@@ -6,11 +6,17 @@ from pathlib import Path
 import pytest
 
 from src.core.models import (
+    AccessRequestStatus,
     AudioFingerprint,
+    AuditAction,
+    AuditLogEntry,
     IngestionJob,
     JobState,
     MetadataCandidate,
+    SourceType,
     TrackMetadata,
+    UserAccount,
+    UserRole,
 )
 from src.db.database import SqliteDatabaseManager
 from src.db.repository import SqliteCatalogRepository
@@ -56,6 +62,8 @@ def test_sqlite_wal_initialization_and_duplicate_queries(tmp_path: Path) -> None
             metadata=meta,
             fingerprint=fp,
             library_path=final_file,
+            uploaded_by=987654321,
+            has_synced_lyrics=True,
         )
 
         by_fp = await repo.check_duplicate("FP_KID_A_01", None)
@@ -68,12 +76,16 @@ def test_sqlite_wal_initialization_and_duplicate_queries(tmp_path: Path) -> None
         assert by_mbid.match_reason == "recording_mbid"
         assert by_mbid.existing_path == final_file
 
+        albums_count, tracks_count = await repo.count_user_uploads(987654321)
+        assert albums_count == 1
+        assert tracks_count == 1
+
     asyncio.run(_scenario())
 
 
 @pytest.mark.integration
 def test_sqlite_job_persistence_roundtrip(tmp_path: Path) -> None:
-    """Verify `IngestionJob` state, candidates, and fingerprint round-trip through SQLite."""
+    """Verify `IngestionJob` state, candidates, fingerprint, and queue fields round-trip through SQLite."""
     db_path = tmp_path / "jobs.db"
     manager = SqliteDatabaseManager(db_path)
     repo = SqliteCatalogRepository(manager)
@@ -103,6 +115,11 @@ def test_sqlite_job_persistence_roundtrip(tmp_path: Path) -> None:
             selected_metadata=candidate_meta,
             fingerprint=AudioFingerprint(duration_seconds=345, fingerprint="FP_VERIDIS"),
             final_path=tmp_path / "final.flac",
+            user_id=123456,
+            source_type=SourceType.ARCHIVE_ZIP,
+            original_filename="Discovery.zip",
+            file_size_bytes=102400,
+            confidence_score=0.88,
         )
         await repo.save_job(job)
 
@@ -116,5 +133,119 @@ def test_sqlite_job_persistence_roundtrip(tmp_path: Path) -> None:
         assert loaded.selected_metadata.album == "Discovery"
         assert loaded.fingerprint is not None
         assert loaded.fingerprint.fingerprint == "FP_VERIDIS"
+        assert loaded.user_id == 123456
+        assert loaded.source_type == SourceType.ARCHIVE_ZIP
+        assert loaded.original_filename == "Discovery.zip"
+
+        active_jobs = await repo.list_active_jobs()
+        assert len(active_jobs) == 1
+        assert active_jobs[0].job_id == "job_discovery"
+
+    asyncio.run(_scenario())
+
+
+@pytest.mark.integration
+def test_sqlite_users_access_requests_and_audit_logs_persistence(tmp_path: Path) -> None:
+    """Verify SQLite persistence for `users`, `access_requests`, and `audit_logs` tables."""
+    db_path = tmp_path / "governance.db"
+    manager = SqliteDatabaseManager(db_path)
+    repo = SqliteCatalogRepository(manager)
+
+    async def _scenario() -> None:
+        await manager.initialize()
+        user = UserAccount(
+            telegram_id=11223344,
+            display_name="Jane Smith",
+            username="jane_smith",
+            role=UserRole.GUEST,
+            authentik_sub="sub-uuid-jane",
+            authentik_username="jane",
+            authentik_groups=("music-uploaders",),
+        )
+        await repo.upsert_user(user)
+
+        by_id = await repo.get_user(11223344)
+        assert by_id is not None
+        assert by_id.authentik_sub == "sub-uuid-jane"
+        assert by_id.authentik_groups == ("music-uploaders",)
+
+        by_sub = await repo.get_user_by_authentik_sub("sub-uuid-jane")
+        assert by_sub is not None
+        assert by_sub.telegram_id == 11223344
+
+        linked = await repo.list_oidc_linked_users()
+        assert len(linked) == 1
+
+        req = await repo.create_access_request(11223344)
+        pending = await repo.get_pending_access_request(11223344)
+        assert pending is not None
+        assert pending.id == req.id
+
+        all_pending = await repo.list_pending_access_requests()
+        assert len(all_pending) == 1
+
+        resolved = await repo.resolve_access_request(
+            request_id=req.id,
+            status=AccessRequestStatus.APPROVED,
+            reviewed_by=11223344,
+        )
+        assert resolved is not None
+        assert resolved.status == AccessRequestStatus.APPROVED
+        assert await repo.get_pending_access_request(11223344) is None
+
+        saved_log = await repo.append_audit_log(
+            AuditLogEntry(
+                actor_id=11223344,
+                action=AuditAction.ROLE_UPDATED,
+                target_entity="user:11223344",
+                details={"new_role": "UPLOADER"},
+            )
+        )
+        assert saved_log.id is not None
+        logs = await repo.list_audit_logs(limit=5)
+        assert len(logs) == 1
+        assert logs[0].details["new_role"] == "UPLOADER"
+
+    asyncio.run(_scenario())
+
+
+@pytest.mark.integration
+def test_sqlite_legacy_ingestion_jobs_schema_migration(tmp_path: Path) -> None:
+    """Verify an existing pre-M3.5 `ingestion_jobs` table without `status` migrates cleanly."""
+    db_path = tmp_path / "legacy.db"
+    manager = SqliteDatabaseManager(db_path)
+    repo = SqliteCatalogRepository(manager)
+
+    async def _scenario() -> None:
+        async with manager.connect() as conn:
+            await conn.execute(
+                """
+                CREATE TABLE ingestion_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    source_path TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    candidates_json TEXT NOT NULL,
+                    selected_metadata_json TEXT,
+                    fingerprint_json TEXT,
+                    final_path TEXT,
+                    error_message TEXT,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+            await conn.execute(
+                """
+                INSERT INTO ingestion_jobs (
+                    job_id, source_path, state, candidates_json, created_at
+                ) VALUES ('legacy_1', '/tmp/a.flac', 'COMPLETED', '[]', '2026-10-11T12:00:00+00:00');
+                """
+            )
+            await conn.commit()
+
+        await manager.initialize()
+        loaded = await repo.get_job("legacy_1")
+        assert loaded is not None
+        assert loaded.job_id == "legacy_1"
+        assert loaded.state == JobState.COMPLETED
 
     asyncio.run(_scenario())

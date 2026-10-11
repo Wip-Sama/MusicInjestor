@@ -13,18 +13,30 @@ def test_default_settings_and_url_normalization() -> None:
     settings = AppSettings(
         telegram_local_api_url="http://localhost:8081/",
         lrclib_base_url="https://lrclib.net/api/",
+        oidc_authorize_url="https://auth.example.com/application/o/authorize/",
+        oidc_token_url="https://auth.example.com/application/o/token/",
+        oidc_userinfo_url="https://auth.example.com/application/o/userinfo/",
     )
     assert settings.telegram_local_api_url == "http://localhost:8081"
     assert settings.lrclib_base_url == "https://lrclib.net/api"
+    assert settings.oidc_authorize_url == "https://auth.example.com/application/o/authorize"
+    assert settings.oidc_token_url == "https://auth.example.com/application/o/token"
+    assert settings.oidc_userinfo_url == "https://auth.example.com/application/o/userinfo"
 
 
-def test_invalid_confidence_raises_validation_error() -> None:
-    """Verify confidence outside [0.0, 1.0] is rejected."""
+def test_invalid_confidence_and_concurrency_raise_validation_error() -> None:
+    """Verify confidence outside [0.0, 1.0] and concurrency outside [1, 4] are rejected."""
     with pytest.raises(ValidationError):
         AppSettings(auto_approve_confidence=1.25)
 
     with pytest.raises(ValidationError):
         AppSettings(auto_approve_confidence=-0.1)
+
+    with pytest.raises(ValidationError):
+        AppSettings(queue_concurrency_limit=0)
+
+    with pytest.raises(ValidationError):
+        AppSettings(queue_concurrency_limit=5)
 
 
 def test_load_settings_merges_dotenv_and_environ(tmp_path: Path) -> None:
@@ -35,7 +47,11 @@ def test_load_settings_merges_dotenv_and_environ(tmp_path: Path) -> None:
         "TELEGRAM_API_ID=111222\n"
         "TELEGRAM_USE_LOCAL_API=false\n"
         "AUTO_APPROVE_CONFIDENCE='0.85'\n"
-        "STORAGE_SCRATCH_DIR=./custom/scratch\n",
+        "STORAGE_SCRATCH_DIR=./custom/scratch\n"
+        "OWNER_TELEGRAM_IDS=1001, 1002\n"
+        "ADMIN_LOG_CHANNEL_ID=-100999888\n"
+        "QUEUE_CONCURRENCY_LIMIT=2\n"
+        "OIDC_ENABLED=true\n",
         encoding="utf-8",
     )
 
@@ -48,6 +64,10 @@ def test_load_settings_merges_dotenv_and_environ(tmp_path: Path) -> None:
     assert loaded.telegram_use_local_api is True
     assert loaded.auto_approve_confidence == 0.85
     assert loaded.storage_scratch_dir == Path("./custom/scratch")
+    assert loaded.owner_telegram_ids == (1001, 1002)
+    assert loaded.admin_log_channel_id == -100999888
+    assert loaded.queue_concurrency_limit == 2
+    assert loaded.oidc_enabled is True
 
 
 def test_ensure_directories_creates_paths(sample_settings: AppSettings) -> None:

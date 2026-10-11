@@ -6,20 +6,157 @@ from enum import StrEnum
 from pathlib import Path
 
 
-class JobState(StrEnum):
-    """Lifecycle states of an ingestion job across pipeline stages."""
+class UserRole(StrEnum):
+    """Five-tier Role-Based Access Control (RBAC) hierarchy."""
+
+    GUEST = "GUEST"
+    UPLOADER = "UPLOADER"
+    MODERATOR = "MODERATOR"
+    ADMIN = "ADMIN"
+    OWNER = "OWNER"
+
+    @property
+    def rank(self) -> int:
+        """Numeric hierarchy level used for role comparisons."""
+        ranks: dict[UserRole, int] = {
+            UserRole.GUEST: 0,
+            UserRole.UPLOADER: 1,
+            UserRole.MODERATOR: 2,
+            UserRole.ADMIN: 3,
+            UserRole.OWNER: 4,
+        }
+        return ranks[self]
+
+    def has_at_least(self, minimum: UserRole) -> bool:
+        """Return True if this role's rank is greater than or equal to `minimum`."""
+        return self.rank >= minimum.rank
+
+
+class Permission(StrEnum):
+    """Granular RBAC capabilities defined in Specification Section 3.1."""
+
+    BASIC_COMMANDS = "BASIC_COMMANDS"
+    LINK_OIDC = "LINK_OIDC"
+    SUBMIT_ACCESS_REQUEST = "SUBMIT_ACCESS_REQUEST"
+    SUBMIT_INGESTION = "SUBMIT_INGESTION"
+    VIEW_OWN_JOBS = "VIEW_OWN_JOBS"
+    RESOLVE_OWN_DISAMBIGUATION = "RESOLVE_OWN_DISAMBIGUATION"
+    REQUEST_TAG_CORRECTION = "REQUEST_TAG_CORRECTION"
+    VIEW_GLOBAL_QUEUE = "VIEW_GLOBAL_QUEUE"
+    RESOLVE_OTHERS_JOBS = "RESOLVE_OTHERS_JOBS"
+    APPROVE_TAG_CORRECTIONS = "APPROVE_TAG_CORRECTIONS"
+    MANAGE_USERS = "MANAGE_USERS"
+    REVIEW_AUDIT_LOGS = "REVIEW_AUDIT_LOGS"
+    CHANGE_CONCURRENCY_LIMIT = "CHANGE_CONCURRENCY_LIMIT"
+    SYSTEM_DESTRUCTIVE_WIPE = "SYSTEM_DESTRUCTIVE_WIPE"
+
+
+class AccessRequestStatus(StrEnum):
+    """Lifecycle states of a manual guest access request."""
 
     PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+
+
+class SourceType(StrEnum):
+    """Ingestion payload origin types."""
+
+    ARCHIVE_ZIP = "ARCHIVE_ZIP"
+    ARCHIVE_7Z = "ARCHIVE_7Z"
+    DIRECT_AUDIO = "DIRECT_AUDIO"
+    URL = "URL"
+
+
+class AuditAction(StrEnum):
+    """Standardized audit log action identifiers."""
+
+    ROLE_UPDATED = "ROLE_UPDATED"
+    OIDC_SYNC = "OIDC_SYNC"
+    ACCESS_REQUESTED = "ACCESS_REQUESTED"
+    ACCESS_DENIED = "ACCESS_DENIED"
+    USER_BLOCKED = "USER_BLOCKED"
+    USER_UNBLOCKED = "USER_UNBLOCKED"
+    INGEST_QUEUED = "INGEST_QUEUED"
+    INGEST_SUCCESS = "INGEST_SUCCESS"
+    DUPLICATE_BLOCKED = "DUPLICATE_BLOCKED"
+    CONCURRENCY_UPDATED = "CONCURRENCY_UPDATED"
+
+
+class JobState(StrEnum):
+    """Lifecycle states of an ingestion job across queue and pipeline stages."""
+
+    QUEUED = "QUEUED"
+    PENDING = "PENDING"
+    PROCESSING = "PROCESSING"
     EXTRACTING = "EXTRACTING"
     FINGERPRINTING = "FINGERPRINTING"
     ENRICHING_METADATA = "ENRICHING_METADATA"
     AWAITING_CONFIRMATION = "AWAITING_CONFIRMATION"
+    AWAITING_INPUT = "AWAITING_INPUT"
     FETCHING_LYRICS = "FETCHING_LYRICS"
     ORGANIZING = "ORGANIZING"
     COMPLETED = "COMPLETED"
     DUPLICATE_REJECTED = "DUPLICATE_REJECTED"
     CANCELLED = "CANCELLED"
     FAILED = "FAILED"
+
+
+@dataclass(slots=True)
+class UserAccount:
+    """Domain entity representing a Telegram user and optional Authentik OIDC federation state."""
+
+    telegram_id: int
+    display_name: str
+    username: str | None = None
+    role: UserRole = UserRole.GUEST
+    is_blocked: bool = False
+    authentik_sub: str | None = None
+    authentik_username: str | None = None
+    authentik_groups: tuple[str, ...] = ()
+    access_token_encrypted: str | None = None
+    refresh_token_encrypted: str | None = None
+    token_expires_at: datetime | None = None
+    last_oidc_sync: datetime | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    @property
+    def is_oidc_linked(self) -> bool:
+        """Return True if this account is paired with an Authentik OIDC subject."""
+        return bool(self.authentik_sub and self.authentik_sub.strip())
+
+    @property
+    def mention_handle(self) -> str:
+        """Return `@username` if available, falling back to `display_name`."""
+        if self.username and self.username.strip():
+            clean = self.username.strip().lstrip("@")
+            return f"@{clean}"
+        return self.display_name
+
+
+@dataclass(frozen=True, slots=True)
+class AccessRequestRecord:
+    """Manual access request submitted by a GUEST user."""
+
+    id: int
+    telegram_id: int
+    status: AccessRequestStatus = AccessRequestStatus.PENDING
+    reviewed_by: int | None = None
+    reviewed_at: datetime | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass(frozen=True, slots=True)
+class AuditLogEntry:
+    """Immutable audit log record persisted in SQLite and optionally routed to Admin Log Channel."""
+
+    actor_id: int
+    action: str
+    target_entity: str | None = None
+    details: dict[str, object] = field(default_factory=dict)
+    id: int | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,7 +243,7 @@ class DuplicateCheckResult:
 
 @dataclass(slots=True)
 class IngestionJob:
-    """Mutable aggregate tracking an ingestion job through the pipeline."""
+    """Mutable aggregate tracking an ingestion job through the queue and pipeline."""
 
     job_id: str
     source_path: Path
@@ -117,6 +254,16 @@ class IngestionJob:
     final_path: Path | None = None
     error_message: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    user_id: int | None = None
+    source_type: SourceType = SourceType.DIRECT_AUDIO
+    original_filename: str = ""
+    file_size_bytes: int = 0
+    scratch_dir: Path | None = None
+    sha256_hash: str | None = None
+    confidence_score: float | None = None
+    matched_release_mbid: str | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)

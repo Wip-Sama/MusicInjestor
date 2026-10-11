@@ -2,6 +2,7 @@
 
 import logging
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 from src.core.deduplicator import DeduplicatorService
@@ -10,6 +11,7 @@ from src.core.models import (
     IngestionResult,
     JobState,
     MetadataCandidate,
+    SourceType,
     TrackMetadata,
 )
 from src.core.ports import (
@@ -67,16 +69,33 @@ class IngestionPipeline:
         self,
         source_path: Path,
         job_id: str | None = None,
+        *,
+        user_id: int | None = None,
+        original_filename: str = "",
+        file_size_bytes: int = 0,
+        source_type: SourceType = SourceType.DIRECT_AUDIO,
+        sha256_hash: str | None = None,
+        started_at: datetime | None = None,
     ) -> IngestionResult:
         """Run stages 1–7, and continue through 8–10 if confidence meets the auto-approve threshold."""
         resolved_job_id = job_id or uuid.uuid4().hex[:12]
-        job = IngestionJob(job_id=resolved_job_id, source_path=source_path)
+        job = IngestionJob(
+            job_id=resolved_job_id,
+            source_path=source_path,
+            user_id=user_id,
+            original_filename=original_filename or source_path.name,
+            file_size_bytes=file_size_bytes or (source_path.stat().st_size if source_path.is_file() else 0),
+            source_type=source_type,
+            sha256_hash=sha256_hash,
+            started_at=started_at or datetime.now(UTC),
+        )
         await self._catalog.save_job(job)
 
         job.state = JobState.EXTRACTING
         await self._catalog.save_job(job)
         staged_files = await self._extractor.extract_or_stage(source_path, resolved_job_id)
         primary_audio = staged_files[0]
+        job.scratch_dir = primary_audio.parent
 
         job.state = JobState.FINGERPRINTING
         await self._catalog.save_job(job)
@@ -86,6 +105,7 @@ class IngestionPipeline:
         dup_check = await self._deduplicator.check_track(fingerprint)
         if dup_check.is_duplicate:
             job.state = JobState.DUPLICATE_REJECTED
+            job.completed_at = datetime.now(UTC)
             await self._catalog.save_job(job)
             await self._extractor.cleanup_job_scratch(resolved_job_id)
             return IngestionResult(
@@ -99,6 +119,9 @@ class IngestionPipeline:
         local_meta = await self._metadata.read_local_metadata(primary_audio)
         candidates = await self._metadata.find_candidates(local_meta, fingerprint)
         job.candidates = candidates
+        if candidates:
+            job.confidence_score = candidates[0].confidence
+            job.matched_release_mbid = candidates[0].metadata.release_mbid
 
         if _requires_confirmation(candidates, self._auto_approve_confidence):
             job.state = JobState.AWAITING_CONFIRMATION
@@ -131,8 +154,10 @@ class IngestionPipeline:
             msg = f"Candidate index {candidate_index} out of range for job {job_id}"
             raise IndexError(msg)
 
-        selected = job.candidates[candidate_index].metadata
-        return await self._complete_ingestion(job, staged_audio_path, selected)
+        chosen = job.candidates[candidate_index]
+        job.confidence_score = chosen.confidence
+        job.matched_release_mbid = chosen.metadata.release_mbid
+        return await self._complete_ingestion(job, staged_audio_path, chosen.metadata)
 
     async def _complete_ingestion(
         self,
@@ -142,6 +167,7 @@ class IngestionPipeline:
     ) -> IngestionResult:
         """Execute stages 8–10: fetch lyrics, write tags & move file, register catalog, cleanup."""
         job.selected_metadata = selected_metadata
+        job.matched_release_mbid = selected_metadata.release_mbid or job.matched_release_mbid
         job.state = JobState.FETCHING_LYRICS
         await self._catalog.save_job(job)
         lyrics = await self._lyrics.fetch_lyrics(selected_metadata)
@@ -155,6 +181,7 @@ class IngestionPipeline:
         )
         job.final_path = final_path
         job.state = JobState.COMPLETED
+        job.completed_at = datetime.now(UTC)
         await self._catalog.save_job(job)
 
         if job.fingerprint is not None:

@@ -57,6 +57,23 @@ class AppSettings(BaseModel):
     fpcalc_binary: str = Field(default="fpcalc")
     sevenzip_binary: str = Field(default="7z")
 
+    # Governance, RBAC, Queue & Admin Log Channel settings
+    owner_telegram_ids: tuple[int, ...] = Field(default=())
+    admin_log_channel_id: int | None = Field(default=None)
+    queue_concurrency_limit: int = Field(default=1, ge=1, le=4)
+    secret_key: str = Field(default="change-me-in-production-secret-key", min_length=16)
+    node_name: str = Field(default="Proxmox LXC 104")
+
+    # Authentik OIDC Federation settings
+    oidc_enabled: bool = Field(default=False)
+    oidc_authorize_url: str = Field(default="https://auth.example.com/application/o/authorize")
+    oidc_token_url: str = Field(default="https://auth.example.com/application/o/token")
+    oidc_userinfo_url: str = Field(default="https://auth.example.com/application/o/userinfo")
+    oidc_client_id: str = Field(default="")
+    oidc_client_secret: str = Field(default="")
+    oidc_redirect_uri: str = Field(default="http://localhost:8080/api/v1/auth/callback")
+    oidc_webhook_secret: str = Field(default="")
+
     @field_validator("auto_approve_confidence")
     @classmethod
     def validate_confidence_range(cls, value: float) -> float:
@@ -66,7 +83,13 @@ class AppSettings(BaseModel):
             raise ValueError(msg)
         return value
 
-    @field_validator("telegram_local_api_url", "lrclib_base_url")
+    @field_validator(
+        "telegram_local_api_url",
+        "lrclib_base_url",
+        "oidc_authorize_url",
+        "oidc_token_url",
+        "oidc_userinfo_url",
+    )
     @classmethod
     def strip_trailing_slash(cls, value: str) -> str:
         """Normalize base URLs by stripping trailing slashes."""
@@ -88,6 +111,12 @@ class AppSettings(BaseModel):
 def _parse_bool(raw: str) -> bool:
     """Convert standard environment string representations to boolean."""
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_int_tuple(raw: str) -> tuple[int, ...]:
+    """Parse a comma-separated string of integers into a tuple."""
+    parts = [item.strip() for item in raw.split(",") if item.strip()]
+    return tuple(int(item) for item in parts)
 
 
 def load_settings(
@@ -114,6 +143,15 @@ def load_settings(
         "LOG_LEVEL": "log_level",
         "FPCALC_BINARY": "fpcalc_binary",
         "SEVENZIP_BINARY": "sevenzip_binary",
+        "SECRET_KEY": "secret_key",
+        "NODE_NAME": "node_name",
+        "OIDC_AUTHORIZE_URL": "oidc_authorize_url",
+        "OIDC_TOKEN_URL": "oidc_token_url",
+        "OIDC_USERINFO_URL": "oidc_userinfo_url",
+        "OIDC_CLIENT_ID": "oidc_client_id",
+        "OIDC_CLIENT_SECRET": "oidc_client_secret",
+        "OIDC_REDIRECT_URI": "oidc_redirect_uri",
+        "OIDC_WEBHOOK_SECRET": "oidc_webhook_secret",
     }
     for env_key, field_name in str_mappings.items():
         if env_key in merged_env and merged_env[env_key] != "":
@@ -138,5 +176,17 @@ def load_settings(
 
     if "AUTO_APPROVE_CONFIDENCE" in merged_env and merged_env["AUTO_APPROVE_CONFIDENCE"] != "":
         raw_kwargs["auto_approve_confidence"] = float(merged_env["AUTO_APPROVE_CONFIDENCE"])
+
+    if "OWNER_TELEGRAM_IDS" in merged_env and merged_env["OWNER_TELEGRAM_IDS"] != "":
+        raw_kwargs["owner_telegram_ids"] = _parse_int_tuple(merged_env["OWNER_TELEGRAM_IDS"])
+
+    if "ADMIN_LOG_CHANNEL_ID" in merged_env and merged_env["ADMIN_LOG_CHANNEL_ID"] != "":
+        raw_kwargs["admin_log_channel_id"] = int(merged_env["ADMIN_LOG_CHANNEL_ID"])
+
+    if "QUEUE_CONCURRENCY_LIMIT" in merged_env and merged_env["QUEUE_CONCURRENCY_LIMIT"] != "":
+        raw_kwargs["queue_concurrency_limit"] = int(merged_env["QUEUE_CONCURRENCY_LIMIT"])
+
+    if "OIDC_ENABLED" in merged_env and merged_env["OIDC_ENABLED"] != "":
+        raw_kwargs["oidc_enabled"] = _parse_bool(merged_env["OIDC_ENABLED"])
 
     return AppSettings.model_validate(raw_kwargs)

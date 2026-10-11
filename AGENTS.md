@@ -16,15 +16,19 @@ The system is architected as a **Hexagonal Modular Monolith** inside `src/` so t
 
 ```text
 musicDownloader/
-├── main.py                      # Composition root wiring config, SQLite, core pipeline, and bot
+├── main.py                      # Composition root wiring config, SQLite, RBAC, OIDC, queue, and bot
 ├── Dockerfile                   # Python 3.14 + uv + fpcalc (Chromaprint) + 7z + ffmpeg
 ├── docker-compose.yml           # WSL/Production stack: telegram-bot-api + music-ingest-bot + test
 ├── src/
 │   ├── config/                  # Typed environment & .env settings (AppSettings)
 │   ├── core/                    # PURE DOMAIN & INGESTION ENGINE (Hexagonal Core)
-│   │   ├── exceptions.py        # Domain-specific exceptions
-│   │   ├── models.py            # Pure dataclasses/enums (TrackMetadata, IngestionJob, etc.)
-│   │   ├── ports.py             # Runtime-checkable Protocols (CatalogRepositoryPort, etc.)
+│   │   ├── audit.py             # Admin Log Channel event & queue/dashboard card formatters
+│   │   ├── exceptions.py        # Domain-specific exceptions (IngestionError, PermissionDeniedError, etc.)
+│   │   ├── models.py            # Pure dataclasses/enums (UserAccount, UserRole, Permission, IngestionJob, etc.)
+│   │   ├── ports.py             # Runtime-checkable Protocols (CatalogRepositoryPort, GovernanceRepositoryPort, etc.)
+│   │   ├── rbac.py              # 5-tier RBAC permission matrix & GovernanceService
+│   │   ├── oidc.py              # Authentik OIDC state nonces, token encryption & claim synchronization
+│   │   ├── queue.py             # Serialized & runtime-configurable IngestionQueueWorker (1..4)
 │   │   ├── extractor.py         # 7z archive unpacking & single-file scratch staging
 │   │   ├── fingerprint.py       # Chromaprint (`fpcalc -json`) execution
 │   │   ├── deduplicator.py      # Fingerprint & MusicBrainz recording ID deduplication
@@ -34,22 +38,25 @@ musicDownloader/
 │   │   └── pipeline.py          # 10-stage IngestionPipeline orchestrator
 │   ├── db/                      # PERSISTENCE ADAPTER (SQLite WAL mode via aiosqlite)
 │   │   ├── database.py          # WAL connection & DDL manager
-│   │   ├── models.py            # SQLite table & index DDL statements
-│   │   └── repository.py        # SqliteCatalogRepository implementing CatalogRepositoryPort
+│   │   ├── models.py            # SQLite table & index DDL statements (users, access_requests, jobs, tracks, audit_logs)
+│   │   └── repository.py        # SqliteCatalogRepository implementing CatalogRepositoryPort & GovernanceRepositoryPort
 │   └── bot/                     # TELEGRAM INTERFACE ADAPTER (aiogram 3.x)
 │       ├── api_server.py        # Local Bot API session builder & container->host path translator
+│       ├── notifier.py          # TelegramAdminLogNotifier implementing AdminLogNotifierPort
+│       ├── oidc_server.py       # OAuth2 `/api/v1/auth/callback` & Authentik webhook coordinator
 │       ├── states.py            # FSM states (IngestionStates)
-│       ├── keyboards/           # InlineKeyboardMarkup builders for ambiguous matches
-│       └── routers/             # /start, /help, /status, file ingress, and callback routers
+│       ├── middlewares/         # RbacMiddleware (role enforcement, 15m OIDC sync, guest upload discard)
+│       ├── keyboards/           # InlineKeyboardMarkup builders for verification, onboarding & /admin
+│       └── routers/             # /start, /help, /status, /admin, file ingress, and callback routers
 └── tests/
     ├── test_architecture.py     # AST enforcement of hexagonal boundaries & explicit imports
-    ├── unit/                    # Fast isolated unit tests (settings, models, pipeline, bot)
+    ├── unit/                    # Fast isolated unit tests (settings, models, pipeline, RBAC, OIDC, queue, bot)
     └── integration/             # SQLite WAL persistence & optional WSL Docker smoke tests
 ```
 
 ### Enforced Architectural Invariants (Tested by `tests/test_architecture.py`)
 1. **`src/core/` Isolation:** `src/core/` MUST NEVER import `aiogram`, `src.bot`, `src.db`, or `src.config`. All external interactions pass through `src/core/ports.py` protocols.
-2. **`src/db/` Isolation:** `src/db/` implements `CatalogRepositoryPort` from `src/core/ports.py` and MUST NEVER import `aiogram` or `src.bot`.
+2. **`src/db/` Isolation:** `src/db/` implements `CatalogRepositoryPort` and `GovernanceRepositoryPort` from `src/core/ports.py` and MUST NEVER import `aiogram` or `src.bot`.
 3. **Explicit Top-Level Imports Only:** Never use wildcard imports (`from ... import *`) or nested/inline imports inside functions or classes.
 
 ---
@@ -113,6 +120,12 @@ Before concluding any task that modifies code:
   - Implemented `IngestionPipeline` stages (staging/extraction, fingerprinting, deduplication, confidence check, confirmation pause/resume, lyrics, filing).
   - Implemented `SqliteDatabaseManager` (WAL mode) and `SqliteCatalogRepository`.
   - Established unit and integration test suites with coverage reporting.
+- [x] **M3.5: Governance, 5-Tier RBAC, Authentik OIDC Synchronization, Ingestion Queue & `/admin` Dashboard (`admin_rbac_specification.md`)**
+  - Extended SQLite WAL schema with `users`, `access_requests`, `ingestion_jobs`, `library_tracks`, `audit_logs`, and indexes.
+  - Implemented 5-tier RBAC (`GUEST`, `UPLOADER`, `MODERATOR`, `ADMIN`, `OWNER`), `GovernanceService`, and `RbacMiddleware` (discarding unauthorized guest uploads and refreshing stale OIDC profiles >15m).
+  - Implemented `AuthentikOidcService` (HMAC-SHA256 state nonces with 10m TTL, encrypted tokens at rest, group-to-role evaluation, demotion queue revocation, periodic sync, and webhook handler).
+  - Implemented `IngestionQueueWorker` with FIFO persistence and runtime-configurable concurrency (`1..4`).
+  - Implemented `TelegramAdminLogNotifier` (Events A, B, C, D and interactive access request cards) and `/admin` Control Dashboard.
 
 ### Upcoming Milestones (To Be Implemented Next)
 - [ ] **M4: Deep `mutagen` Tag Inspection & Writing**
@@ -123,4 +136,5 @@ Before concluding any task that modifies code:
   - Query `musicbrainzngs` recordings/releases in `MusicBrainzMetadataService.find_candidates` and rank multi-release candidates.
 - [ ] **M6: Multi-Track Archive Batch Processing & End-to-End Telegram FSM Wiring**
   - Extend `files_router` and `verification_router` in `src/bot/routers/` to download/resolve local API files, invoke `pipeline.process_file`, transition `FSMContext` to `IngestionStates.awaiting_confirmation`, and handle album-level archives.
+
 

@@ -1,0 +1,404 @@
+"""Role-Based Access Control (RBAC) policy matrix and user governance service."""
+
+import logging
+from datetime import UTC, datetime
+
+from src.core.exceptions import PermissionDeniedError
+from src.core.models import (
+    AccessRequestRecord,
+    AccessRequestStatus,
+    AuditAction,
+    AuditLogEntry,
+    Permission,
+    UserAccount,
+    UserRole,
+)
+from src.core.ports import AdminLogNotifierPort, GovernanceRepositoryPort
+
+logger = logging.getLogger(__name__)
+
+ROLE_PERMISSIONS: dict[UserRole, frozenset[Permission]] = {
+    UserRole.GUEST: frozenset(
+        {
+            Permission.BASIC_COMMANDS,
+            Permission.LINK_OIDC,
+            Permission.SUBMIT_ACCESS_REQUEST,
+        }
+    ),
+    UserRole.UPLOADER: frozenset(
+        {
+            Permission.BASIC_COMMANDS,
+            Permission.LINK_OIDC,
+            Permission.SUBMIT_INGESTION,
+            Permission.VIEW_OWN_JOBS,
+            Permission.RESOLVE_OWN_DISAMBIGUATION,
+            Permission.REQUEST_TAG_CORRECTION,
+        }
+    ),
+    UserRole.MODERATOR: frozenset(
+        {
+            Permission.BASIC_COMMANDS,
+            Permission.LINK_OIDC,
+            Permission.SUBMIT_INGESTION,
+            Permission.VIEW_OWN_JOBS,
+            Permission.RESOLVE_OWN_DISAMBIGUATION,
+            Permission.REQUEST_TAG_CORRECTION,
+            Permission.VIEW_GLOBAL_QUEUE,
+            Permission.RESOLVE_OTHERS_JOBS,
+            Permission.APPROVE_TAG_CORRECTIONS,
+        }
+    ),
+    UserRole.ADMIN: frozenset(
+        {
+            Permission.BASIC_COMMANDS,
+            Permission.LINK_OIDC,
+            Permission.SUBMIT_INGESTION,
+            Permission.VIEW_OWN_JOBS,
+            Permission.RESOLVE_OWN_DISAMBIGUATION,
+            Permission.REQUEST_TAG_CORRECTION,
+            Permission.VIEW_GLOBAL_QUEUE,
+            Permission.RESOLVE_OTHERS_JOBS,
+            Permission.APPROVE_TAG_CORRECTIONS,
+            Permission.MANAGE_USERS,
+            Permission.REVIEW_AUDIT_LOGS,
+            Permission.CHANGE_CONCURRENCY_LIMIT,
+        }
+    ),
+    UserRole.OWNER: frozenset(
+        {
+            Permission.BASIC_COMMANDS,
+            Permission.LINK_OIDC,
+            Permission.SUBMIT_INGESTION,
+            Permission.VIEW_OWN_JOBS,
+            Permission.RESOLVE_OWN_DISAMBIGUATION,
+            Permission.REQUEST_TAG_CORRECTION,
+            Permission.VIEW_GLOBAL_QUEUE,
+            Permission.RESOLVE_OTHERS_JOBS,
+            Permission.APPROVE_TAG_CORRECTIONS,
+            Permission.MANAGE_USERS,
+            Permission.REVIEW_AUDIT_LOGS,
+            Permission.CHANGE_CONCURRENCY_LIMIT,
+            Permission.SYSTEM_DESTRUCTIVE_WIPE,
+        }
+    ),
+}
+
+
+def has_permission(user: UserAccount, permission: Permission) -> bool:
+    """Return True if `user` is not blocked and holds `permission` under their current role."""
+    if user.is_blocked:
+        return False
+    allowed = ROLE_PERMISSIONS.get(user.role, frozenset())
+    return permission in allowed
+
+
+def require_permission(user: UserAccount, permission: Permission) -> None:
+    """Raise `PermissionDeniedError` if `user` lacks `permission` or is blocked."""
+    if not has_permission(user, permission):
+        msg = (
+            f"User {user.telegram_id} (role={user.role.value}, blocked={user.is_blocked}) "
+            f"lacks required permission {permission.value}"
+        )
+        raise PermissionDeniedError(msg)
+
+
+def evaluate_oidc_role(groups: tuple[str, ...] | list[str]) -> UserRole:
+    """Map Authentik OIDC group claims to the highest matching `UserRole` (Specification Section 2.2)."""
+    group_set = {g.strip() for g in groups if g.strip()}
+    if "music-admins" in group_set:
+        return UserRole.ADMIN
+    if "music-moderators" in group_set:
+        return UserRole.MODERATOR
+    if "music-uploaders" in group_set:
+        return UserRole.UPLOADER
+    return UserRole.GUEST
+
+
+def next_promotion_role(current: UserRole) -> UserRole | None:
+    """Return the next higher tier for manual admin promotion buttons."""
+    promotions: dict[UserRole, UserRole] = {
+        UserRole.GUEST: UserRole.UPLOADER,
+        UserRole.UPLOADER: UserRole.MODERATOR,
+        UserRole.MODERATOR: UserRole.ADMIN,
+    }
+    return promotions.get(current)
+
+
+def next_demotion_role(current: UserRole) -> UserRole | None:
+    """Return the next lower tier for manual admin demotion buttons."""
+    demotions: dict[UserRole, UserRole] = {
+        UserRole.ADMIN: UserRole.MODERATOR,
+        UserRole.MODERATOR: UserRole.UPLOADER,
+        UserRole.UPLOADER: UserRole.GUEST,
+    }
+    return demotions.get(current)
+
+
+class GovernanceService:
+    """Domain service orchestrating user onboarding, access requests, RBAC changes, and audit logs."""
+
+    def __init__(
+        self,
+        repository: GovernanceRepositoryPort,
+        notifier: AdminLogNotifierPort | None = None,
+        owner_telegram_ids: tuple[int, ...] = (),
+    ) -> None:
+        self._repo = repository
+        self._notifier = notifier
+        self._owner_ids = set(owner_telegram_ids)
+
+    async def ensure_user(
+        self,
+        telegram_id: int,
+        display_name: str,
+        username: str | None = None,
+    ) -> UserAccount:
+        """Load an existing user or create a new one, bootstrapping configured OWNER IDs."""
+        existing = await self._repo.get_user(telegram_id)
+        now = datetime.now(UTC)
+        if existing is not None:
+            needs_save = False
+            if display_name and existing.display_name != display_name:
+                existing.display_name = display_name
+                needs_save = True
+            if username is not None and existing.username != username:
+                existing.username = username
+                needs_save = True
+            if telegram_id in self._owner_ids and existing.role != UserRole.OWNER and not existing.is_blocked:
+                existing.role = UserRole.OWNER
+                needs_save = True
+            if needs_save:
+                existing.updated_at = now
+                await self._repo.upsert_user(existing)
+            return existing
+
+        initial_role = UserRole.OWNER if telegram_id in self._owner_ids else UserRole.GUEST
+        new_user = UserAccount(
+            telegram_id=telegram_id,
+            display_name=display_name or f"User {telegram_id}",
+            username=username,
+            role=initial_role,
+            created_at=now,
+            updated_at=now,
+        )
+        return await self._repo.upsert_user(new_user)
+
+    async def submit_access_request(
+        self,
+        user: UserAccount,
+    ) -> tuple[AccessRequestRecord, bool]:
+        """Submit a manual access request with debounce protection against button spam.
+
+        Returns `(record, created_new)` where `created_new` is False if a PENDING request already exists.
+        """
+        require_permission(user, Permission.SUBMIT_ACCESS_REQUEST)
+        existing_pending = await self._repo.get_pending_access_request(user.telegram_id)
+        if existing_pending is not None:
+            logger.debug(
+                "Debounced duplicate access request from user %s (request_id=%s)",
+                user.telegram_id,
+                existing_pending.id,
+            )
+            return existing_pending, False
+
+        request = await self._repo.create_access_request(user.telegram_id)
+        await self._repo.append_audit_log(
+            AuditLogEntry(
+                actor_id=user.telegram_id,
+                action=AuditAction.ACCESS_REQUESTED,
+                target_entity=f"user:{user.telegram_id}",
+                details={"request_id": request.id, "username": user.username},
+            )
+        )
+        if self._notifier is not None:
+            await self._notifier.send_access_request_card(user, request)
+        return request, True
+
+    async def approve_access_request(
+        self,
+        actor: UserAccount,
+        request_id: int,
+        granted_role: UserRole = UserRole.UPLOADER,
+    ) -> UserAccount:
+        """Approve a pending access request and assign `granted_role` to the requester."""
+        require_permission(actor, Permission.MANAGE_USERS)
+        request = await self._repo.get_access_request_by_id(request_id)
+        if request is None:
+            msg = f"Access request {request_id} not found"
+            raise KeyError(msg)
+
+        target_user = await self._repo.get_user(request.telegram_id)
+        if target_user is None:
+            msg = f"Target user {request.telegram_id} not found"
+            raise KeyError(msg)
+
+        previous_role = target_user.role
+        target_user.role = granted_role
+        target_user.updated_at = datetime.now(UTC)
+        await self._repo.upsert_user(target_user)
+        await self._repo.resolve_access_request(
+            request_id=request_id,
+            status=AccessRequestStatus.APPROVED,
+            reviewed_by=actor.telegram_id,
+        )
+        await self._repo.append_audit_log(
+            AuditLogEntry(
+                actor_id=actor.telegram_id,
+                action=AuditAction.ROLE_UPDATED,
+                target_entity=f"user:{target_user.telegram_id}",
+                details={
+                    "previous_role": previous_role.value,
+                    "new_role": granted_role.value,
+                    "reason": "Manual Approval via Button",
+                    "request_id": request_id,
+                },
+            )
+        )
+        if self._notifier is not None:
+            await self._notifier.send_role_updated_audit(
+                target_user=target_user,
+                actor=actor,
+                previous_role=previous_role,
+                new_role=granted_role,
+                reason="Manual Approval via Button",
+            )
+        return target_user
+
+    async def deny_access_request(
+        self,
+        actor: UserAccount,
+        request_id: int,
+    ) -> AccessRequestRecord:
+        """Reject a pending access request."""
+        require_permission(actor, Permission.MANAGE_USERS)
+        resolved = await self._repo.resolve_access_request(
+            request_id=request_id,
+            status=AccessRequestStatus.REJECTED,
+            reviewed_by=actor.telegram_id,
+        )
+        if resolved is None:
+            msg = f"Access request {request_id} not found"
+            raise KeyError(msg)
+
+        await self._repo.append_audit_log(
+            AuditLogEntry(
+                actor_id=actor.telegram_id,
+                action=AuditAction.ACCESS_DENIED,
+                target_entity=f"user:{resolved.telegram_id}",
+                details={"request_id": request_id},
+            )
+        )
+        return resolved
+
+    async def change_user_role(
+        self,
+        actor: UserAccount,
+        target_telegram_id: int,
+        new_role: UserRole,
+        reason: str = "Admin Dashboard Role Update",
+    ) -> UserAccount:
+        """Promote or demote a user, cancelling queued jobs if demoted to GUEST."""
+        require_permission(actor, Permission.MANAGE_USERS)
+        if new_role == UserRole.OWNER:
+            require_permission(actor, Permission.SYSTEM_DESTRUCTIVE_WIPE)
+
+        target_user = await self._repo.get_user(target_telegram_id)
+        if target_user is None:
+            msg = f"User {target_telegram_id} not found"
+            raise KeyError(msg)
+
+        if target_user.role == UserRole.OWNER and actor.role != UserRole.OWNER:
+            raise PermissionDeniedError("Only an OWNER can modify another OWNER account.")
+
+        previous_role = target_user.role
+        target_user.role = new_role
+        target_user.updated_at = datetime.now(UTC)
+        await self._repo.upsert_user(target_user)
+
+        cancelled_count = 0
+        if new_role == UserRole.GUEST:
+            cancelled_count = await self._repo.cancel_queued_jobs_for_user(target_telegram_id)
+
+        pending_req = await self._repo.get_pending_access_request(target_telegram_id)
+        if pending_req is not None and pending_req.id is not None:
+            resolution_status = (
+                AccessRequestStatus.REJECTED if new_role == UserRole.GUEST else AccessRequestStatus.APPROVED
+            )
+            await self._repo.resolve_access_request(
+                request_id=pending_req.id,
+                status=resolution_status,
+                reviewed_by=actor.telegram_id,
+            )
+
+        await self._repo.append_audit_log(
+            AuditLogEntry(
+                actor_id=actor.telegram_id,
+                action=AuditAction.ROLE_UPDATED,
+                target_entity=f"user:{target_user.telegram_id}",
+                details={
+                    "previous_role": previous_role.value,
+                    "new_role": new_role.value,
+                    "reason": reason,
+                    "cancelled_jobs": cancelled_count,
+                },
+            )
+        )
+        if self._notifier is not None:
+            await self._notifier.send_role_updated_audit(
+                target_user=target_user,
+                actor=actor,
+                previous_role=previous_role,
+                new_role=new_role,
+                reason=reason,
+            )
+        return target_user
+
+    async def set_user_blocked(
+        self,
+        actor: UserAccount,
+        target_telegram_id: int,
+        is_blocked: bool,
+        reason: str = "Admin Block/Ban Action",
+    ) -> UserAccount:
+        """Block/ban or unblock a user, revoking active queued jobs when blocked."""
+        require_permission(actor, Permission.MANAGE_USERS)
+        target_user = await self._repo.get_user(target_telegram_id)
+        if target_user is None:
+            msg = f"User {target_telegram_id} not found"
+            raise KeyError(msg)
+
+        if target_user.role == UserRole.OWNER:
+            raise PermissionDeniedError("Cannot block an OWNER account.")
+
+        previous_role = target_user.role
+        target_user.is_blocked = is_blocked
+        cancelled_count = 0
+        if is_blocked:
+            target_user.role = UserRole.GUEST
+            cancelled_count = await self._repo.cancel_queued_jobs_for_user(target_telegram_id)
+            pending_req = await self._repo.get_pending_access_request(target_telegram_id)
+            if pending_req is not None and pending_req.id is not None:
+                await self._repo.resolve_access_request(
+                    request_id=pending_req.id,
+                    status=AccessRequestStatus.REJECTED,
+                    reviewed_by=actor.telegram_id,
+                )
+        target_user.updated_at = datetime.now(UTC)
+        await self._repo.upsert_user(target_user)
+
+        action = AuditAction.USER_BLOCKED if is_blocked else AuditAction.USER_UNBLOCKED
+        await self._repo.append_audit_log(
+            AuditLogEntry(
+                actor_id=actor.telegram_id,
+                action=action,
+                target_entity=f"user:{target_user.telegram_id}",
+                details={
+                    "is_blocked": is_blocked,
+                    "previous_role": previous_role.value,
+                    "new_role": target_user.role.value,
+                    "cancelled_jobs": cancelled_count,
+                    "reason": reason,
+                },
+            )
+        )
+        return target_user

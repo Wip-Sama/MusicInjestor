@@ -26,3 +26,15 @@ class DuplicateTrackError(IngestionError):
         super().__init__(f"Duplicate track detected ({reason}): {existing_path}")
         self.existing_path = existing_path
         self.reason = reason
+
+
+class PermissionDeniedError(IngestionError):
+    """Raised when a user attempts an action without sufficient RBAC permissions."""
+
+
+class OidcAuthenticationError(IngestionError):
+    """Raised when Authentik OIDC nonce verification, token exchange, or userinfo sync fails."""
+
+
+class QueueConcurrencyError(IngestionError):
+    """Raised when an invalid concurrency limit or queue state transition is requested."""
