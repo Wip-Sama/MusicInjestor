@@ -3,6 +3,7 @@
 import asyncio
 from pathlib import Path
 
+from src.core.exceptions import FingerprintingError
 from src.core.models import (
     AudioFingerprint,
     DuplicateCheckResult,
@@ -218,3 +219,91 @@ def test_pipeline_halts_for_ambiguous_candidates_and_resumes_on_confirmation(
     assert confirmed_result.job.selected_metadata.album == "Deluxe Edition"
     assert confirmed_result.job.final_path is not None
     assert confirmed_result.job.final_path.is_file()
+
+
+def test_pipeline_sha256_fallback_manual_search_and_multi_track_batch(
+    tmp_path: Path,
+) -> None:
+    """Verify SHA-256 fallback when `fpcalc` fails, manual search, and multi-track archive batch filing."""
+    track_one = tmp_path / "01 - First Song.flac"
+    track_two = tmp_path / "02 - Second Song.flac"
+    track_one.write_bytes(b"fLaC-track-1")
+    track_two.write_bytes(b"fLaC-track-2")
+
+    class BatchStubExtractor(StubExtractor):
+        async def extract_or_stage(self, source_path: Path, job_id: str) -> list[Path]:
+            await asyncio.sleep(0)
+            return [track_one, track_two]
+
+    class FailingFingerprinter:
+        async def compute_fingerprint(self, audio_path: Path) -> AudioFingerprint:
+            await asyncio.sleep(0)
+            msg = "fpcalc not found"
+            raise FingerprintingError(msg)
+
+    catalog = InMemoryCatalogRepository()
+    extractor = BatchStubExtractor()
+    candidates = [
+        MetadataCandidate(
+            metadata=TrackMetadata(
+                title="First Song",
+                artist="Emilia (CV: Rie Takahashi)",
+                album="Stay Alive",
+                year=2016,
+                track_number=1,
+            ),
+            confidence=0.95,
+        )
+    ]
+    pipeline = IngestionPipeline(
+        extractor=extractor,
+        fingerprinter=FailingFingerprinter(),
+        metadata_provider=StubMetadataProvider(candidates),
+        lyrics_provider=StubLyricsProvider(),
+        organizer=LibraryOrganizer(tmp_path / "library"),
+        catalog_repository=catalog,
+        auto_approve_confidence=0.90,
+    )
+
+    batch_result = asyncio.run(
+        pipeline.process_file(
+            track_one,
+            job_id="job_batch",
+            original_filename="01 - EMILIA(CV:RIE TAKAHASHI) – Stay Alive.flac",
+        )
+    )
+    assert batch_result.job.state == JobState.COMPLETED
+    assert len(catalog.tracks_by_fp) == 2
+
+    # Test manual candidate search and job cancellation
+    low_conf_pipeline = IngestionPipeline(
+        extractor=extractor,
+        fingerprinter=StubFingerprinter("FP_MANUAL"),
+        metadata_provider=StubMetadataProvider(
+            [
+                MetadataCandidate(
+                    metadata=TrackMetadata(title="Stay Alive", artist="Emilia", album="Stay Alive"),
+                    confidence=0.72,
+                )
+            ]
+        ),
+        lyrics_provider=StubLyricsProvider(),
+        organizer=LibraryOrganizer(tmp_path / "library"),
+        catalog_repository=catalog,
+        auto_approve_confidence=0.90,
+    )
+    paused = asyncio.run(low_conf_pipeline.process_file(track_one, job_id="job_manual"))
+    assert paused.job.state == JobState.AWAITING_CONFIRMATION
+
+    manual_res = asyncio.run(
+        low_conf_pipeline.search_manual_candidates(
+            "job_manual",
+            "Emilia (CV: Rie Takahashi) - Stay Alive | Stay Alive",
+        )
+    )
+    assert manual_res.requires_user_confirmation is True
+    assert manual_res.job.state == JobState.AWAITING_CONFIRMATION
+
+    cancelled = asyncio.run(low_conf_pipeline.cancel_job("job_manual"))
+    assert cancelled.state == JobState.CANCELLED
+    assert "job_manual" in extractor.cleaned_jobs

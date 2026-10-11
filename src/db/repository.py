@@ -44,6 +44,7 @@ def _deserialize_metadata(data: dict[str, object]) -> TrackMetadata:
         ),
         recording_mbid=(str(data["recording_mbid"]) if data.get("recording_mbid") is not None else None),
         release_mbid=str(data["release_mbid"]) if data.get("release_mbid") is not None else None,
+        isrc=str(data["isrc"]) if data.get("isrc") is not None else None,
     )
 
 

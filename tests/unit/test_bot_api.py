@@ -43,8 +43,13 @@ from src.bot.routers.commands import (
     handle_status,
 )
 from src.bot.routers.files import format_ingestion_summary, handle_incoming_media
-from src.bot.routers.verification import parse_verification_callback
+from src.bot.routers.verification import (
+    handle_manual_search_query,
+    handle_verification_callback,
+    parse_verification_callback,
+)
 from src.config.settings import AppSettings
+from src.core.extractor import SevenZipArchiveExtractor
 from src.core.models import (
     DuplicateCheckResult,
     IngestionJob,
@@ -92,7 +97,7 @@ def test_resolve_local_api_file_path_hybrid_and_fallback(sample_settings: AppSet
 
 
 def test_verification_keyboard_and_callback_parsing() -> None:
-    """Verify inline keyboard construction and callback data parsing."""
+    """Verify inline keyboard construction with leading confidence and callback data parsing."""
     candidates = [
         MetadataCandidate(
             metadata=TrackMetadata(title="Track A", artist="Artist", album="Album A", year=2001),
@@ -103,6 +108,7 @@ def test_verification_keyboard_and_callback_parsing() -> None:
     assert len(markup.inline_keyboard) == 2
     first_btn = markup.inline_keyboard[0][0]
     assert first_btn.callback_data == "verify:select:job99:0"
+    assert first_btn.text.startswith("1. [82%] Artist - Track A")
 
     action, job_id, idx = parse_verification_callback("verify:select:job99:0")
     assert action == "select"
@@ -198,7 +204,23 @@ def test_admin_and_onboarding_keyboards_and_parsers() -> None:
 
 def test_format_ingestion_summary_variants() -> None:
     """Verify Telegram HTML summary formatting for duplicate, confirmation, and completed states."""
-    job = IngestionJob(job_id="j1", source_path=Path("a.flac"))
+    job = IngestionJob(
+        job_id="j1",
+        source_path=Path("a.flac"),
+        candidates=[
+            MetadataCandidate(
+                metadata=TrackMetadata(
+                    title="Stay Alive",
+                    artist="Emilia (CV: Rie Takahashi)",
+                    album="Stay Alive",
+                    year=2016,
+                    release_mbid="ca344c5b-9c69-4283-8383-e7c4c026d571",
+                ),
+                confidence=0.98,
+                release_type="Single",
+            )
+        ],
+    )
 
     dup_result = IngestionResult(
         job=job,
@@ -211,7 +233,10 @@ def test_format_ingestion_summary_variants() -> None:
     assert "Duplicate Rejected" in format_ingestion_summary(dup_result)
 
     confirm_result = IngestionResult(job=job, requires_user_confirmation=True)
-    assert "Confirmation Required" in format_ingestion_summary(confirm_result)
+    confirm_html = format_ingestion_summary(confirm_result)
+    assert "Confirmation Required" in confirm_html
+    assert "<b>1. [98%]</b>" in confirm_html
+    assert "https://musicbrainz.org/release/ca344c5b-9c69-4283-8383-e7c4c026d571" in confirm_html
 
     job.final_path = Path("/music/Artist/Album/01 - a.flac")
     job.state = JobState.COMPLETED
@@ -407,5 +432,183 @@ def test_build_root_router_and_rbac_middleware_and_admin_handlers(tmp_path: Path
         job, _ = await worker.enqueue_job(owner_user, audio_file)
         cb.data = f"queue:cancel:{job.job_id}"
         await handle_queue_cancel_callback(cb, current_user=owner_user, queue_worker=worker)
+
+    asyncio.run(_scenario())
+
+
+def test_end_to_end_local_bot_api_ingestion_and_interactive_verification_flow(
+    tmp_path: Path,
+    sample_settings: AppSettings,
+) -> None:
+    """Verify full >20MB Local Bot API download mapping, confirmation keyboard, manual search, and filing."""
+    host_api_dir = tmp_path / "telegram-bot-api"
+    wsl_token_dir = host_api_dir / "8931169297\uf03aTOKEN" / "music"
+    wsl_token_dir.mkdir(parents=True)
+    local_downloaded_flac = wsl_token_dir / "file_0.flac"
+    local_downloaded_flac.write_bytes(b"fLaC-stay-alive-32mb")
+
+    settings = sample_settings.model_copy(
+        update={
+            "telegram_local_api_host_dir": host_api_dir,
+            "storage_scratch_dir": tmp_path / "scratch",
+            "storage_library_dir": tmp_path / "library",
+            "database_path": tmp_path / "library.db",
+        }
+    )
+
+    db = SqliteDatabaseManager(settings.database_path)
+    repo = SqliteCatalogRepository(db)
+
+    candidates = [
+        MetadataCandidate(
+            metadata=TrackMetadata(
+                title="Stay Alive",
+                artist="Emilia (CV: Rie Takahashi)",
+                album="Stay Alive",
+                album_artist="Emilia (CV: Rie Takahashi)",
+                year=2016,
+                track_number=1,
+            ),
+            confidence=0.92,
+        ),
+        MetadataCandidate(
+            metadata=TrackMetadata(
+                title="Stay Alive",
+                artist="Emilia (CV: Rie Takahashi)",
+                album="Re:Zero Ending Single",
+                album_artist="Emilia (CV: Rie Takahashi)",
+                year=2016,
+                track_number=1,
+            ),
+            confidence=0.90,
+            disambiguation="TV Size",
+        ),
+    ]
+    pipeline = IngestionPipeline(
+        extractor=SevenZipArchiveExtractor(scratch_root=settings.storage_scratch_dir),
+        fingerprinter=StubFingerprinter("FP_STAY_ALIVE"),
+        metadata_provider=StubMetadataProvider(candidates),
+        lyrics_provider=StubLyricsProvider(),
+        organizer=LibraryOrganizer(settings.storage_library_dir),
+        catalog_repository=repo,
+        auto_approve_confidence=0.90,
+    )
+    worker = IngestionQueueWorker(
+        pipeline=pipeline,
+        catalog_repository=repo,
+        governance_repository=repo,
+    )
+
+    async def _scenario() -> None:
+        await db.initialize()
+        uploader = UserAccount(
+            telegram_id=5295075799,
+            display_name="WindsOf",
+            username="WindsOf",
+            role=UserRole.UPLOADER,
+        )
+        await repo.upsert_user(uploader)
+
+        bot_mock = MagicMock()
+        tg_file_mock = MagicMock()
+        tg_file_mock.file_path = "/var/lib/telegram-bot-api/8931169297:TOKEN/music/file_0.flac"
+        bot_mock.get_file = AsyncMock(return_value=tg_file_mock)
+
+        msg = MagicMock(spec=Message)
+        msg.bot = bot_mock
+        msg.audio = MagicMock(
+            file_id="big_32mb_fid",
+            file_name="Stay Alive.flac",
+            performer="EMILIA(CV:RIE TAKAHASHI)",
+            title="Stay Alive",
+            file_size=33_764_147,
+        )
+        msg.document = None
+        msg.answer = AsyncMock()
+        msg.edit_text = AsyncMock()
+
+        fsm_data: dict[str, object] = {}
+        fsm = MagicMock()
+        fsm.set_state = AsyncMock()
+        fsm.clear = AsyncMock()
+
+        async def _update_data(**kwargs: object) -> None:
+            fsm_data.update(kwargs)
+
+        async def _get_data() -> dict[str, object]:
+            return dict(fsm_data)
+
+        fsm.update_data = AsyncMock(side_effect=_update_data)
+        fsm.get_data = AsyncMock(side_effect=_get_data)
+
+        # 1. Forwarded 32.2 MB track triggers get_file, resolves WSL \uf03a path, and pauses for confirmation
+        await handle_incoming_media(
+            msg,
+            current_user=uploader,
+            queue_worker=worker,
+            pipeline=pipeline,
+            governance_repository=repo,
+            settings=settings,
+            state=fsm,
+        )
+        bot_mock.get_file.assert_awaited_once_with("big_32mb_fid")
+        assert msg.answer.await_count == 2
+        second_reply_text = msg.answer.await_args_list[1].args[0]
+        assert "Confirmation Required" in second_reply_text
+        active_job_id = str(fsm_data["job_id"])
+
+        # 2. User clicks [Manual Search] and submits a refined query
+        cb = MagicMock(spec=CallbackQuery)
+        cb.message = msg
+        cb.answer = AsyncMock()
+        cb.data = f"verify:manual:{active_job_id}"
+        await handle_verification_callback(
+            cb,
+            state=fsm,
+            current_user=uploader,
+            pipeline=pipeline,
+            queue_worker=worker,
+        )
+
+        msg.text = "Emilia (CV: Rie Takahashi) - Stay Alive | Stay Alive"
+        await handle_manual_search_query(msg, state=fsm, pipeline=pipeline)
+
+        # 3. User taps candidate #0: [Emilia (CV: Rie Takahashi) - Stay Alive | Stay Alive (2016) (92%)]
+        cb.data = f"verify:select:{active_job_id}:0"
+        await handle_verification_callback(
+            cb,
+            state=fsm,
+            current_user=uploader,
+            pipeline=pipeline,
+            queue_worker=worker,
+        )
+        msg.edit_text.assert_awaited()
+        assert msg.edit_text.await_args is not None
+        final_summary = str(msg.edit_text.await_args.args[0])
+        assert "Track Ingested" in final_summary
+        assert "01 - Stay Alive.flac" in final_summary
+
+        expected_flac = (
+            settings.storage_library_dir
+            / "Emilia (CV_ Rie Takahashi)"
+            / "Stay Alive (2016)"
+            / "01 - Stay Alive.flac"
+        )
+        assert expected_flac.is_file()
+        assert expected_flac.with_suffix(".lrc").is_file()
+
+        # 4. Forwarding the same track again immediately replies with Duplicate Rejected
+        msg.answer.reset_mock()
+        await handle_incoming_media(
+            msg,
+            current_user=uploader,
+            queue_worker=worker,
+            pipeline=pipeline,
+            governance_repository=repo,
+            settings=settings,
+            state=fsm,
+        )
+        dup_reply = msg.answer.await_args_list[1].args[0]
+        assert "Duplicate Rejected" in dup_reply
 
     asyncio.run(_scenario())

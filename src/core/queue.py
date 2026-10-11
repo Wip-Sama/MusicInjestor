@@ -126,12 +126,14 @@ class IngestionQueueWorker:
         source_path: Path,
         original_filename: str | None = None,
         job_id: str | None = None,
+        file_size_bytes: int | None = None,
     ) -> tuple[IngestionJob, int]:
         """Persist a new job in `QUEUED` state and return `(job, queue_position)`."""
         require_permission(user, Permission.SUBMIT_INGESTION)
         resolved_id = job_id or str(uuid.uuid4())
         resolved_name = original_filename or source_path.name
-        size_bytes = source_path.stat().st_size if source_path.is_file() else 0
+        disk_size = source_path.stat().st_size if source_path.is_file() else 0
+        size_bytes = file_size_bytes if file_size_bytes is not None and file_size_bytes > 0 else disk_size
         sha256_hex = compute_file_sha256(source_path)
 
         job = IngestionJob(
@@ -140,7 +142,7 @@ class IngestionQueueWorker:
             state=JobState.QUEUED,
             created_at=datetime.now(UTC),
             user_id=user.telegram_id,
-            source_type=infer_source_type(source_path),
+            source_type=infer_source_type(Path(resolved_name)),
             original_filename=resolved_name,
             file_size_bytes=size_bytes,
             scratch_dir=source_path.parent,
@@ -181,10 +183,7 @@ class IngestionQueueWorker:
                 f"User {actor.telegram_id} cannot cancel job {job_id} owned by {job.user_id}."
             )
 
-        job.state = JobState.CANCELLED
-        job.completed_at = datetime.now(UTC)
-        await self._catalog.save_job(job)
-        return job
+        return await self._pipeline.cancel_job(job_id)
 
     async def process_next_queued_job(self) -> IngestionResult | None:
         """Acquire a concurrency slot, pop the oldest `QUEUED` job in FIFO order, and execute it."""
@@ -215,16 +214,25 @@ class IngestionQueueWorker:
             if self._progress_callback is not None:
                 await self._progress_callback(job, None)
 
-            result = await self._pipeline.process_file(
-                source_path=job.source_path,
-                job_id=job.job_id,
-                user_id=job.user_id,
-                original_filename=job.original_filename,
-                file_size_bytes=job.file_size_bytes,
-                source_type=job.source_type,
-                sha256_hash=job.sha256_hash,
-                started_at=job.started_at,
-            )
+            try:
+                result = await self._pipeline.process_file(
+                    source_path=job.source_path,
+                    job_id=job.job_id,
+                    user_id=job.user_id,
+                    original_filename=job.original_filename,
+                    file_size_bytes=job.file_size_bytes,
+                    source_type=job.source_type,
+                    sha256_hash=job.sha256_hash,
+                    started_at=job.started_at,
+                )
+            except Exception as exc:
+                failed_job = await self._catalog.get_job(job.job_id) or job
+                failed_job.state = JobState.FAILED
+                failed_job.error_message = str(exc)
+                failed_job.completed_at = datetime.now(UTC)
+                await self._catalog.save_job(failed_job)
+                raise
+
             elapsed = max(0.1, time.monotonic() - started_clock)
             await self._emit_completion_events(result, elapsed)
 
@@ -236,6 +244,16 @@ class IngestionQueueWorker:
             async with self._condition:
                 self._active_count -= 1
                 self._condition.notify_all()
+
+    async def record_confirmed_completion(
+        self,
+        result: IngestionResult,
+        duration_seconds: float = 1.0,
+    ) -> None:
+        """Emit audit log and Admin Channel events when an awaiting-confirmation job finishes."""
+        await self._emit_completion_events(result, duration_seconds)
+        if self._progress_callback is not None:
+            await self._progress_callback(result.job, result)
 
     async def recover_pending_jobs(self) -> list[IngestionJob]:
         """Reset any interrupted in-flight jobs back to `QUEUED` on startup and return the FIFO queue."""

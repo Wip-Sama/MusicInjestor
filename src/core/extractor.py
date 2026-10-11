@@ -3,6 +3,8 @@
 import asyncio
 import logging
 import shutil
+import tarfile
+import zipfile
 from pathlib import Path
 
 from src.core.exceptions import ArchiveExtractionError, UnsupportedAudioFormatError
@@ -13,6 +15,29 @@ SUPPORTED_AUDIO_EXTENSIONS: frozenset[str] = frozenset(
     {".flac", ".mp3", ".m4a", ".alac", ".ogg", ".opus", ".wav", ".wv", ".dsf"}
 )
 SUPPORTED_ARCHIVE_EXTENSIONS: frozenset[str] = frozenset({".zip", ".7z", ".rar", ".tar", ".gz"})
+
+
+def _extract_archive_fallback(archive_path: Path, output_dir: Path) -> None:
+    """Extract `.zip` or `.tar`/`.gz` archives using Python's standard library when `7z` is unavailable."""
+    suffix = archive_path.suffix.lower()
+    try:
+        if suffix == ".zip":
+            with zipfile.ZipFile(archive_path, "r") as zf:
+                zf.extractall(output_dir)
+            return
+        if suffix in {".tar", ".gz"}:
+            with tarfile.open(archive_path, "r:*") as tf:
+                tf.extractall(output_dir, filter="data")
+            return
+    except (zipfile.BadZipFile, tarfile.TarError, OSError) as exc:
+        msg = f"Archive extraction failed for {archive_path.name}: {exc}"
+        raise ArchiveExtractionError(msg) from exc
+
+    msg = (
+        f"7z binary is not installed on PATH and stdlib fallback does not support '{suffix}' "
+        f"for {archive_path.name}."
+    )
+    raise ArchiveExtractionError(msg)
 
 
 class SevenZipArchiveExtractor:
@@ -64,16 +89,26 @@ class SevenZipArchiveExtractor:
         raise UnsupportedAudioFormatError(msg)
 
     async def _run_7z_extract(self, archive_path: Path, output_dir: Path) -> None:
-        """Invoke the system `7z` binary asynchronously to unpack an archive."""
-        process = await asyncio.create_subprocess_exec(
-            self._sevenzip_binary,
-            "x",
-            str(archive_path),
-            f"-o{output_dir}",
-            "-y",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        """Invoke the system `7z` binary asynchronously to unpack an archive, with stdlib fallback."""
+        try:
+            process = await asyncio.create_subprocess_exec(
+                self._sevenzip_binary,
+                "x",
+                str(archive_path),
+                f"-o{output_dir}",
+                "-y",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            logger.info(
+                "Binary '%s' not found on PATH; using Python stdlib fallback for %s",
+                self._sevenzip_binary,
+                archive_path.name,
+            )
+            await asyncio.to_thread(_extract_archive_fallback, archive_path, output_dir)
+            return
+
         stdout_bytes, stderr_bytes = await process.communicate()
         if process.returncode != 0:
             stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()

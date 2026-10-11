@@ -12,10 +12,11 @@ def build_verification_keyboard(
     """Create inline buttons for each metadata candidate plus manual search and cancel actions."""
     rows: list[list[InlineKeyboardButton]] = []
     for index, candidate in enumerate(candidates):
+        button_label = f"{index + 1}. {candidate.display_label}"
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=candidate.display_label[:64],
+                    text=button_label[:64],
                     callback_data=f"verify:select:{job_id}:{index}",
                 )
             ]
@@ -24,7 +25,7 @@ def build_verification_keyboard(
     rows.append(
         [
             InlineKeyboardButton(
-                text="Manual Search",
+                text="Manual Search / Link",
                 callback_data=f"verify:manual:{job_id}",
             ),
             InlineKeyboardButton(

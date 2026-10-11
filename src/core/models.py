@@ -183,6 +183,7 @@ class TrackMetadata:
     duration_seconds: int | None = None
     recording_mbid: str | None = None
     release_mbid: str | None = None
+    isrc: str | None = None
 
     @property
     def effective_album_artist(self) -> str:
@@ -208,8 +209,8 @@ class MetadataCandidate:
         extra = f" [{self.disambiguation}]" if self.disambiguation else ""
         pct = round(self.confidence * 100)
         return (
-            f"{self.metadata.artist} - {self.metadata.title} | "
-            f"{self.metadata.album}{year_part}{extra} ({pct}%)"
+            f"[{pct}%] {self.metadata.artist} - {self.metadata.title} | "
+            f"{self.metadata.album}{year_part}{extra}"
         )
 
 

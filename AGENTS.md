@@ -127,14 +127,15 @@ Before concluding any task that modifies code:
   - Implemented `IngestionQueueWorker` with FIFO persistence and runtime-configurable concurrency (`1..4`).
   - Implemented `TelegramAdminLogNotifier` (Events A, B, C, D and interactive access request cards) and `/admin` Control Dashboard.
 
-### Upcoming Milestones (To Be Implemented Next)
-- [ ] **M4: Deep `mutagen` Tag Inspection & Writing**
-  - Read existing ID3v2 / Vorbis / MP4 tags in `MusicBrainzMetadataService.read_local_metadata`.
-  - Write enriched tags (Artist, Album Artist, Album, Year, Track/Disc numbers, MBIDs, embedded `USLT`/`LYRICS` tags, and cover art) in `LibraryOrganizer.finalize_track`.
-- [ ] **M5: Live AcoustID & MusicBrainz (`musicbrainzngs`) Query Implementation**
-  - Query AcoustID web service in `ChromaprintFingerprinter` when `acoustid_api_key` is configured.
-  - Query `musicbrainzngs` recordings/releases in `MusicBrainzMetadataService.find_candidates` and rank multi-release candidates.
-- [ ] **M6: Multi-Track Archive Batch Processing & End-to-End Telegram FSM Wiring**
-  - Extend `files_router` and `verification_router` in `src/bot/routers/` to download/resolve local API files, invoke `pipeline.process_file`, transition `FSMContext` to `IngestionStates.awaiting_confirmation`, and handle album-level archives.
+- [x] **M4: Deep `mutagen` Tag Inspection & Writing**
+  - Implemented embedded tag inspection (`mutagen.File(..., easy=True)`, including `isrc`) and smart `[disc-]track - Artist - Title` filename stem parsing in `MusicBrainzMetadataService.read_local_metadata`.
+  - Implemented enriched tag writing (Artist, Album Artist, Album, Year, Track/Disc numbers, Genre, MBIDs, and embedded `LYRICS`/`\xa9lyr` tags) alongside `.lrc` sidecars in `LibraryOrganizer.finalize_track`.
+- [x] **M5: Live AcoustID & MusicBrainz (`musicbrainzngs`) Query Implementation**
+  - Added AcoustID v2 REST lookup (`_lookup_acoustid_mbid`) in `ChromaprintFingerprinter` when `acoustid_api_key` is configured, plus SHA-256 fingerprint fallback in `IngestionPipeline` when `fpcalc` is unavailable on host.
+  - Implemented `musicbrainzngs` recording/release lookups with ISRC queries, `Character (CV: Voice Actor)` decomposition (`extract_artist_search_variants`), English/Romaji alias reconstruction (`_extract_english_artist_credit`), artist alias -> `arid` resolution, Lucene escaping, and full `release-list` scoring (demoting unrelated compilations and rewarding year/track matches).
+- [x] **M6: Multi-Track Archive Batch Processing & End-to-End Telegram FSM Wiring**
+  - Wired `files_router` (`handle_incoming_media`) to fetch files via `bot.get_file(file_id)`, map `--local` container paths via `resolve_local_api_file_path` (including WSL/Windows `\uf03a` colon directory translation), enqueue and execute jobs via `IngestionQueueWorker`, and prompt interactive confirmation (`IngestionStates.awaiting_confirmation`) with leading confidence labels (`1. [98%] ...`), full candidate details, and clickable MusicBrainz links.
+  - Wired `verification_router` (`handle_verification_callback` & `handle_manual_search_query`) for release selection (`verify:select`), manual MusicBrainz re-query (`verify:manual` supporting MusicBrainz URLs, raw MBIDs, ISRCs, key-value overrides, `Artist - Title | Album`, or single voice actor/artist overrides), and cancellation (`verify:cancel`).
+
 
 

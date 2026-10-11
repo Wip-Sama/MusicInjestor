@@ -62,6 +62,7 @@ def create_ingestion_pipeline(
         app_name=settings.musicbrainz_app_name,
         app_version=settings.musicbrainz_app_version,
         contact=settings.musicbrainz_contact,
+        enable_network=True,
     )
     lyrics_provider = LrclibLyricsClient(base_url=settings.lrclib_base_url)
     organizer = LibraryOrganizer(library_root=settings.storage_library_dir)

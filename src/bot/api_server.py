@@ -60,6 +60,18 @@ def resolve_local_api_file_path(
     try:
         relative_part = raw_posix.relative_to(work_dir_posix)
         resolved = settings.telegram_local_api_host_dir / Path(*relative_part.parts)
+        if any(":" in part for part in relative_part.parts):
+            wsl_parts = [part.replace(":", "\uf03a") for part in relative_part.parts]
+            wsl_resolved = settings.telegram_local_api_host_dir / Path(*wsl_parts)
+            try:
+                resolved_exists = resolved.exists()
+            except OSError:
+                resolved_exists = False
+            try:
+                if not resolved_exists and (wsl_resolved.exists() or wsl_resolved.parent.exists()):
+                    resolved = wsl_resolved
+            except OSError:
+                pass
         logger.debug(
             "Translated local Bot API path %s -> %s",
             reported_file_path,
