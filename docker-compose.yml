@@ -1,0 +1,61 @@
+services:
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: music-telegram-bot-api
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:-12345678}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:-0123456789abcdef0123456789abcdef}
+      TELEGRAM_LOCAL: 1
+      TELEGRAM_HTTP_PORT: 8081
+      TELEGRAM_STAT: 1
+      TELEGRAM_HTTP_STAT_PORT: 8082
+    ports:
+      - "${TELEGRAM_LOCAL_API_PORT:-8081}:8081"
+      - "8082:8082"
+    volumes:
+      - ./storage/telegram-bot-api:/var/lib/telegram-bot-api
+
+  music-ingest-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: music-ingest-bot
+    restart: unless-stopped
+    depends_on:
+      - telegram-bot-api
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      TELEGRAM_USE_LOCAL_API: "true"
+      TELEGRAM_LOCAL_API_URL: http://telegram-bot-api:8081
+      TELEGRAM_LOCAL_API_WORK_DIR: /var/lib/telegram-bot-api
+      TELEGRAM_LOCAL_API_HOST_DIR: /var/lib/telegram-bot-api
+      STORAGE_SCRATCH_DIR: /app/storage/scratch
+      STORAGE_LIBRARY_DIR: /mnt/music/library
+      DATABASE_PATH: /app/storage/library.db
+    volumes:
+      # Shared volume with telegram-bot-api for zero-copy local file access (up to 2GB)
+      - ./storage/telegram-bot-api:/var/lib/telegram-bot-api:ro
+      - ./storage/scratch:/app/storage/scratch
+      - ./storage/library:/mnt/music/library
+      - ./storage:/app/storage
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: music-ingest-test
+    profiles:
+      - test
+    environment:
+      TELEGRAM_USE_LOCAL_API: "true"
+      TELEGRAM_LOCAL_API_URL: http://telegram-bot-api:8081
+      TELEGRAM_LOCAL_API_WORK_DIR: /var/lib/telegram-bot-api
+      TELEGRAM_LOCAL_API_HOST_DIR: /var/lib/telegram-bot-api
+    command: ["uv", "run", "pytest"]
+

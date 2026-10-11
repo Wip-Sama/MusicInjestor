@@ -1,0 +1,62 @@
+repos:
+  # Formatters and linters
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff
+        entry: uv run ruff check --fix
+        language: system
+        types_or: [python, pyi]
+        files: ^(src/|tests/|.*\.py$)
+        pass_filenames: false
+        always_run: false
+
+      - id: ruff-format
+        name: ruff-format
+        entry: uv run ruff format
+        language: system
+        types_or: [python, pyi]
+        files: ^(src/|tests/|.*\.py$)
+        pass_filenames: false
+        always_run: false
+
+  # Type checkers
+      - id: ty
+        name: ty
+        entry: uv run ty check
+        language: system
+        types: [python]
+        pass_filenames: false
+        always_run: true
+
+      #- id: pyright
+      #  name: pyright
+      #  entry: uv run pyright
+      #  language: system
+      #  types: [python]
+      #  pass_filenames: false
+      #  always_run: true
+
+      # Heavy linters && testing
+      #- id: mypy
+      #  name: mypy
+      #  entry: uv run mypy .
+      #  language: system
+      #  types: [python]
+      #  pass_filenames: false
+      #  stages: [pre-push]
+
+      #- id: pylint
+      #  name: pylint
+      #  entry: uv run pylint
+      #  language: system
+      #  types: [python]
+      #  require_serial: true
+      #  stages: [pre-push]
+
+      - id: pytest
+        name: pytest
+        entry: uv run pytest
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

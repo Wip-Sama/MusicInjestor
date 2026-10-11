@@ -1,0 +1,35 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# Testing & type-checking caches
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime storage & databases
+storage/*
+!storage/scratch/
+storage/scratch/*
+!storage/scratch/.gitkeep
+!storage/library/
+storage/library/*
+!storage/library/.gitkeep
+*.db
+*.db-shm
+*.db-wal
+
