@@ -1,4 +1,4 @@
-"""Interactive `/songs` & `/rescan` router for searching, retrieving, editing, exporting/importing, and reconciling tracks."""
+"""Interactive `/songs` & `/rescan` router for searching, editing, exporting, and reconciling tracks."""
 
 import html
 import json
@@ -301,21 +301,24 @@ def format_rescan_dry_run_card(report: LibraryRescanReport, applied: bool = Fals
         lines.append("\n<b>➕ Added Tracks:</b>")
         for rec in report.added_tracks[:8]:
             lines.append(
-                f"  • {html.escape(rec.artist)} - {html.escape(rec.title)} (<code>{html.escape(rec.storage_path.name)}</code>)"
+                f"  • {html.escape(rec.artist)} - {html.escape(rec.title)} "
+                f"(<code>{html.escape(rec.storage_path.name)}</code>)"
             )
 
     if report.updated_tracks:
         lines.append("\n<b>🔄 Modified / Moved Tracks:</b>")
         for rec in report.updated_tracks[:8]:
             lines.append(
-                f"  • {html.escape(rec.artist)} - {html.escape(rec.title)} ➡️ <code>{html.escape(str(rec.storage_path))}</code>"
+                f"  • {html.escape(rec.artist)} - {html.escape(rec.title)} "
+                f"➡️ <code>{html.escape(str(rec.storage_path))}</code>"
             )
 
     if report.removed_tracks:
         lines.append("\n<b>🗑️ Missing Files (Will Remove from DB):</b>")
         for rec in report.removed_tracks[:8]:
             lines.append(
-                f"  • {html.escape(rec.artist)} - {html.escape(rec.title)} (<code>{html.escape(str(rec.storage_path))}</code>)"
+                f"  • {html.escape(rec.artist)} - {html.escape(rec.title)} "
+                f"(<code>{html.escape(str(rec.storage_path))}</code>)"
             )
 
     if not applied and report.has_changes:
@@ -437,7 +440,8 @@ async def handle_songs_command(
     body = (
         f"{header}\n"
         "────────────────────────\n"
-        "• Tap a song below to open its management menu (download, edit metadata/cover/lyrics, re-search, or export/import).\n"
+        "• Tap a song below to open its management menu "
+        "(download, edit metadata/cover/lyrics, re-search, or export/import).\n"
         "• Or simply <b>type a song title, artist, or album</b> right now to filter the list:"
     )
     await message.answer(
@@ -667,7 +671,10 @@ async def handle_songs_callback(
                 FSInputFile(record.storage_path),
                 title=record.title,
                 performer=record.artist,
-                caption=f"🎵 <b>{html.escape(record.artist)} - {html.escape(record.title)}</b> ({html.escape(record.album)})",
+                caption=(
+                    f"🎵 <b>{html.escape(record.artist)} - {html.escape(record.title)}</b> "
+                    f"({html.escape(record.album)})"
+                ),
             )
             lrc_path = record.storage_path.with_suffix(".lrc")
             if lrc_path.is_file():
@@ -780,7 +787,8 @@ async def handle_songs_callback(
                 "────────────────────────\n"
                 "Send a <b>Photo</b>, an image <b>Document</b> (<code>.jpg</code> / <code>.png</code>), "
                 "or paste a direct <b>Image URL</b> (<code>https://...</code>).\n\n"
-                "<i>You will see a dry-run confirmation preview before <code>cover.jpg</code> and embedded audio tags are updated.</i>",
+                "<i>You will see a dry-run confirmation preview before <code>cover.jpg</code> "
+                "and embedded audio tags are updated.</i>",
                 reply_markup=build_input_cancel_keyboard(record.id),
             )
         await callback.answer()
@@ -805,9 +813,10 @@ async def handle_songs_callback(
                 f"📝 <b>Edit Lyrics for {html.escape(record.artist)} - {html.escape(record.title)}</b>\n"
                 "────────────────────────"
                 f"{preview_snippet}\n"
-                "Send a <code>.lrc</code> or <code>.txt</code> file, or paste the lyrics text directly in chat "
-                "(timestamped <code>[mm:ss.xx]</code> or plain text).\n\n"
-                "<i>Both the embedded audio lyrics tags and the sidecar <code>.lrc</code> file will be updated after confirmation.</i>",
+                "Send a <code>.lrc</code> or <code>.txt</code> file, or paste the lyrics text "
+                "directly in chat (timestamped <code>[mm:ss.xx]</code> or plain text).\n\n"
+                "<i>Both the embedded audio lyrics tags and the sidecar <code>.lrc</code> file "
+                "will be updated after confirmation.</i>",
                 reply_markup=build_input_cancel_keyboard(record.id),
             )
         await callback.answer()
@@ -818,7 +827,8 @@ async def handle_songs_callback(
         await _reset_to_search_state(state, active_song_id=record.id)
         if msg is not None:
             await msg.edit_text(
-                f"🔎 <b>Re-Search Song Data ({html.escape(record.artist)} - {html.escape(record.title)})</b>\n"
+                f"🔎 <b>Re-Search Song Data ({html.escape(record.artist)} - "
+                f"{html.escape(record.title)})</b>\n"
                 "────────────────────────\n"
                 "Choose whether to automatically re-query <b>MusicBrainz + Genius + Last.fm + LRCLIB</b> "
                 "or enter a custom search query / MusicBrainz URL / MBID:",
@@ -906,7 +916,8 @@ async def handle_songs_callback(
             await msg.answer_document(
                 BufferedInputFile(json_text.encode("utf-8"), filename=safe_filename),
                 caption=(
-                    f"📤 <b>Exported Song Data:</b> {html.escape(record.artist)} - {html.escape(record.title)}\n"
+                    f"📤 <b>Exported Song Data:</b> {html.escape(record.artist)} - "
+                    f"{html.escape(record.title)}\n"
                     "You can edit this JSON and re-import it via <b>📥 Import Data</b>."
                 ),
             )
@@ -925,7 +936,8 @@ async def handle_songs_callback(
                 f"📥 <b>Import Song Data for {html.escape(record.artist)} - {html.escape(record.title)}</b>\n"
                 "────────────────────────\n"
                 "Upload a <code>.json</code> file or paste a JSON object with any of these keys:\n"
-                '<code>{"title": "...", "artist": "...", "album": "...", "year": 2020, "track_number": 1, "lyrics": "..."}</code>\n\n'
+                '<code>{"title": "...", "artist": "...", "album": "...", '
+                '"year": 2020, "track_number": 1, "lyrics": "..."}</code>\n\n'
                 "<i>A dry-run preview will be shown for your confirmation before applying.</i>",
                 reply_markup=build_input_cancel_keyboard(record.id),
             )
@@ -1185,7 +1197,8 @@ async def handle_cover_edit_input(
 
     if not cover_bytes:
         await message.answer(
-            "⚠️ Could not read cover image. Please send a Photo, an image file, or a valid <code>https://</code> image URL.",
+            "⚠️ Could not read cover image. Please send a Photo, an image file, "
+            "or a valid <code>https://</code> image URL.",
             reply_markup=build_input_cancel_keyboard(record.id),
         )
         return

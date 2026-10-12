@@ -727,7 +727,7 @@ def _normalize_path_key(path: Path) -> str:
 
 
 def _extract_tail_library_key(path: Path) -> str:
-    """Return the normalized lowercase `<artist>/<album>/<filename>` tail for mount-point migration matching."""
+    """Return normalized lowercase `<artist>/<album>/<filename>` tail for mount-point migration matching."""
     parts = [part.lower() for part in str(path).replace("\\", "/").split("/") if part]
     return "/".join(parts[-3:]) if len(parts) >= 3 else "/".join(parts)
 

@@ -18,19 +18,21 @@ WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app
+    PYTHONPATH=/app \
+    PATH="/app/.venv/bin:${PATH}"
 
 # Install Python dependencies first for optimal layer caching
 COPY pyproject.toml uv.lock .python-version ./
 RUN uv sync --frozen --no-install-project
 
-# Copy application source, tests, and base configuration templates
+# Copy application source, tests, CI workflows, and base configuration templates
 COPY src/ ./src/
 COPY tests/ ./tests/
-COPY main.py README.md config.example.yaml docker-compose.yml docker-compose.example.yaml ./
+COPY .github/ ./.github/
+COPY main.py README.md .env.example config.example.yaml docker-compose.yml docker-compose.example.yaml ./
 
 # Ensure runtime storage and external music mount directories exist inside the container
 RUN mkdir -p /app/storage/scratch /app/storage/library /var/lib/telegram-bot-api /mnt/music/library
 
-CMD ["uv", "run", "--no-dev", "python", "main.py"]
+CMD ["python", "main.py"]
 

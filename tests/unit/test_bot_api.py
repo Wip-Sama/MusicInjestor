@@ -803,7 +803,7 @@ def test_fixtags_moderator_disambiguation_and_wipe_commands_and_callbacks(tmp_pa
 
 
 def test_songs_interactive_menu_dry_run_editing_export_import_and_rescan(tmp_path: Path) -> None:
-    """Verify `/songs` interactive browser, dry-run previews, metadata/lyrics/cover edits, export/import, and `/rescan`."""
+    """Verify `/songs` menu, dry-run previews, metadata/lyrics/cover edits, export/import, and `/rescan`."""
     db = SqliteDatabaseManager(tmp_path / "songs.db")
     repo = SqliteCatalogRepository(db)
     lib_dir = tmp_path / "library"
@@ -1098,7 +1098,10 @@ def test_songs_interactive_menu_dry_run_editing_export_import_and_rescan(tmp_pat
             pipeline=pipeline,
             settings=settings,
         )
-        msg.text = '{"title": "Orange Mint", "artist": "Saori Hayami", "album": "Orange Mint", "year": 2015, "lyrics": "[00:02.00] Imported LRC"}'
+        msg.text = (
+            '{"title": "Orange Mint", "artist": "Saori Hayami", '
+            '"album": "Orange Mint", "year": 2015, "lyrics": "[00:02.00] Imported LRC"}'
+        )
         await handle_import_payload_input(
             msg,
             state=fsm,

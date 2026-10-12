@@ -204,7 +204,7 @@ class AppSettings(BaseModel):
         return value.rstrip("/")
 
     def ensure_directories(self) -> None:
-        """Apply optional process umask and create required runtime directories for scratch, library, and DB."""
+        """Apply optional process umask and create required scratch, library, and DB directories."""
         if self.umask.strip():
             with contextlib.suppress(ValueError, OSError):
                 os.umask(int(self.umask.strip(), 8))

@@ -2,6 +2,9 @@
 
 Self-hosted music library ingestion engine powered by **Python 3.14**, **aiogram 3.x**, **SQLite (WAL mode)**, and the official **Local Telegram Bot API (`--local` mode)** supporting lossless audio and multi-disc archives up to **2 GB**.
 
+> [!NOTE]
+> **Disclaimer:** This project is mostly vibe-coded for personal use and tailored to a specific self-hosted setup and music workflow. While it includes automated tests and a modular structure, expect personal quirks, opinionated defaults, and ongoing experiments. Feel free to explore, fork, or adapt it, but use it at your own discretion!
+
 ## Architecture Highlights
 
 The codebase follows a **Hexagonal Modular Monolith** layout under `src/` so the domain engine (`src/core/`) has zero dependency on Telegram (`aiogram`) or SQLite (`aiosqlite`) and can be extracted into a standalone microservice or paired with a Web UI at any time:
@@ -52,13 +55,38 @@ To run the live WSL Docker container smoke test:
 RUN_WSL_DOCKER_TESTS=1 uv run pytest -m docker
 ```
 
-### 4. Full Docker Compose Deployment (External Mounted Music Folder)
-Set `HOST_MUSIC_DIR` in `.env` (e.g., `HOST_MUSIC_DIR=/mnt/nas/music` or `HOST_MUSIC_DIR=D:/Music`) so your external music folder is bind-mounted to `/mnt/music/library` inside the container (see [`docker-compose.example.yaml`](file:///d:/Programming/musicDownloader/docker-compose.example.yaml) and [`config.example.yaml`](file:///d:/Programming/musicDownloader/config.example.yaml)):
-```bash
-docker compose up -d --build
-```
+### 4. Full Docker Compose Deployment (Pull from GHCR or Build Locally)
+Set `HOST_MUSIC_DIR` in `.env` (e.g., `HOST_MUSIC_DIR=/mnt/nas/music` or `HOST_MUSIC_DIR=D:/Music`) so your external music folder is bind-mounted to `/mnt/music/library` inside the container (see [`docker-compose.example.yaml`](file:///d:/Programming/musicDownloader/docker-compose.example.yaml) and [`config.example.yaml`](file:///d:/Programming/musicDownloader/config.example.yaml)).
+
+- **Option A — Pull Pre-Built Image from GitHub Container Registry (GHCR):**
+  Set `MUSIC_BOT_IMAGE=ghcr.io/<github-owner>/<repo-name>:latest` in `.env`, then run:
+  ```bash
+  docker compose pull
+  docker compose up -d
+  ```
+- **Option B — Build Image Locally:**
+  ```bash
+  docker compose up -d --build
+  ```
+
 Run the test suite inside the container (with `fpcalc`, `7z`, and `ffmpeg` pre-installed):
 ```bash
 docker compose --profile test run --rm test
 ```
+
+### 5. GitHub Actions CI/CD & Local `act` Testing
+The workflow in [`.github/workflows/ci.yml`](file:///d:/Programming/musicDownloader/.github/workflows/ci.yml) runs `ruff`, `ty`, and `pytest`, then builds and publishes the Docker image to `ghcr.io/<owner>/<repo>` on pushes to `main`/`master` or `v*` version tags.
+
+With [`act`](https://github.com/nektos/act) installed (pre-configured via [`.actrc`](file:///d:/Programming/musicDownloader/.actrc) to use `catthehacker/ubuntu:act-latest`), you can test the GitHub Actions jobs locally:
+```bash
+# List workflow jobs
+act -l
+
+# Run the Lint, Typecheck & Test job locally in act
+act -j quality-and-test
+
+# Run the full CI + local Docker build verification pipeline
+act
+```
+
 

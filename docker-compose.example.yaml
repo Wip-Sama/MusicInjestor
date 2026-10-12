@@ -7,7 +7,9 @@
 #      with your real external host/NAS music folder path:
 #        - Linux / NAS:  HOST_MUSIC_DIR=/mnt/nas/music
 #        - Windows/WSL:  HOST_MUSIC_DIR=D:/Music
-#   3. Run: `docker compose up -d --build`
+#   3. Set `MUSIC_BOT_IMAGE=ghcr.io/<github-user>/<repo>:latest` in `.env` to pull from GHCR:
+#        - Pull pre-built image from GHCR: `docker compose pull && docker compose up -d`
+#        - Or build from local source:     `docker compose up -d --build`
 # ============================================================================
 
 services:
@@ -32,6 +34,7 @@ services:
       - ./storage/telegram-bot-api:/var/lib/telegram-bot-api
 
   music-ingest-bot:
+    image: ${MUSIC_BOT_IMAGE:-ghcr.io/owner/musicdownloader:latest}
     build:
       context: .
       dockerfile: Dockerfile

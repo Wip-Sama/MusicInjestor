@@ -85,14 +85,22 @@ uv run pytest
    RUN_WSL_DOCKER_TESTS=1 uv run pytest -m docker
    ```
 
-### 3.3 Full Containerized Execution & Containerized Test Suite (with Linux `fpcalc` & `7z`)
-- **Run full stack in Docker:**
+### 3.3 Full Containerized Execution, GHCR Pull & Local `act` CI Testing
+- **Pull pre-built image from GHCR (set `MUSIC_BOT_IMAGE=ghcr.io/<owner>/<repo>:latest` in `.env`):**
+  ```bash
+  docker compose pull && docker compose up -d
+  ```
+- **Or build and run full stack locally in Docker:**
   ```bash
   docker compose up -d --build
   ```
 - **Run `pytest` inside the Docker image (where `fpcalc`, `7z`, and `ffmpeg` are pre-installed):**
   ```bash
   docker compose --profile test run --rm test
+  ```
+- **Run GitHub Actions CI workflow locally via `act` (`catthehacker/ubuntu:act-latest` configured in `.actrc`):**
+  ```bash
+  act -j quality-and-test
   ```
 
 ---
@@ -160,6 +168,9 @@ Before concluding any task that modifies code:
   - Wired automatic library reconciliation on bot startup and periodic background cron (`run_periodic_library_rescan_loop` in `main.py`), plus interactive `/rescan` (`🔄 Rescan Library Folder`) with Dry-Run Preview Report and confirmation for `MODERATOR`+ roles.
   - Added `<artist>/<album>/<filename>` tail-key matching (`_extract_tail_library_key`) during filesystem rescan so migrating `library.db` between a host path and a Docker container mount (`/mnt/music/library`) automatically updates `storage_path` without losing track IDs or Chromaprint fingerprints.
   - Added layered YAML configuration loading (`config.yaml` / `CONFIG_FILE` < `.env` < environment variables) and `UMASK` / `PUID` / `PGID` support in `src/config/settings.py`, plus `config.example.yaml` and `docker-compose.example.yaml` for external bind-mounted music folders (`HOST_MUSIC_DIR`).
+- [x] **M11: GitHub Actions CI/CD, GHCR Container Registry Publishing & Local `act` Runner Support**
+  - Added `.github/workflows/ci.yml` with `quality-and-test` (`ruff check`, `ruff format --check`, `ty check`, `pytest`) and `docker-build-publish` (publishing tagged images to `ghcr.io/<owner>/<repo>` on branch/tag pushes and running local Docker build+test verification when invoked via `act`).
+  - Added `.actrc` targeting `catthehacker/ubuntu:act-latest` and updated `docker-compose.yml`, `docker-compose.example.yaml`, and `.env.example` with `MUSIC_BOT_IMAGE` so deployments can either pull pre-built GHCR images or build locally.
 
 ### Planned Backlog (Future Enhancements)
 - [ ] **Low-Priority Backlog: Admin Folder Structure Viewer & Mass Migration**
