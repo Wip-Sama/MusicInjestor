@@ -726,6 +726,12 @@ def _normalize_path_key(path: Path) -> str:
         return str(path).replace("\\", "/").lower()
 
 
+def _extract_tail_library_key(path: Path) -> str:
+    """Return the normalized lowercase `<artist>/<album>/<filename>` tail for mount-point migration matching."""
+    parts = [part.lower() for part in str(path).replace("\\", "/").split("/") if part]
+    return "/".join(parts[-3:]) if len(parts) >= 3 else "/".join(parts)
+
+
 def _scan_library_filesystem_sync(
     library_root: Path,
     existing_records: list[LibraryTrackRecord],
@@ -763,10 +769,21 @@ def _scan_library_filesystem_sync(
 
     remaining_records = [rec for rec in existing_records if rec.id not in matched_ids]
     remaining_by_fp: dict[str, LibraryTrackRecord] = {rec.fingerprint: rec for rec in remaining_records}
+    remaining_by_tail: dict[str, LibraryTrackRecord] = {
+        _extract_tail_library_key(rec.storage_path): rec for rec in remaining_records
+    }
 
     for audio_file in unmatched_files:
         sha_fp = _compute_file_sha256_fingerprint_sync(audio_file)
-        moved_rec = remaining_by_fp.pop(sha_fp, None)
+        tail_key = _extract_tail_library_key(audio_file)
+        moved_rec = remaining_by_tail.pop(tail_key, None)
+        if moved_rec is not None:
+            remaining_by_fp.pop(moved_rec.fingerprint, None)
+        else:
+            moved_rec = remaining_by_fp.pop(sha_fp, None)
+            if moved_rec is not None:
+                remaining_by_tail.pop(_extract_tail_library_key(moved_rec.storage_path), None)
+
         if moved_rec is None:
             # Also check if only 1 missing record has the exact same filename and duration
             fallback_meta = _read_mutagen_metadata_sync(
@@ -779,6 +796,7 @@ def _scan_library_filesystem_sync(
                     and cand_rec.artist.lower() == fallback_meta.artist.lower()
                 ):
                     moved_rec = remaining_by_fp.pop(cand_rec.fingerprint, None)
+                    remaining_by_tail.pop(_extract_tail_library_key(cand_rec.storage_path), None)
                     break
 
         if moved_rec is not None:

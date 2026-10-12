@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from src.config.settings import AppSettings, load_settings
@@ -59,7 +60,11 @@ def test_load_settings_merges_dotenv_and_environ(tmp_path: Path) -> None:
         "TELEGRAM_API_ID": "333444",
         "TELEGRAM_USE_LOCAL_API": "true",
     }
-    loaded = load_settings(dotenv_path=dotenv_file, environ=override_env)
+    loaded = load_settings(
+        dotenv_path=dotenv_file,
+        environ=override_env,
+        yaml_path=tmp_path / "missing.yaml",
+    )
     assert loaded.telegram_api_id == 333444
     assert loaded.telegram_use_local_api is True
     assert loaded.auto_approve_confidence == 0.85
@@ -68,6 +73,65 @@ def test_load_settings_merges_dotenv_and_environ(tmp_path: Path) -> None:
     assert loaded.admin_log_channel_id == -100999888
     assert loaded.queue_concurrency_limit == 2
     assert loaded.oidc_enabled is True
+
+
+def test_load_settings_yaml_config_and_precedence(tmp_path: Path) -> None:
+    """Verify `config.yaml` is loaded and overridden by `.env` and environment variables."""
+    yaml_file = tmp_path / "config.yaml"
+    yaml_file.write_text(
+        "telegram:\n"
+        "  api_id: 999000\n"
+        "  use_local_api: true\n"
+        "storage:\n"
+        "  library_dir: /mnt/music/library\n"
+        "  scratch_dir: /app/storage/scratch\n"
+        "  umask: '0002'\n"
+        "governance:\n"
+        "  owner_telegram_ids:\n"
+        "    - 7001\n"
+        "    - 7002\n"
+        "  node_name: Docker Container\n",
+        encoding="utf-8",
+    )
+    dotenv_file = tmp_path / ".env"
+    dotenv_file.write_text(
+        "NODE_NAME=FromDotEnv\n",
+        encoding="utf-8",
+    )
+    loaded = load_settings(
+        dotenv_path=dotenv_file,
+        environ={"CONFIG_FILE": str(yaml_file)},
+    )
+    assert loaded.telegram_api_id == 999000
+    assert loaded.storage_library_dir == Path("/mnt/music/library")
+    assert loaded.storage_scratch_dir == Path("/app/storage/scratch")
+    assert loaded.umask == "0002"
+    assert loaded.owner_telegram_ids == (7001, 7002)
+    assert loaded.node_name == "FromDotEnv"
+
+
+def test_example_yaml_files_are_valid() -> None:
+    """Verify `config.example.yaml`, `docker-compose.yml`, and `docker-compose.example.yaml` parse cleanly."""
+    project_root = Path(__file__).resolve().parent.parent.parent
+    config_example = project_root / "config.example.yaml"
+    compose_main = project_root / "docker-compose.yml"
+    compose_example = project_root / "docker-compose.example.yaml"
+
+    assert config_example.is_file()
+    assert compose_main.is_file()
+    assert compose_example.is_file()
+
+    loaded_settings = load_settings(
+        dotenv_path=project_root / ".nonexistent.env",
+        environ={},
+        yaml_path=config_example,
+    )
+    assert loaded_settings.storage_library_dir == Path("/mnt/music/library")
+
+    compose_data = yaml.safe_load(compose_example.read_text(encoding="utf-8"))
+    assert isinstance(compose_data, dict)
+    assert "services" in compose_data
+    assert "music-ingest-bot" in compose_data["services"]
 
 
 def test_ensure_directories_creates_paths(sample_settings: AppSettings) -> None:

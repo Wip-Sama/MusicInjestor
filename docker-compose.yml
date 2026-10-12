@@ -25,12 +25,14 @@ services:
       dockerfile: Dockerfile
     container_name: music-ingest-bot
     restart: unless-stopped
+    user: "${PUID:-0}:${PGID:-0}"
     depends_on:
       - telegram-bot-api
     env_file:
       - path: .env
         required: false
     environment:
+      CONFIG_FILE: ${CONFIG_FILE:-config.yaml}
       TELEGRAM_USE_LOCAL_API: "true"
       TELEGRAM_LOCAL_API_URL: http://telegram-bot-api:8081
       TELEGRAM_LOCAL_API_WORK_DIR: /var/lib/telegram-bot-api
@@ -38,12 +40,18 @@ services:
       STORAGE_SCRATCH_DIR: /app/storage/scratch
       STORAGE_LIBRARY_DIR: /mnt/music/library
       DATABASE_PATH: /app/storage/library.db
+      UMASK: ${UMASK:-0022}
+    ports:
+      - "${OIDC_LISTEN_PORT:-8080}:8080"
     volumes:
       # Shared volume with telegram-bot-api for zero-copy local file access (up to 2GB)
       - ./storage/telegram-bot-api:/var/lib/telegram-bot-api:ro
-      - ./storage/scratch:/app/storage/scratch
-      - ./storage/library:/mnt/music/library
+      # External host/NAS music folder mounted into the container (override HOST_MUSIC_DIR in .env)
+      - ${HOST_MUSIC_DIR:-./storage/library}:/mnt/music/library
+      # Persistent bot state (SQLite WAL library.db and temporary archive extraction scratch)
       - ./storage:/app/storage
+      # Uncomment below if using a local config.yaml file on the host:
+      # - ./config.yaml:/app/config.yaml:ro
 
   test:
     build:

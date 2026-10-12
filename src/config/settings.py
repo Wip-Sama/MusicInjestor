@@ -1,12 +1,113 @@
-"""Typed environment settings and path resolution for local and Docker runtimes."""
+"""Typed environment, .env, and YAML configuration settings for local and Docker runtimes."""
 
+import contextlib
 import logging
 import os
 from pathlib import Path
 
+import yaml
 from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
+
+_YAML_SECTION_KEY_MAP: dict[str, dict[str, str]] = {
+    "telegram": {
+        "api_id": "TELEGRAM_API_ID",
+        "api_hash": "TELEGRAM_API_HASH",
+        "bot_token": "TELEGRAM_BOT_TOKEN",
+        "use_local_api": "TELEGRAM_USE_LOCAL_API",
+        "local_api_url": "TELEGRAM_LOCAL_API_URL",
+        "local_api_work_dir": "TELEGRAM_LOCAL_API_WORK_DIR",
+        "local_api_host_dir": "TELEGRAM_LOCAL_API_HOST_DIR",
+    },
+    "storage": {
+        "scratch_dir": "STORAGE_SCRATCH_DIR",
+        "library_dir": "STORAGE_LIBRARY_DIR",
+        "database_path": "DATABASE_PATH",
+        "umask": "UMASK",
+    },
+    "metadata": {
+        "acoustid_api_key": "ACOUSTID_API_KEY",
+        "musicbrainz_app_name": "MUSICBRAINZ_APP_NAME",
+        "musicbrainz_app_version": "MUSICBRAINZ_APP_VERSION",
+        "musicbrainz_contact": "MUSICBRAINZ_CONTACT",
+        "genius_access_token": "GENIUS_ACCESS_TOKEN",
+        "lastfm_api_key": "LASTFM_API_KEY",
+        "lastfm_api_secret": "LASTFM_API_SECRET",
+        "lrclib_base_url": "LRCLIB_BASE_URL",
+    },
+    "pipeline": {
+        "auto_approve_confidence": "AUTO_APPROVE_CONFIDENCE",
+        "log_level": "LOG_LEVEL",
+        "fpcalc_binary": "FPCALC_BINARY",
+        "sevenzip_binary": "SEVENZIP_BINARY",
+    },
+    "governance": {
+        "owner_telegram_ids": "OWNER_TELEGRAM_IDS",
+        "admin_log_channel_id": "ADMIN_LOG_CHANNEL_ID",
+        "queue_concurrency_limit": "QUEUE_CONCURRENCY_LIMIT",
+        "secret_key": "SECRET_KEY",
+        "node_name": "NODE_NAME",
+    },
+    "oidc": {
+        "enabled": "OIDC_ENABLED",
+        "authorize_url": "OIDC_AUTHORIZE_URL",
+        "token_url": "OIDC_TOKEN_URL",
+        "userinfo_url": "OIDC_USERINFO_URL",
+        "client_id": "OIDC_CLIENT_ID",
+        "client_secret": "OIDC_CLIENT_SECRET",
+        "redirect_uri": "OIDC_REDIRECT_URI",
+        "webhook_secret": "OIDC_WEBHOOK_SECRET",
+        "listen_host": "OIDC_LISTEN_HOST",
+        "listen_port": "OIDC_LISTEN_PORT",
+        "sync_interval_seconds": "OIDC_SYNC_INTERVAL_SECONDS",
+    },
+}
+
+
+def _stringify_yaml_scalar(value: object) -> str:
+    """Convert a YAML scalar or list (e.g. `owner_telegram_ids`) into an environment string."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple)):
+        return ",".join(str(item).strip() for item in value if str(item).strip())
+    return str(value).strip()
+
+
+def _parse_yaml_config_file(yaml_path: Path) -> dict[str, str]:
+    """Parse an optional YAML configuration file into canonical uppercase setting keys."""
+    values: dict[str, str] = {}
+    if not yaml_path.is_file():
+        return values
+
+    try:
+        loaded = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Failed to parse YAML config file %s: %s", yaml_path, exc)
+        return values
+
+    if not isinstance(loaded, dict):
+        return values
+
+    for raw_top_key, top_val in loaded.items():
+        top_key = str(raw_top_key).strip()
+        lower_section = top_key.lower()
+        if lower_section in _YAML_SECTION_KEY_MAP and isinstance(top_val, dict):
+            section_map = _YAML_SECTION_KEY_MAP[lower_section]
+            for sub_key, sub_val in top_val.items():
+                if sub_val is None:
+                    continue
+                norm_sub = str(sub_key).strip().lower()
+                env_key = section_map.get(norm_sub, str(sub_key).strip().upper())
+                str_val = _stringify_yaml_scalar(sub_val)
+                if str_val != "":
+                    values[env_key] = str_val
+        elif top_val is not None and not isinstance(top_val, dict):
+            str_val = _stringify_yaml_scalar(top_val)
+            if str_val != "":
+                values[top_key.upper()] = str_val
+
+    return values
 
 
 def _parse_dotenv_file(dotenv_path: Path) -> dict[str, str]:
@@ -53,6 +154,7 @@ class AppSettings(BaseModel):
     storage_scratch_dir: Path = Field(default=Path("./storage/scratch"))
     storage_library_dir: Path = Field(default=Path("./storage/library"))
     database_path: Path = Field(default=Path("./storage/library.db"))
+    umask: str = Field(default="0022")
 
     # Pipeline & logging behavior
     auto_approve_confidence: float = Field(default=0.90)
@@ -102,15 +204,19 @@ class AppSettings(BaseModel):
         return value.rstrip("/")
 
     def ensure_directories(self) -> None:
-        """Create required runtime directories for scratch, library, and SQLite parent."""
+        """Apply optional process umask and create required runtime directories for scratch, library, and DB."""
+        if self.umask.strip():
+            with contextlib.suppress(ValueError, OSError):
+                os.umask(int(self.umask.strip(), 8))
         self.storage_scratch_dir.mkdir(parents=True, exist_ok=True)
         self.storage_library_dir.mkdir(parents=True, exist_ok=True)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         logger.debug(
-            "Verified runtime storage directories: scratch=%s, library=%s, db=%s",
+            "Verified runtime storage directories: scratch=%s, library=%s, db=%s (umask=%s)",
             self.storage_scratch_dir,
             self.storage_library_dir,
             self.database_path,
+            self.umask,
         )
 
 
@@ -128,11 +234,21 @@ def _parse_int_tuple(raw: str) -> tuple[int, ...]:
 def load_settings(
     dotenv_path: Path | None = None,
     environ: dict[str, str] | None = None,
+    yaml_path: Path | None = None,
 ) -> AppSettings:
-    """Load application settings from an optional .env file and environment variables."""
+    """Load application settings from optional `config.yaml`, `.env`, and environment variables."""
     resolved_dotenv = dotenv_path if dotenv_path is not None else Path(".env")
-    merged_env = _parse_dotenv_file(resolved_dotenv)
+    dotenv_env = _parse_dotenv_file(resolved_dotenv)
     source_env = environ if environ is not None else dict(os.environ)
+
+    if yaml_path is not None:
+        resolved_yaml = yaml_path
+    else:
+        configured_yaml = source_env.get("CONFIG_FILE") or dotenv_env.get("CONFIG_FILE") or "config.yaml"
+        resolved_yaml = Path(configured_yaml)
+
+    merged_env = _parse_yaml_config_file(resolved_yaml)
+    merged_env.update(dotenv_env)
     merged_env.update(source_env)
 
     raw_kwargs: dict[str, object] = {}
@@ -149,6 +265,7 @@ def load_settings(
         "LASTFM_API_KEY": "lastfm_api_key",
         "LASTFM_API_SECRET": "lastfm_api_secret",
         "LRCLIB_BASE_URL": "lrclib_base_url",
+        "UMASK": "umask",
         "LOG_LEVEL": "log_level",
         "FPCALC_BINARY": "fpcalc_binary",
         "SEVENZIP_BINARY": "sevenzip_binary",

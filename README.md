@@ -19,11 +19,13 @@ For detailed architectural specifications and AI agent handoff status, see:
 
 ## Quick Start
 
-### 1. Environment Configuration
-Copy `.env.example` to `.env` and fill in your Telegram API credentials (from [my.telegram.org](https://my.telegram.org) and `@BotFather`):
+### 1. Configuration (`.env` and/or `config.yaml`)
+Copy `.env.example` to `.env` (or `config.example.yaml` to `config.yaml`) and fill in your Telegram API credentials (from [my.telegram.org](https://my.telegram.org) and `@BotFather`):
 ```bash
 cp .env.example .env
+cp config.example.yaml config.yaml
 ```
+Settings are merged in order: `defaults < config.yaml < .env < environment variables`.
 
 ### 2. Running Tests Locally (`uv`)
 All unit, architectural boundary, and SQLite WAL integration tests run locally via `uv`:
@@ -50,8 +52,8 @@ To run the live WSL Docker container smoke test:
 RUN_WSL_DOCKER_TESTS=1 uv run pytest -m docker
 ```
 
-### 4. Full Docker Compose Deployment (or Containerized Testing with `fpcalc` & `7z`)
-Build and start both `telegram-bot-api` and `music-ingest-bot`:
+### 4. Full Docker Compose Deployment (External Mounted Music Folder)
+Set `HOST_MUSIC_DIR` in `.env` (e.g., `HOST_MUSIC_DIR=/mnt/nas/music` or `HOST_MUSIC_DIR=D:/Music`) so your external music folder is bind-mounted to `/mnt/music/library` inside the container (see [`docker-compose.example.yaml`](file:///d:/Programming/musicDownloader/docker-compose.example.yaml) and [`config.example.yaml`](file:///d:/Programming/musicDownloader/config.example.yaml)):
 ```bash
 docker compose up -d --build
 ```

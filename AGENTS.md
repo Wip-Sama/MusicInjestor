@@ -158,6 +158,8 @@ Before concluding any task that modifies code:
 - [x] **M10 (Phase 2B): Library Folder Rescan & Database Reconciliation**
   - Implemented `LibraryOrganizer.scan_library_filesystem`, `apply_rescan_report`, and `reconcile_library_with_repository` (`LibraryRescanReport` in `src/core/models.py`) plus `SqliteCatalogRepository.upsert_scanned_library_track` and `delete_library_track` to synchronize `storage/library` filesystem changes (newly added, modified/retagged, moved, or deleted audio tracks, `.lrc` sidecars, and `cover.jpg` files) with SQLite.
   - Wired automatic library reconciliation on bot startup and periodic background cron (`run_periodic_library_rescan_loop` in `main.py`), plus interactive `/rescan` (`🔄 Rescan Library Folder`) with Dry-Run Preview Report and confirmation for `MODERATOR`+ roles.
+  - Added `<artist>/<album>/<filename>` tail-key matching (`_extract_tail_library_key`) during filesystem rescan so migrating `library.db` between a host path and a Docker container mount (`/mnt/music/library`) automatically updates `storage_path` without losing track IDs or Chromaprint fingerprints.
+  - Added layered YAML configuration loading (`config.yaml` / `CONFIG_FILE` < `.env` < environment variables) and `UMASK` / `PUID` / `PGID` support in `src/config/settings.py`, plus `config.example.yaml` and `docker-compose.example.yaml` for external bind-mounted music folders (`HOST_MUSIC_DIR`).
 
 ### Planned Backlog (Future Enhancements)
 - [ ] **Low-Priority Backlog: Admin Folder Structure Viewer & Mass Migration**

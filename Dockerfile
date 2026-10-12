@@ -24,13 +24,13 @@ ENV UV_COMPILE_BYTECODE=1 \
 COPY pyproject.toml uv.lock .python-version ./
 RUN uv sync --frozen --no-install-project
 
-# Copy application source and tests
+# Copy application source, tests, and base configuration templates
 COPY src/ ./src/
 COPY tests/ ./tests/
-COPY main.py README.md ./
+COPY main.py README.md config.example.yaml docker-compose.yml docker-compose.example.yaml ./
 
-# Ensure runtime storage directories exist inside the container
-RUN mkdir -p /app/storage/scratch /app/storage/library /var/lib/telegram-bot-api
+# Ensure runtime storage and external music mount directories exist inside the container
+RUN mkdir -p /app/storage/scratch /app/storage/library /var/lib/telegram-bot-api /mnt/music/library
 
 CMD ["uv", "run", "--no-dev", "python", "main.py"]
 

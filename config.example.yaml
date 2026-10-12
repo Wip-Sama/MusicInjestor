@@ -1,0 +1,82 @@
+# ============================================================================
+# Automated Music Ingestion Bot — Base YAML Configuration (config.example.yaml)
+# ============================================================================
+# Copy this file to `config.yaml` and customize as needed.
+# Precedence order (lowest to highest):
+#   1. Built-in defaults
+#   2. `config.yaml` (or custom path set via `CONFIG_FILE`)
+#   3. `.env` file
+#   4. OS / Docker Compose environment variables
+# ============================================================================
+
+telegram:
+  # Obtain API_ID and API_HASH at https://my.telegram.org/apps
+  api_id: 12345678
+  api_hash: "0123456789abcdef0123456789abcdef"
+  # Obtain BOT_TOKEN from @BotFather (https://t.me/BotFather)
+  bot_token: "123456789:AAExampleBotTokenStringHere"
+
+  # Local Telegram Bot API mode (lifts the 20MB limit up to 2000MB)
+  use_local_api: true
+  # Use http://telegram-bot-api:8081 inside Docker Compose, or http://localhost:8081 on host
+  local_api_url: "http://telegram-bot-api:8081"
+  local_api_work_dir: "/var/lib/telegram-bot-api"
+  local_api_host_dir: "/var/lib/telegram-bot-api"
+
+storage:
+  # Inside Docker, your external host music folder is bind-mounted to `/mnt/music/library`.
+  # Change `HOST_MUSIC_DIR` in `.env` or `docker-compose.yml` to point to your external music path.
+  library_dir: "/mnt/music/library"
+  scratch_dir: "/app/storage/scratch"
+  database_path: "/app/storage/library.db"
+  # File creation umask applied inside the container (0022 -> 755 dirs / 644 files; 0002 -> group-writable)
+  umask: "0022"
+
+metadata:
+  # AcoustID API key: https://acoustid.org/new-application
+  acoustid_api_key: ""
+  # MusicBrainz client identification (https://musicbrainz.org/doc/MusicBrainz_API/Rate_Limiting)
+  musicbrainz_app_name: "MusicIngestBot"
+  musicbrainz_app_version: "0.1.0"
+  musicbrainz_contact: "admin@example.com"
+  # Genius API Client Access Token: https://genius.com/api-clients (optional; public search fallback used if empty)
+  genius_access_token: ""
+  # Last.fm API credentials: https://www.last.fm/api/account/create (optional)
+  lastfm_api_key: ""
+  lastfm_api_secret: ""
+  # LRCLIB synced/plain lyrics API (free, no key required)
+  lrclib_base_url: "https://lrclib.net/api"
+
+pipeline:
+  # Confidence threshold [0.0..1.0] for automatic metadata approval
+  auto_approve_confidence: 0.90
+  log_level: "INFO"
+  fpcalc_binary: "fpcalc"
+  sevenzip_binary: "7z"
+
+governance:
+  # Telegram user IDs granted top-tier OWNER permissions automatically
+  owner_telegram_ids:
+    - 10000001
+  # Optional Telegram channel/supergroup ID for real-time audit & queue notifications
+  admin_log_channel_id: -1001234567890
+  # Concurrent ingestion workers (1..4)
+  queue_concurrency_limit: 1
+  # 32+ character secret key used for HMAC state nonces and OIDC token encryption at rest
+  secret_key: "replace-with-secure-random-32-byte-secret-key"
+  node_name: "Docker Container"
+
+oidc:
+  # Optional Authentik OIDC SSO Federation
+  enabled: false
+  authorize_url: "https://auth.example.com/application/o/authorize"
+  token_url: "https://auth.example.com/application/o/token"
+  userinfo_url: "https://auth.example.com/application/o/userinfo"
+  client_id: "music-ingest-bot"
+  client_secret: ""
+  redirect_uri: "http://localhost:8080/api/v1/auth/callback"
+  webhook_secret: ""
+  listen_host: "0.0.0.0"
+  listen_port: 8080
+  sync_interval_seconds: 3600
+
