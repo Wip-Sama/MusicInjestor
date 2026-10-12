@@ -13,6 +13,7 @@ from src.bot.keyboards import (
     BTN_MAIN_ADMIN,
     BTN_MAIN_INFO,
     BTN_MAIN_QUEUE,
+    BTN_MAIN_SONGS,
     BTN_MAIN_SSO,
     build_access_request_approval_keyboard,
     build_admin_dashboard_keyboard,
@@ -33,16 +34,34 @@ from src.bot.routers.admin import (
     handle_admin_dashboard_callback,
     handle_queue_cancel_callback,
     handle_queue_view_callback,
+    handle_wipe_command,
     parse_access_request_callback,
     parse_admin_callback,
 )
 from src.bot.routers.commands import (
+    handle_cancel_command,
+    handle_fixtags_command,
     handle_queue_command,
     handle_sso_command,
     handle_start,
     handle_status,
 )
 from src.bot.routers.files import format_ingestion_summary, handle_incoming_media
+from src.bot.routers.songs import (
+    _is_ingestion_media_message,
+    _is_non_command_text,
+    _is_non_media_input_message,
+    handle_cover_edit_input,
+    handle_custom_research_input,
+    handle_dry_run_unexpected_text,
+    handle_import_payload_input,
+    handle_lyrics_edit_input,
+    handle_metadata_edit_input,
+    handle_rescan_command,
+    handle_songs_callback,
+    handle_songs_command,
+    handle_songs_search_text,
+)
 from src.bot.routers.verification import (
     handle_manual_search_query,
     handle_verification_callback,
@@ -51,10 +70,12 @@ from src.bot.routers.verification import (
 from src.config.settings import AppSettings
 from src.core.extractor import SevenZipArchiveExtractor
 from src.core.models import (
+    AudioFingerprint,
     DuplicateCheckResult,
     IngestionJob,
     IngestionResult,
     JobState,
+    LyricsData,
     MetadataCandidate,
     TrackMetadata,
     UserAccount,
@@ -142,8 +163,9 @@ def test_admin_and_onboarding_keyboards_and_parsers() -> None:
     owner_menu = build_main_menu_keyboard(owner_user)
     assert owner_menu.resize_keyboard is True
     assert owner_menu.is_persistent is True
-    assert owner_menu.keyboard[0][0].text == BTN_MAIN_QUEUE
-    assert owner_menu.keyboard[0][1].text == BTN_MAIN_SSO
+    assert owner_menu.keyboard[0][0].text == BTN_MAIN_SONGS
+    assert owner_menu.keyboard[0][1].text == BTN_MAIN_QUEUE
+    assert owner_menu.keyboard[0][2].text == BTN_MAIN_SSO
     assert owner_menu.keyboard[1][0].text == BTN_MAIN_ADMIN
     assert owner_menu.keyboard[1][1].text == BTN_MAIN_INFO
 
@@ -247,7 +269,7 @@ def test_format_ingestion_summary_variants() -> None:
 def test_build_root_router_and_rbac_middleware_and_admin_handlers(tmp_path: Path) -> None:
     """Verify root router, `RbacMiddleware` guest/blocked gating, `/start`, `/adduser`, and `/admin` flows."""
     root = build_root_router()
-    assert len(root.sub_routers) == 4
+    assert len(root.sub_routers) == 5
 
     db = SqliteDatabaseManager(tmp_path / "mw.db")
     repo = SqliteCatalogRepository(db)
@@ -541,7 +563,8 @@ def test_end_to_end_local_bot_api_ingestion_and_interactive_verification_flow(
         fsm.update_data = AsyncMock(side_effect=_update_data)
         fsm.get_data = AsyncMock(side_effect=_get_data)
 
-        # 1. Forwarded 32.2 MB track triggers get_file, resolves WSL \uf03a path, and pauses for confirmation
+        # 1. Forwarded 32.2 MB track triggers get_file, resolves WSL \uf03a path,
+        # edits progress bar in-place, and transitions the same message into confirmation card
         await handle_incoming_media(
             msg,
             current_user=uploader,
@@ -552,9 +575,13 @@ def test_end_to_end_local_bot_api_ingestion_and_interactive_verification_flow(
             state=fsm,
         )
         bot_mock.get_file.assert_awaited_once_with("big_32mb_fid")
-        assert msg.answer.await_count == 2
-        second_reply_text = msg.answer.await_args_list[1].args[0]
-        assert "Confirmation Required" in second_reply_text
+        msg.answer.assert_awaited_once()
+        status_msg = msg.answer.return_value
+        assert status_msg.edit_text.await_count >= 3
+        progress_edits = [str(call.args[0]) for call in status_msg.edit_text.await_args_list]
+        assert any("Ingesting:" in text and "Stay Alive.flac" in text for text in progress_edits)
+        final_confirm_text = progress_edits[-1]
+        assert "Confirmation Required" in final_confirm_text
         active_job_id = str(fsm_data["job_id"])
 
         # 2. User clicks [Manual Search] and submits a refined query
@@ -597,8 +624,9 @@ def test_end_to_end_local_bot_api_ingestion_and_interactive_verification_flow(
         assert expected_flac.is_file()
         assert expected_flac.with_suffix(".lrc").is_file()
 
-        # 4. Forwarding the same track again immediately replies with Duplicate Rejected
+        # 4. Forwarding the same track again edits the queued message in-place with Duplicate Rejected
         msg.answer.reset_mock()
+        status_msg.edit_text.reset_mock()
         await handle_incoming_media(
             msg,
             current_user=uploader,
@@ -608,7 +636,635 @@ def test_end_to_end_local_bot_api_ingestion_and_interactive_verification_flow(
             settings=settings,
             state=fsm,
         )
-        dup_reply = msg.answer.await_args_list[1].args[0]
+        msg.answer.assert_awaited_once()
+        dup_reply = str(status_msg.edit_text.await_args_list[-1].args[0])
         assert "Duplicate Rejected" in dup_reply
+
+    asyncio.run(_scenario())
+
+
+def _last_arg(mock_fn: AsyncMock) -> str:
+    """Return the first positional argument from the latest await call on `mock_fn`."""
+    assert mock_fn.await_args is not None
+    return str(mock_fn.await_args.args[0])
+
+
+def test_fixtags_moderator_disambiguation_and_wipe_commands_and_callbacks(tmp_path: Path) -> None:
+    """Verify `/fixtags`, `admin:tags` / `admin:tag_approve`, `admin:resolve_job`, and `/wipe CONFIRM`."""
+    db = SqliteDatabaseManager(tmp_path / "mod_tags.db")
+    repo = SqliteCatalogRepository(db)
+    gov = GovernanceService(repo, owner_telegram_ids=(1001,))
+
+    candidates = [
+        MetadataCandidate(
+            metadata=TrackMetadata(
+                title="Stay Alive",
+                artist="Emilia (CV: Rie Takahashi)",
+                album="Stay Alive",
+                year=2016,
+                track_number=1,
+            ),
+            confidence=0.75,
+        )
+    ]
+    pipeline = IngestionPipeline(
+        extractor=StubExtractor(),
+        fingerprinter=StubFingerprinter("FP_PAUSED"),
+        metadata_provider=StubMetadataProvider(candidates),
+        lyrics_provider=StubLyricsProvider(),
+        organizer=LibraryOrganizer(tmp_path / "lib"),
+        catalog_repository=repo,
+        auto_approve_confidence=0.90,
+    )
+    worker = IngestionQueueWorker(
+        pipeline=pipeline,
+        catalog_repository=repo,
+        governance_repository=repo,
+    )
+
+    async def _scenario() -> None:
+        await db.initialize()
+        owner = await gov.ensure_user(1001, "Owner")
+        uploader_a = await gov.ensure_user(2001, "Uploader A")
+        uploader_a = await gov.change_user_role(owner, 2001, UserRole.UPLOADER)
+        uploader_b = await gov.ensure_user(2002, "Uploader B")
+        uploader_b = await gov.change_user_role(owner, 2002, UserRole.UPLOADER)
+        moderator = await gov.ensure_user(3001, "Moderator")
+        moderator = await gov.change_user_role(owner, 3001, UserRole.MODERATOR)
+
+        # 1. Uploader A pauses a job at AWAITING_CONFIRMATION
+        audio_path = tmp_path / "paused.flac"
+        audio_path.write_bytes(b"fLaC-paused")
+        job, _ = await worker.enqueue_job(uploader_a, audio_path, "paused.flac")
+        res = await worker.execute_job(job.job_id)
+        assert res is not None
+        assert res.requires_user_confirmation is True
+
+        # 2. Uploader B (another UPLOADER) is blocked from resolving Uploader A's job
+        cb = MagicMock(spec=CallbackQuery)
+        cb.data = f"verify:select:{job.job_id}:0"
+        cb.answer = AsyncMock()
+        msg = MagicMock(spec=Message)
+        msg.answer = AsyncMock()
+        msg.edit_text = AsyncMock()
+        cb.message = msg
+
+        await handle_verification_callback(
+            cb,
+            current_user=uploader_b,
+            pipeline=pipeline,
+            queue_worker=worker,
+        )
+        assert "permission" in _last_arg(cb.answer).lower()
+
+        # 3. Moderator views `/queue`, sees paused job button, opens `admin:resolve_job`, and confirms it
+        await handle_queue_command(msg, current_user=moderator, governance_repository=repo)
+        assert "Awaiting Disambiguation" in _last_arg(msg.answer)
+
+        fsm = MagicMock()
+        fsm.set_state = AsyncMock()
+        fsm.update_data = AsyncMock()
+        fsm.clear = AsyncMock()
+
+        cb.data = f"admin:resolve_job:{job.job_id}"
+        await handle_admin_dashboard_callback(
+            cb,
+            current_user=moderator,
+            governance_service=gov,
+            governance_repository=repo,
+            queue_worker=worker,
+            pipeline=pipeline,
+            state=fsm,
+        )
+        msg.edit_text.assert_awaited()
+
+        cb.data = f"verify:select:{job.job_id}:0"
+        await handle_verification_callback(
+            cb,
+            state=fsm,
+            current_user=moderator,
+            pipeline=pipeline,
+            queue_worker=worker,
+        )
+        assert "Track Ingested" in _last_arg(msg.edit_text)
+
+        # 4. Uploader A runs `/fixtags` (first without args to list tracks, then with tag edits)
+        msg.text = "/fixtags"
+        await handle_fixtags_command(
+            msg,
+            current_user=uploader_a,
+            governance_service=gov,
+            governance_repository=repo,
+        )
+        assert "Recent Library Tracks" in _last_arg(msg.answer)
+
+        tracks = await repo.list_library_tracks(limit=5)
+        assert len(tracks) == 1
+        track_id = tracks[0].id
+
+        msg.text = f"/fixtags {track_id} title=Stay Alive (Edited) | artist=Emilia | year=2017 | reason=Fix"
+        await handle_fixtags_command(
+            msg,
+            current_user=uploader_a,
+            governance_service=gov,
+            governance_repository=repo,
+        )
+        assert "Tag Correction Request #1 Submitted" in _last_arg(msg.answer)
+
+        # 5. Moderator reviews `admin:tags` and approves `admin:tag_approve:1`
+        cb.data = "admin:tags"
+        await handle_admin_dashboard_callback(
+            cb,
+            current_user=moderator,
+            governance_service=gov,
+            governance_repository=repo,
+        )
+        assert "Pending Tag Correction #1" in _last_arg(msg.edit_text)
+
+        cb.data = "admin:tag_approve:1"
+        await handle_admin_dashboard_callback(
+            cb,
+            current_user=moderator,
+            governance_service=gov,
+            governance_repository=repo,
+        )
+        assert "Approved" in _last_arg(msg.edit_text)
+
+        updated_track = await repo.get_library_track(track_id)
+        assert updated_track is not None
+        assert updated_track.title == "Stay Alive (Edited)"
+
+        # 6. Owner executes `/wipe CONFIRM`
+        msg.text = "/wipe CONFIRM"
+        await handle_wipe_command(msg, current_user=owner, governance_service=gov)
+        assert "System Catalog Wipe Executed" in _last_arg(msg.answer)
+
+    asyncio.run(_scenario())
+
+
+def test_songs_interactive_menu_dry_run_editing_export_import_and_rescan(tmp_path: Path) -> None:
+    """Verify `/songs` interactive browser, dry-run previews, metadata/lyrics/cover edits, export/import, and `/rescan`."""
+    db = SqliteDatabaseManager(tmp_path / "songs.db")
+    repo = SqliteCatalogRepository(db)
+    lib_dir = tmp_path / "library"
+    scratch_dir = tmp_path / "scratch"
+    organizer = LibraryOrganizer(lib_dir)
+
+    candidates = [
+        MetadataCandidate(
+            metadata=TrackMetadata(
+                title="Orange Mint",
+                artist="Saori Hayami",
+                album="Orange Mint",
+                year=2015,
+                track_number=1,
+                duration_seconds=274,
+                recording_mbid="rec-orange",
+                release_mbid="rel-orange",
+            ),
+            confidence=1.0,
+        )
+    ]
+    pipeline = IngestionPipeline(
+        extractor=SevenZipArchiveExtractor(scratch_root=scratch_dir),
+        fingerprinter=StubFingerprinter(),
+        metadata_provider=StubMetadataProvider(candidates),
+        lyrics_provider=StubLyricsProvider(),
+        organizer=organizer,
+        catalog_repository=repo,
+    )
+    settings = AppSettings(
+        telegram_api_id=12345,
+        telegram_api_hash="0123456789abcdef",
+        telegram_bot_token="123456:ABCDEF",
+        storage_scratch_dir=scratch_dir,
+        storage_library_dir=lib_dir,
+        database_path=tmp_path / "songs.db",
+    )
+
+    async def _scenario() -> None:
+        await db.initialize()
+        uploader = UserAccount(telegram_id=3001, display_name="Uploader", role=UserRole.UPLOADER)
+        await repo.upsert_user(uploader)
+
+        # Create a real track file in the library and register it
+        src_audio = tmp_path / "01 - Orange Mint.flac"
+        src_audio.write_bytes(b"fake-flac-bytes-orange-mint")
+        final_path = await organizer.finalize_track(
+            src_audio,
+            candidates[0].metadata,
+            LyricsData(synced_lyrics="[00:08.53] Sayonara"),
+        )
+        await repo.register_ingested_track(
+            job_id="job-orange-1",
+            metadata=candidates[0].metadata,
+            fingerprint=AudioFingerprint(duration_seconds=274, fingerprint="fp-orange-1"),
+            library_path=final_path,
+        )
+
+        # Stateful FSM mock storing `state_data` dictionary
+        state_data: dict[str, object] = {}
+        fsm = MagicMock()
+        fsm.set_state = AsyncMock()
+
+        async def _update_data(**kwargs: object) -> dict[str, object]:
+            state_data.update(kwargs)
+            return dict(state_data)
+
+        async def _get_data() -> dict[str, object]:
+            return dict(state_data)
+
+        fsm.update_data = AsyncMock(side_effect=_update_data)
+        fsm.get_data = AsyncMock(side_effect=_get_data)
+        fsm.clear = AsyncMock(side_effect=state_data.clear)
+
+        msg = MagicMock(spec=Message)
+        msg.answer = AsyncMock()
+        msg.edit_text = AsyncMock()
+        msg.answer_audio = AsyncMock()
+        msg.answer_document = AsyncMock()
+        msg.answer_photo = AsyncMock()
+        msg.photo = None
+        msg.document = None
+        msg.bot = MagicMock()
+
+        # 1. `/songs` opens browser menu
+        msg.text = "/songs"
+        await handle_songs_command(
+            msg,
+            state=fsm,
+            current_user=uploader,
+            governance_repository=repo,
+        )
+        assert "Music Library Browser" in _last_arg(msg.answer)
+
+        # 2. Type search query in `awaiting_search_query`
+        msg.text = "Orange"
+        await handle_songs_search_text(
+            msg,
+            state=fsm,
+            current_user=uploader,
+            governance_repository=repo,
+        )
+        assert "Search Results for" in _last_arg(msg.answer)
+
+        tracks = await repo.list_library_tracks(limit=5)
+        assert len(tracks) == 1
+        track = tracks[0]
+        sid = track.id[:12]
+
+        cb = MagicMock(spec=CallbackQuery)
+        cb.message = msg
+        cb.answer = AsyncMock()
+
+        # 3. View song card (`songs:view:<sid>`) & retrieve song/album (`songs:get_track`, `songs:get_album`)
+        cb.data = f"songs:view:{sid}"
+        await handle_songs_callback(
+            cb,
+            state=fsm,
+            current_user=uploader,
+            governance_repository=repo,
+            pipeline=pipeline,
+            settings=settings,
+        )
+        assert "Song Details" in _last_arg(msg.edit_text)
+
+        cb.data = f"songs:get_track:{sid}"
+        await handle_songs_callback(
+            cb,
+            state=fsm,
+            current_user=uploader,
+            governance_repository=repo,
+            pipeline=pipeline,
+            settings=settings,
+        )
+        msg.answer_audio.assert_awaited()
+        msg.answer_document.assert_awaited()
+
+        cb.data = f"songs:get_album:{sid}"
+        await handle_songs_callback(
+            cb,
+            state=fsm,
+            current_user=uploader,
+            governance_repository=repo,
+            pipeline=pipeline,
+            settings=settings,
+        )
+
+        # 4. Edit Metadata -> Dry-Run Preview -> Confirm & Apply (relocates file on disk!)
+        cb.data = f"songs:field:{sid}:multi"
+        await handle_songs_callback(
+            cb,
+            state=fsm,
+            current_user=uploader,
+            governance_repository=repo,
+            pipeline=pipeline,
+            settings=settings,
+        )
+        msg.text = "artist: Yotsugi Ononoki(Saori Hayami) | title: Orange Mint (TV Size) | year: 2016"
+        await handle_metadata_edit_input(
+            msg,
+            state=fsm,
+            governance_repository=repo,
+            pipeline=pipeline,
+            settings=settings,
+        )
+        dry_run_html = _last_arg(msg.answer)
+        assert "Dry-Run Preview (METADATA)" in dry_run_html
+        assert "Orange Mint (TV Size)" in dry_run_html
+        assert "Saori Hayami" in dry_run_html
+
+        cb.data = f"songs:confirm_apply:{sid}"
+        await handle_songs_callback(
+            cb,
+            state=fsm,
+            current_user=uploader,
+            governance_repository=repo,
+            pipeline=pipeline,
+            settings=settings,
+        )
+        assert "Changes Applied Successfully" in _last_arg(msg.edit_text)
+        updated_rec = await repo.get_library_track(sid)
+        assert updated_rec is not None
+        assert updated_rec.title == "Orange Mint (TV Size)"
+        assert updated_rec.year == 2016
+        assert updated_rec.storage_path.is_file()
+
+        # 5. Edit Lyrics -> Dry-Run Preview -> Confirm & Apply
+        cb.data = f"songs:edit_lyrics:{sid}"
+        await handle_songs_callback(
+            cb,
+            state=fsm,
+            current_user=uploader,
+            governance_repository=repo,
+            pipeline=pipeline,
+            settings=settings,
+        )
+        msg.text = "[00:01.00] New synced line 1\n[00:05.00] New synced line 2"
+        await handle_lyrics_edit_input(
+            msg,
+            state=fsm,
+            governance_repository=repo,
+            pipeline=pipeline,
+            settings=settings,
+        )
+        assert "Dry-Run Preview (LYRICS)" in _last_arg(msg.answer)
+
+        cb.data = f"songs:confirm_apply:{sid}"
+        await handle_songs_callback(
+            cb,
+            state=fsm,
+            current_user=uploader,
+            governance_repository=repo,
+            pipeline=pipeline,
+            settings=settings,
+        )
+        lrc_file = updated_rec.storage_path.with_suffix(".lrc")
+        assert lrc_file.is_file()
+        assert "New synced line 1" in lrc_file.read_text(encoding="utf-8")
+
+        # 6. Edit Cover Art via uploaded document -> Dry-Run Preview -> Confirm & Apply
+        cb.data = f"songs:edit_cover:{sid}"
+        await handle_songs_callback(
+            cb,
+            state=fsm,
+            current_user=uploader,
+            governance_repository=repo,
+            pipeline=pipeline,
+            settings=settings,
+        )
+        local_api_dir = tmp_path / "telegram-bot-api"
+        local_api_dir.mkdir(parents=True, exist_ok=True)
+        cover_upload = local_api_dir / "new_cover.jpg"
+        cover_upload.write_bytes(b"\xff\xd8\xff\xe0\x00\x10JFIF-new-cover")
+        doc_mock = MagicMock()
+        doc_mock.file_id = "cover-file-id"
+        doc_mock.mime_type = "image/jpeg"
+        msg.document = doc_mock
+        msg.text = None
+        tg_file_mock = MagicMock()
+        tg_file_mock.file_path = str(cover_upload)
+        msg.bot.get_file = AsyncMock(return_value=tg_file_mock)
+
+        await handle_cover_edit_input(
+            msg,
+            state=fsm,
+            governance_repository=repo,
+            pipeline=pipeline,
+            settings=settings,
+        )
+        assert "Dry-Run Preview (COVER)" in _last_arg(msg.answer)
+        msg.document = None
+
+        cb.data = f"songs:confirm_apply:{sid}"
+        await handle_songs_callback(
+            cb,
+            state=fsm,
+            current_user=uploader,
+            governance_repository=repo,
+            pipeline=pipeline,
+            settings=settings,
+        )
+        assert (
+            updated_rec.storage_path.parent / "cover.jpg"
+        ).read_bytes() == b"\xff\xd8\xff\xe0\x00\x10JFIF-new-cover"
+
+        # 7. Export & Import JSON -> Dry-Run Preview -> Confirm & Apply
+        cb.data = f"songs:export:{sid}"
+        await handle_songs_callback(
+            cb,
+            state=fsm,
+            current_user=uploader,
+            governance_repository=repo,
+            pipeline=pipeline,
+            settings=settings,
+        )
+        cb.data = "songs:export_all"
+        await handle_songs_callback(
+            cb,
+            state=fsm,
+            current_user=uploader,
+            governance_repository=repo,
+            pipeline=pipeline,
+            settings=settings,
+        )
+
+        cb.data = f"songs:import:{sid}"
+        await handle_songs_callback(
+            cb,
+            state=fsm,
+            current_user=uploader,
+            governance_repository=repo,
+            pipeline=pipeline,
+            settings=settings,
+        )
+        msg.text = '{"title": "Orange Mint", "artist": "Saori Hayami", "album": "Orange Mint", "year": 2015, "lyrics": "[00:02.00] Imported LRC"}'
+        await handle_import_payload_input(
+            msg,
+            state=fsm,
+            governance_repository=repo,
+            pipeline=pipeline,
+            settings=settings,
+        )
+        assert "Dry-Run Preview (IMPORT)" in _last_arg(msg.answer)
+
+        cb.data = f"songs:confirm_apply:{sid}"
+        await handle_songs_callback(
+            cb,
+            state=fsm,
+            current_user=uploader,
+            governance_repository=repo,
+            pipeline=pipeline,
+            settings=settings,
+        )
+        restored_rec = await repo.get_library_track(sid)
+        assert restored_rec is not None
+        assert restored_rec.title == "Orange Mint"
+        assert restored_rec.year == 2015
+
+        # 8. Custom Re-Search -> Dry-Run Preview
+        cb.data = f"songs:research_custom:{sid}"
+        await handle_songs_callback(
+            cb,
+            state=fsm,
+            current_user=uploader,
+            governance_repository=repo,
+            pipeline=pipeline,
+            settings=settings,
+        )
+        msg.text = "Saori Hayami - Orange Mint"
+        await handle_custom_research_input(
+            msg,
+            state=fsm,
+            governance_repository=repo,
+            pipeline=pipeline,
+            settings=settings,
+        )
+        assert "Dry-Run Preview (RESEARCH)" in _last_arg(msg.answer)
+
+        # 9. Library Folder Rescan (`/rescan` and `songs:rescan_apply`) when a new file is dropped on disk
+        extra_dir = lib_dir / "ClariS" / "border (2015)"
+        extra_dir.mkdir(parents=True, exist_ok=True)
+        extra_audio = extra_dir / "01 - ClariS - border.flac"
+        extra_audio.write_bytes(b"fake-flac-bytes-claris-border")
+        extra_audio.with_suffix(".lrc").write_text("[00:01.00] border lrc", encoding="utf-8")
+
+        msg.text = "/rescan"
+        await handle_rescan_command(
+            msg,
+            state=fsm,
+            current_user=uploader,
+            governance_repository=repo,
+            pipeline=pipeline,
+            settings=settings,
+        )
+        rescan_preview = _last_arg(msg.answer)
+        assert "Library Rescan Dry-Run Preview" in rescan_preview
+        assert "Added on Disk:</b> 1" in rescan_preview
+
+        cb.data = "songs:rescan_apply"
+        await handle_songs_callback(
+            cb,
+            state=fsm,
+            current_user=uploader,
+            governance_repository=repo,
+            pipeline=pipeline,
+            settings=settings,
+        )
+        assert "Library Rescan &amp; Sync Complete" in _last_arg(msg.edit_text)
+        all_after_rescan = await repo.list_library_tracks(limit=10)
+        assert len(all_after_rescan) == 2
+
+    asyncio.run(_scenario())
+
+
+def test_fsm_state_reset_and_audio_upload_isolation_prevent_stuck_states() -> None:
+    """Verify audio uploads, commands, and menu buttons never get stuck in `/songs` FSM states."""
+    # 1. Verify filter helpers never match audio tracks, archives, slash commands, or menu buttons
+    audio_msg = MagicMock(spec=Message)
+    audio_msg.audio = MagicMock(file_id="aud-1", file_name="etoile et toi.flac")
+    audio_msg.document = None
+    audio_msg.photo = None
+    audio_msg.text = None
+    assert _is_ingestion_media_message(audio_msg) is True
+    assert _is_non_command_text(audio_msg) is False
+    assert _is_non_media_input_message(audio_msg) is False
+
+    archive_msg = MagicMock(spec=Message)
+    archive_msg.audio = None
+    archive_msg.document = MagicMock(file_name="album.zip", mime_type="application/zip")
+    archive_msg.photo = None
+    archive_msg.text = None
+    assert _is_ingestion_media_message(archive_msg) is True
+    assert _is_non_media_input_message(archive_msg) is False
+
+    cmd_msg = MagicMock(spec=Message)
+    cmd_msg.audio = None
+    cmd_msg.document = None
+    cmd_msg.photo = None
+    cmd_msg.text = "/start"
+    assert _is_non_command_text(cmd_msg) is False
+    assert _is_non_media_input_message(cmd_msg) is False
+
+    menu_msg = MagicMock(spec=Message)
+    menu_msg.audio = None
+    menu_msg.document = None
+    menu_msg.photo = None
+    menu_msg.text = BTN_MAIN_INFO
+    assert _is_non_command_text(menu_msg) is False
+    assert _is_non_media_input_message(menu_msg) is False
+
+    json_doc_msg = MagicMock(spec=Message)
+    json_doc_msg.audio = None
+    json_doc_msg.document = MagicMock(file_name="song.json", mime_type="application/json")
+    json_doc_msg.photo = None
+    json_doc_msg.text = None
+    assert _is_ingestion_media_message(json_doc_msg) is False
+    assert _is_non_media_input_message(json_doc_msg) is True
+
+    # 2. Verify `/start`, `/cancel`, and `handle_dry_run_unexpected_text` reset or guard FSM state
+    async def _scenario() -> None:
+        state_data: dict[str, object] = {
+            "active_song_id": "trk-123456789012",
+            "pending_song_proposal": {"new_title": "Test"},
+        }
+        fsm = MagicMock()
+        fsm.set_state = AsyncMock()
+        fsm.get_data = AsyncMock(side_effect=lambda: dict(state_data))
+        fsm.clear = AsyncMock(side_effect=state_data.clear)
+
+        msg = MagicMock(spec=Message)
+        msg.answer = AsyncMock()
+        msg.text = "unexpected text"
+
+        await handle_dry_run_unexpected_text(msg, state=fsm)
+        assert "Pending Dry-Run Preview" in _last_arg(msg.answer)
+
+        await handle_cancel_command(msg, state=fsm)
+        fsm.clear.assert_awaited()
+        assert state_data == {}
+        assert "Active prompt cancelled" in _last_arg(msg.answer)
+
+        state_data["active_song_id"] = "stuck-id"
+        owner = UserAccount(telegram_id=1, display_name="Owner", role=UserRole.OWNER)
+        await handle_start(msg, current_user=owner, state=fsm)
+        assert state_data == {}
+        assert fsm.clear.await_count >= 2
+
+        state_data["active_song_id"] = "stuck-id-2"
+        await handle_songs_callback(
+            MagicMock(
+                spec=CallbackQuery,
+                data="songs:view:trk-12345678",
+                message=msg,
+                answer=AsyncMock(),
+            ),
+            state=fsm,
+            current_user=owner,
+            governance_repository=MagicMock(
+                get_library_track=AsyncMock(return_value=None),
+            ),
+        )
+        assert fsm.set_state.await_count == 0 or state_data.get("active_song_id") == "stuck-id-2"
 
     asyncio.run(_scenario())

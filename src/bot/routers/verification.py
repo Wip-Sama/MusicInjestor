@@ -6,17 +6,28 @@ from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
+from src.bot.keyboards.admin import RESERVED_MENU_BUTTONS
 from src.bot.keyboards.verification import build_verification_keyboard
 from src.bot.routers.files import format_ingestion_summary
 from src.bot.states import IngestionStates
 from src.core.exceptions import PermissionDeniedError
-from src.core.models import UserAccount
+from src.core.models import IngestionJob, Permission, UserAccount
 from src.core.pipeline import IngestionPipeline
 from src.core.queue import IngestionQueueWorker
+from src.core.rbac import has_permission
 
 logger = logging.getLogger(__name__)
 
 verification_router = Router(name="verification")
+
+
+def _can_resolve_job(user: UserAccount | None, job: IngestionJob | None) -> bool:
+    """Return True if `user` is permitted to disambiguate `job` (own vs others' jobs)."""
+    if user is None:
+        return True
+    if job is not None and job.user_id is not None and job.user_id != user.telegram_id:
+        return has_permission(user, Permission.RESOLVE_OTHERS_JOBS)
+    return has_permission(user, Permission.RESOLVE_OWN_DISAMBIGUATION)
 
 
 def parse_verification_callback(data: str) -> tuple[str, str, int | None]:
@@ -59,6 +70,14 @@ async def handle_verification_callback(
 
     if pipeline is None:
         await callback.answer(f"Action '{action}' registered for job {job_id}.")
+        return
+
+    target_job = await pipeline.get_job(job_id)
+    if not _can_resolve_job(current_user, target_job):
+        await callback.answer(
+            "🔒 You do not have permission to resolve another user's job.",
+            show_alert=True,
+        )
         return
 
     msg = callback.message if isinstance(callback.message, Message) else None
@@ -120,10 +139,16 @@ async def handle_verification_callback(
     await callback.answer(f"Action '{action}' registered for job {job_id}.")
 
 
-@verification_router.message(IngestionStates.awaiting_manual_query)
+@verification_router.message(
+    IngestionStates.awaiting_manual_query,
+    F.text,
+    ~F.text.startswith("/"),
+    ~F.text.in_(RESERVED_MENU_BUTTONS),
+)
 async def handle_manual_search_query(
     message: Message,
     state: FSMContext,
+    current_user: UserAccount | None = None,
     pipeline: IngestionPipeline | None = None,
 ) -> None:
     """Re-query MusicBrainz candidates using the user's manual search query or link."""
@@ -132,6 +157,12 @@ async def handle_manual_search_query(
     if not job_id or pipeline is None:
         await state.clear()
         await message.answer("⚠️ No active verification job found for manual search.")
+        return
+
+    target_job = await pipeline.get_job(job_id)
+    if not _can_resolve_job(current_user, target_job):
+        await state.clear()
+        await message.answer("🔒 You do not have permission to resolve another user's job.")
         return
 
     query_text = (message.text or "").strip()

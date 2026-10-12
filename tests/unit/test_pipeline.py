@@ -307,3 +307,140 @@ def test_pipeline_sha256_fallback_manual_search_and_multi_track_batch(
     cancelled = asyncio.run(low_conf_pipeline.cancel_job("job_manual"))
     assert cancelled.state == JobState.CANCELLED
     assert "job_manual" in extractor.cleaned_jobs
+
+
+def test_pipeline_multi_track_archive_release_tracklist_mapping_and_stage_callbacks(
+    tmp_path: Path,
+) -> None:
+    """Verify multi-track archives map each track against `fetch_release_tracks` and emit stage callbacks."""
+    track_one = tmp_path / "01 - Track_01.flac"
+    track_two = tmp_path / "02 - Track_02.flac"
+    track_one.write_bytes(b"fLaC-multi-1")
+    track_two.write_bytes(b"fLaC-multi-2")
+
+    class MultiExtractor(StubExtractor):
+        async def extract_or_stage(self, source_path: Path, job_id: str) -> list[Path]:
+            await asyncio.sleep(0)
+            return [track_one, track_two]
+
+    class ReleaseMetadataProvider(StubMetadataProvider):
+        async def read_local_metadata(self, audio_path: Path) -> TrackMetadata:
+            await asyncio.sleep(0)
+            idx = 1 if "01" in audio_path.name else 2
+            return TrackMetadata(
+                title=f"Local {idx}",
+                artist="Local Artist",
+                album="Local Album",
+                track_number=idx,
+            )
+
+        async def fetch_release_tracks(
+            self,
+            release_mbid: str,
+            prefer_english: bool = False,
+        ) -> list[TrackMetadata]:
+            await asyncio.sleep(0)
+            assert release_mbid == "ca344c5b-9c69-4283-8383-e7c4c026d571"
+            assert prefer_english is True
+            return [
+                TrackMetadata(
+                    title="Stay Alive",
+                    artist="Emilia (CV: Rie Takahashi)",
+                    album="Stay Alive",
+                    album_artist="Emilia (CV: Rie Takahashi)",
+                    year=2016,
+                    track_number=1,
+                    disc_number=1,
+                    recording_mbid="rec-mbid-track-1",
+                    release_mbid=release_mbid,
+                ),
+                TrackMetadata(
+                    title="Wishing",
+                    artist="Rem (CV: Inori Minase)",
+                    album="Stay Alive",
+                    album_artist="Emilia (CV: Rie Takahashi)",
+                    year=2016,
+                    track_number=2,
+                    disc_number=1,
+                    recording_mbid="rec-mbid-track-2",
+                    release_mbid=release_mbid,
+                ),
+            ]
+
+    recorded_tracks: list[TrackMetadata] = []
+
+    class TrackingCatalog(InMemoryCatalogRepository):
+        async def register_ingested_track(
+            self,
+            job_id: str,
+            metadata: TrackMetadata,
+            fingerprint: AudioFingerprint,
+            library_path: Path,
+        ) -> None:
+            await super().register_ingested_track(job_id, metadata, fingerprint, library_path)
+            recorded_tracks.append(metadata)
+
+    catalog = TrackingCatalog()
+    candidates = [
+        MetadataCandidate(
+            metadata=TrackMetadata(
+                title="Stay Alive",
+                artist="Emilia (CV: Rie Takahashi)",
+                album="Stay Alive",
+                album_artist="Emilia (CV: Rie Takahashi)",
+                year=2016,
+                track_number=1,
+                disc_number=1,
+                recording_mbid="rec-mbid-track-1",
+                release_mbid="ca344c5b-9c69-4283-8383-e7c4c026d571",
+            ),
+            confidence=0.98,
+        )
+    ]
+
+    class PerFileFingerprinter:
+        async def compute_fingerprint(self, audio_path: Path) -> AudioFingerprint:
+            await asyncio.sleep(0)
+            return AudioFingerprint(
+                duration_seconds=215,
+                fingerprint=f"FP_{audio_path.stem}",
+                acoustid_mbid=None,
+            )
+
+    pipeline = IngestionPipeline(
+        extractor=MultiExtractor(),
+        fingerprinter=PerFileFingerprinter(),
+        metadata_provider=ReleaseMetadataProvider(candidates),
+        lyrics_provider=StubLyricsProvider(),
+        organizer=LibraryOrganizer(tmp_path / "library"),
+        catalog_repository=catalog,
+        auto_approve_confidence=0.90,
+    )
+
+    stages_seen: list[JobState] = []
+
+    async def _on_stage(job: IngestionJob) -> None:
+        stages_seen.append(job.state)
+
+    result = asyncio.run(
+        pipeline.process_file(
+            track_one,
+            job_id="job_release_map",
+            stage_callback=_on_stage,
+        )
+    )
+    assert result.job.state == JobState.COMPLETED
+    assert result.tracks_ingested == 2
+    assert result.lyrics_embedded_count == 2
+    assert len(recorded_tracks) == 2
+    assert recorded_tracks[0].title == "Stay Alive"
+    assert recorded_tracks[0].recording_mbid == "rec-mbid-track-1"
+    assert recorded_tracks[1].title == "Wishing"
+    assert recorded_tracks[1].artist == "Rem (CV: Inori Minase)"
+    assert recorded_tracks[1].recording_mbid == "rec-mbid-track-2"
+    assert JobState.EXTRACTING in stages_seen
+    assert JobState.FINGERPRINTING in stages_seen
+    assert JobState.ENRICHING_METADATA in stages_seen
+    assert JobState.FETCHING_LYRICS in stages_seen
+    assert JobState.ORGANIZING in stages_seen
+    assert JobState.COMPLETED in stages_seen

@@ -14,3 +14,15 @@ class AdminStates(StatesGroup):
     """FSM states during interactive administrator user onboarding/management."""
 
     awaiting_new_user_id = State()
+
+
+class SongManagementStates(StatesGroup):
+    """FSM states during interactive `/songs` search, tag/cover/lyrics editing, and dry-run confirmation."""
+
+    awaiting_search_query = State()
+    awaiting_metadata_input = State()
+    awaiting_lyrics_input = State()
+    awaiting_cover_input = State()
+    awaiting_research_query = State()
+    awaiting_import_payload = State()
+    awaiting_dry_run_confirmation = State()

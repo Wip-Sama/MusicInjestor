@@ -105,6 +105,23 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 );
 """
 
+CREATE_TAG_CORRECTION_REQUESTS_TABLE = """
+CREATE TABLE IF NOT EXISTS tag_correction_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    track_id TEXT NOT NULL,
+    requested_by INTEGER NOT NULL REFERENCES users(telegram_id),
+    proposed_title TEXT,
+    proposed_artist TEXT,
+    proposed_album TEXT,
+    proposed_year INTEGER,
+    reason TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    reviewed_by INTEGER REFERENCES users(telegram_id),
+    reviewed_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
 CREATE_USERS_ROLE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
 """
@@ -134,6 +151,7 @@ TABLE_DDL_STATEMENTS: tuple[str, ...] = (
     CREATE_LIBRARY_TRACKS_TABLE,
     CREATE_TRACKS_TABLE,
     CREATE_AUDIT_LOGS_TABLE,
+    CREATE_TAG_CORRECTION_REQUESTS_TABLE,
 )
 
 INDEX_DDL_STATEMENTS: tuple[str, ...] = (

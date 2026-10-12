@@ -1,7 +1,10 @@
-"""Standard Telegram command and persistent bottom-menu handlers (/start, /help, /status, /queue, /sso)."""
+"""Standard Telegram command and bottom-menu handlers (/start, /help, /status, /queue, /sso, /fixtags)."""
+
+import html
 
 from aiogram import F, Router
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
 from src.bot.keyboards.admin import (
@@ -11,15 +14,18 @@ from src.bot.keyboards.admin import (
     build_guest_onboarding_keyboard,
     build_main_menu_keyboard,
     build_oidc_link_keyboard,
+    build_paused_jobs_keyboard,
     build_queued_job_keyboard,
+    build_tag_correction_review_keyboard,
 )
 from src.config.settings import AppSettings
 from src.core.audit import format_guest_access_denied_card, format_queued_job_card
-from src.core.models import Permission, UserAccount, UserRole
+from src.core.exceptions import PermissionDeniedError
+from src.core.models import JobState, Permission, UserAccount, UserRole
 from src.core.oidc import AuthentikOidcService
 from src.core.ports import GovernanceRepositoryPort
 from src.core.queue import IngestionQueueWorker
-from src.core.rbac import has_permission
+from src.core.rbac import GovernanceService, has_permission
 
 commands_router = Router(name="commands")
 
@@ -36,14 +42,57 @@ def _resolve_oidc_url(
     return None
 
 
+def _parse_tag_correction_spec(
+    raw_spec: str,
+) -> tuple[str | None, str | None, str | None, int | None, str]:
+    """Parse `title=... | artist=... | album=... | year=... | reason=...` tag correction fields."""
+    proposed_title: str | None = None
+    proposed_artist: str | None = None
+    proposed_album: str | None = None
+    proposed_year: int | None = None
+    reason = ""
+
+    segments = [seg.strip() for seg in raw_spec.split("|") if seg.strip()]
+    for seg in segments:
+        sep = "=" if "=" in seg else (":" if ":" in seg else None)
+        if sep is not None:
+            key, val = seg.split(sep, maxsplit=1)
+            norm_key = key.strip().lower()
+            clean_val = val.strip()
+            if not clean_val:
+                continue
+            if norm_key in {"title", "track", "t"}:
+                proposed_title = clean_val
+            elif norm_key in {"artist", "a"}:
+                proposed_artist = clean_val
+            elif norm_key in {"album", "b"}:
+                proposed_album = clean_val
+            elif norm_key in {"year", "date", "y"} and clean_val.isdigit():
+                proposed_year = int(clean_val)
+            elif norm_key in {"reason", "note", "r"}:
+                reason = clean_val
+        elif " - " in seg and proposed_artist is None and proposed_title is None:
+            artist_part, title_part = seg.split(" - ", maxsplit=1)
+            proposed_artist = artist_part.strip() or None
+            proposed_title = title_part.strip() or None
+        elif proposed_title is None:
+            proposed_title = seg
+
+    return proposed_title, proposed_artist, proposed_album, proposed_year, reason
+
+
 @commands_router.message(Command("start"))
 async def handle_start(
     message: Message,
     current_user: UserAccount | None = None,
     oidc_service: AuthentikOidcService | None = None,
     settings: AppSettings | None = None,
+    state: FSMContext | None = None,
 ) -> None:
     """Intercept GUEST users with the onboarding screen or present the simple upload prompt & bottom menu."""
+    if state is not None:
+        await state.clear()
+
     if current_user is not None and current_user.role == UserRole.GUEST:
         oidc_url = _resolve_oidc_url(current_user, oidc_service, settings)
         await message.answer(
@@ -62,14 +111,37 @@ async def handle_start(
     )
 
 
+@commands_router.message(Command("cancel"))
+async def handle_cancel_command(
+    message: Message,
+    state: FSMContext | None = None,
+) -> None:
+    """Exit any active FSM input or confirmation prompt and return to the default idle state."""
+    if state is not None:
+        await state.clear()
+    await message.answer(
+        "🛑 <b>Active prompt cancelled.</b>\n"
+        "You can now send an audio/archive file to ingest or use <code>/songs</code> to browse the library."
+    )
+
+
 @commands_router.message(Command("help"))
-async def handle_help(message: Message) -> None:
+async def handle_help(
+    message: Message,
+    state: FSMContext | None = None,
+) -> None:
     """Provide usage instructions and pipeline overview."""
+    if state is not None:
+        await state.clear()
     await message.answer(
         "<b>Available Commands:</b>\n"
         "/start - Show upload prompt &amp; persistent bottom navigation\n"
-        "/admin - Open Administrator Control Panel (ADMIN / OWNER)\n"
+        "/songs - Browse, search, download, edit tags/cover/lyrics, and export/import songs\n"
+        "/rescan - Scan library folder and reconcile changes with database\n"
+        "/cancel - Exit any active input or confirmation prompt\n"
+        "/admin - Open Administrator Control Panel (MODERATOR / ADMIN / OWNER)\n"
         "/adduser <code>&lt;id&gt; [ROLE]</code> - Authorize or promote a Telegram user ID (ADMIN / OWNER)\n"
+        "/fixtags <code>&lt;track_id&gt; title=... | artist=...</code> - Request post-ingestion tag edits\n"
         "/queue - View active and queued ingestion jobs\n"
         "/sso - Link or inspect Authentik SSO pairing\n"
         "/status - Check local Bot API, RBAC &amp; queue status\n"
@@ -84,8 +156,12 @@ async def handle_status(
     current_user: UserAccount | None = None,
     governance_repository: GovernanceRepositoryPort | None = None,
     queue_worker: IngestionQueueWorker | None = None,
+    state: FSMContext | None = None,
 ) -> None:
     """Report current operational, RBAC, OIDC, and queue status of the ingestion service."""
+    if state is not None:
+        await state.clear()
+
     if current_user is None or governance_repository is None:
         await message.answer("Status: <b>Online</b> (Local Bot API &amp; SQLite WAL ready).")
         return
@@ -118,8 +194,12 @@ async def handle_sso_command(
     current_user: UserAccount | None = None,
     oidc_service: AuthentikOidcService | None = None,
     settings: AppSettings | None = None,
+    state: FSMContext | None = None,
 ) -> None:
     """Display Authentik OIDC pairing status and provide an inline SSO login button."""
+    if state is not None:
+        await state.clear()
+
     if current_user is None:
         await message.answer("Session unavailable.")
         return
@@ -144,8 +224,12 @@ async def handle_queue_command(
     message: Message,
     current_user: UserAccount | None = None,
     governance_repository: GovernanceRepositoryPort | None = None,
+    state: FSMContext | None = None,
 ) -> None:
-    """Display the user's queued jobs (or global queue for MODERATOR+)."""
+    """Display the user's queued jobs (or global queue and paused disambiguation jobs for MODERATOR+)."""
+    if state is not None:
+        await state.clear()
+
     if current_user is None or not has_permission(current_user, Permission.VIEW_OWN_JOBS):
         await message.answer("🔒 You need at least <b>UPLOADER</b> permissions to view the queue.")
         return
@@ -162,8 +246,24 @@ async def handle_queue_command(
     )
     active_jobs = await governance_repository.list_active_jobs()
     active_name = active_jobs[0].original_filename if active_jobs else None
+    paused_jobs = [
+        j
+        for j in active_jobs
+        if j.state in {JobState.AWAITING_CONFIRMATION, JobState.AWAITING_INPUT}
+        and (
+            has_permission(current_user, Permission.RESOLVE_OTHERS_JOBS)
+            or j.user_id == current_user.telegram_id
+        )
+    ]
 
     if not jobs:
+        if paused_jobs:
+            await message.answer(
+                f"⚠️ <b>{len(paused_jobs)} Job(s) Awaiting Disambiguation</b>\n"
+                "Select a paused job below to resolve its MusicBrainz release:",
+                reply_markup=build_paused_jobs_keyboard(paused_jobs),
+            )
+            return
         await message.answer(f"✅ <b>Ingestion Queue Empty</b> ({len(active_jobs)} active job(s) in flight).")
         return
 
@@ -171,4 +271,88 @@ async def handle_queue_command(
     await message.answer(
         format_queued_job_card(first_job, position=1, active_job_filename=active_name),
         reply_markup=build_queued_job_keyboard(first_job.job_id),
+    )
+
+
+@commands_router.message(Command("fixtags"))
+async def handle_fixtags_command(
+    message: Message,
+    current_user: UserAccount | None = None,
+    governance_service: GovernanceService | None = None,
+    governance_repository: GovernanceRepositoryPort | None = None,
+    state: FSMContext | None = None,
+) -> None:
+    """Submit a post-ingestion tag correction request (`REQUEST_TAG_CORRECTION`)."""
+    if state is not None:
+        await state.clear()
+    if current_user is None or not has_permission(current_user, Permission.REQUEST_TAG_CORRECTION):
+        await message.answer(
+            "🔒 You need at least <b>UPLOADER</b> permissions to request post-ingestion tag corrections."
+        )
+        return
+
+    if governance_service is None or governance_repository is None:
+        await message.answer("Tag correction service is not initialized.")
+        return
+
+    raw_text = (message.text or "").strip()
+    parts = raw_text.split(maxsplit=2)
+    if len(parts) < 3:
+        recent_tracks = await governance_repository.list_library_tracks(limit=10)
+        lines = [
+            "🏷 <b>Post-Ingestion Tag Correction</b>",
+            (
+                "Usage: <code>/fixtags &lt;track_id&gt; "
+                "title=New Title | artist=New Artist | album=New Album | year=2024</code>"
+            ),
+        ]
+        if recent_tracks:
+            lines.append("\n<b>Recent Library Tracks:</b>")
+            for trk in recent_tracks:
+                lines.append(
+                    f"• <code>{html.escape(trk.id)}</code> — {html.escape(trk.artist)} - "
+                    f"<b>{html.escape(trk.title)}</b> (<i>{html.escape(trk.album)}</i>)"
+                )
+        await message.answer("\n".join(lines))
+        return
+
+    track_id = parts[1].strip()
+    title, artist, album, year, reason = _parse_tag_correction_spec(parts[2])
+    if title is None and artist is None and album is None and year is None:
+        await message.answer(
+            "⚠️ Please specify at least one tag field to update "
+            "(e.g. <code>title=... | artist=... | album=... | year=2024</code>)."
+        )
+        return
+
+    try:
+        req, track = await governance_service.request_tag_correction(
+            actor=current_user,
+            track_id=track_id,
+            proposed_title=title,
+            proposed_artist=artist,
+            proposed_album=album,
+            proposed_year=year,
+            reason=reason,
+        )
+    except (KeyError, PermissionDeniedError) as exc:
+        await message.answer(f"⚠️ Could not create tag correction request: {html.escape(str(exc))}")
+        return
+
+    can_approve = has_permission(current_user, Permission.APPROVE_TAG_CORRECTIONS)
+    kb = build_tag_correction_review_keyboard(req.id or 0) if can_approve and req.id is not None else None
+    changes: list[str] = []
+    if title is not None:
+        changes.append(f"• Title: <code>{html.escape(track.title)}</code> → <b>{html.escape(title)}</b>")
+    if artist is not None:
+        changes.append(f"• Artist: <code>{html.escape(track.artist)}</code> → <b>{html.escape(artist)}</b>")
+    if album is not None:
+        changes.append(f"• Album: <code>{html.escape(track.album)}</code> → <b>{html.escape(album)}</b>")
+    if year is not None:
+        changes.append(f"• Year: <code>{track.year or '-'}</code> → <b>{year}</b>")
+
+    await message.answer(
+        f"✅ <b>Tag Correction Request #{req.id} Submitted</b>\n"
+        f"Track ID: <code>{html.escape(track.id)}</code>\n" + "\n".join(changes),
+        reply_markup=kb,
     )

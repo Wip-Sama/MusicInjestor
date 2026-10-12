@@ -15,6 +15,25 @@ SUPPORTED_AUDIO_EXTENSIONS: frozenset[str] = frozenset(
     {".flac", ".mp3", ".m4a", ".alac", ".ogg", ".opus", ".wav", ".wv", ".dsf"}
 )
 SUPPORTED_ARCHIVE_EXTENSIONS: frozenset[str] = frozenset({".zip", ".7z", ".rar", ".tar", ".gz"})
+SUPPORTED_IMAGE_EXTENSIONS: frozenset[str] = frozenset({".jpg", ".jpeg", ".png", ".webp"})
+PREFERRED_COVER_STEMS: tuple[str, ...] = ("cover", "folder", "front", "album", "art", "artwork")
+
+
+def find_best_cover_image(search_dir: Path, recursive: bool = False) -> Path | None:
+    """Locate the best candidate cover art image inside `search_dir`."""
+    if not search_dir.is_dir():
+        return None
+    iterator = search_dir.rglob("*") if recursive else search_dir.iterdir()
+    images = sorted(
+        path for path in iterator if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+    )
+    if not images:
+        return None
+    for preferred in PREFERRED_COVER_STEMS:
+        for img in images:
+            if img.stem.lower() == preferred or img.stem.lower().startswith(preferred):
+                return img
+    return images[0]
 
 
 def _extract_archive_fallback(archive_path: Path, output_dir: Path) -> None:
@@ -64,6 +83,11 @@ class SevenZipArchiveExtractor:
         if suffix in SUPPORTED_AUDIO_EXTENSIONS:
             staged_path = job_dir / source_path.name
             await asyncio.to_thread(shutil.copy2, source_path, staged_path)
+            sibling_cover = find_best_cover_image(source_path.parent, recursive=False)
+            if sibling_cover is not None:
+                staged_cover = job_dir / "cover.jpg"
+                if not staged_cover.exists():
+                    await asyncio.to_thread(shutil.copy2, sibling_cover, staged_cover)
             logger.info("Staged single audio track for job %s at %s", job_id, staged_path)
             return [staged_path]
 
@@ -77,6 +101,14 @@ class SevenZipArchiveExtractor:
             if not discovered:
                 msg = f"Archive {source_path.name} contained no supported audio files"
                 raise ArchiveExtractionError(msg)
+
+            best_image = find_best_cover_image(job_dir, recursive=True)
+            if best_image is not None:
+                audio_dir = discovered[0].parent
+                target_cover = audio_dir / "cover.jpg"
+                if not target_cover.exists() and best_image.resolve() != target_cover.resolve():
+                    await asyncio.to_thread(shutil.copy2, best_image, target_cover)
+
             logger.info(
                 "Extracted %d audio file(s) for job %s into %s",
                 len(discovered),

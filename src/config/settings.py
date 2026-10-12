@@ -44,6 +44,9 @@ class AppSettings(BaseModel):
     musicbrainz_app_name: str = Field(default="MusicIngestBot")
     musicbrainz_app_version: str = Field(default="0.1.0")
     musicbrainz_contact: str = Field(default="admin@example.com")
+    genius_access_token: str = Field(default="")
+    lastfm_api_key: str = Field(default="")
+    lastfm_api_secret: str = Field(default="")
     lrclib_base_url: str = Field(default="https://lrclib.net/api")
 
     # Storage & SQLite settings
@@ -73,6 +76,9 @@ class AppSettings(BaseModel):
     oidc_client_secret: str = Field(default="")
     oidc_redirect_uri: str = Field(default="http://localhost:8080/api/v1/auth/callback")
     oidc_webhook_secret: str = Field(default="")
+    oidc_listen_host: str = Field(default="0.0.0.0")
+    oidc_listen_port: int = Field(default=8080, ge=0, le=65535)
+    oidc_sync_interval_seconds: int = Field(default=3600, ge=60)
 
     @field_validator("auto_approve_confidence")
     @classmethod
@@ -139,6 +145,9 @@ def load_settings(
         "MUSICBRAINZ_APP_NAME": "musicbrainz_app_name",
         "MUSICBRAINZ_APP_VERSION": "musicbrainz_app_version",
         "MUSICBRAINZ_CONTACT": "musicbrainz_contact",
+        "GENIUS_ACCESS_TOKEN": "genius_access_token",
+        "LASTFM_API_KEY": "lastfm_api_key",
+        "LASTFM_API_SECRET": "lastfm_api_secret",
         "LRCLIB_BASE_URL": "lrclib_base_url",
         "LOG_LEVEL": "log_level",
         "FPCALC_BINARY": "fpcalc_binary",
@@ -152,6 +161,7 @@ def load_settings(
         "OIDC_CLIENT_SECRET": "oidc_client_secret",
         "OIDC_REDIRECT_URI": "oidc_redirect_uri",
         "OIDC_WEBHOOK_SECRET": "oidc_webhook_secret",
+        "OIDC_LISTEN_HOST": "oidc_listen_host",
     }
     for env_key, field_name in str_mappings.items():
         if env_key in merged_env and merged_env[env_key] != "":
@@ -188,5 +198,11 @@ def load_settings(
 
     if "OIDC_ENABLED" in merged_env and merged_env["OIDC_ENABLED"] != "":
         raw_kwargs["oidc_enabled"] = _parse_bool(merged_env["OIDC_ENABLED"])
+
+    if "OIDC_LISTEN_PORT" in merged_env and merged_env["OIDC_LISTEN_PORT"] != "":
+        raw_kwargs["oidc_listen_port"] = int(merged_env["OIDC_LISTEN_PORT"])
+
+    if "OIDC_SYNC_INTERVAL_SECONDS" in merged_env and merged_env["OIDC_SYNC_INTERVAL_SECONDS"] != "":
+        raw_kwargs["oidc_sync_interval_seconds"] = int(merged_env["OIDC_SYNC_INTERVAL_SECONDS"])
 
     return AppSettings.model_validate(raw_kwargs)

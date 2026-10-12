@@ -8,7 +8,12 @@ import httpx
 import pytest
 
 from src.bot.notifier import TelegramAdminLogNotifier
-from src.bot.oidc_server import OidcCallbackCoordinator, format_oidc_pairing_message
+from src.bot.oidc_server import (
+    OidcCallbackCoordinator,
+    OidcHttpServer,
+    format_oidc_pairing_message,
+    run_hourly_oidc_sync_loop,
+)
 from src.core.audit import (
     format_access_request_card,
     format_admin_dashboard_card,
@@ -27,11 +32,13 @@ from src.core.exceptions import (
     QueueConcurrencyError,
 )
 from src.core.models import (
+    AudioFingerprint,
     IngestionJob,
     JobState,
     MetadataCandidate,
     Permission,
     SourceType,
+    TagCorrectionStatus,
     TrackMetadata,
     UserAccount,
     UserRole,
@@ -475,3 +482,191 @@ def test_audit_and_ui_card_formatters(tmp_path: Path) -> None:
     detail = format_user_detail_card(user, 14, 182)
     assert "14 albums (182 tracks)" in detail
     assert format_access_request_card is not None
+
+
+def test_oidc_http_server_endpoints_and_hourly_sync_loop(tmp_path: Path) -> None:
+    """Verify `OidcHttpServer` HTTP routes (`/api/v1/auth/callback` & webhook) and hourly cron loop."""
+    db_manager = SqliteDatabaseManager(tmp_path / "oidc_http.db")
+    repo = SqliteCatalogRepository(db_manager)
+    secret = "oidc-http-test-secret-key-32-bytes"
+    current_groups: list[str] = ["music-uploaders"]
+
+    def _mock_idp(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/token/"):
+            return httpx.Response(
+                status_code=200,
+                json={
+                    "access_token": "acc_http",
+                    "refresh_token": "ref_http",
+                    "expires_in": 3600,
+                },
+            )
+        if request.url.path.endswith("/userinfo/"):
+            return httpx.Response(
+                status_code=200,
+                json={
+                    "sub": "sub-http-user-1",
+                    "preferred_username": "http_user",
+                    "groups": current_groups,
+                    "is_active": True,
+                },
+            )
+        return httpx.Response(status_code=404)
+
+    oidc = AuthentikOidcService(
+        repository=repo,
+        secret_key=secret,
+        authorize_url="https://auth.example.com/application/o/authorize",
+        token_url="https://auth.example.com/application/o/token",
+        userinfo_url="https://auth.example.com/application/o/userinfo",
+        client_id="music-bot",
+        client_secret="client-sec",
+        redirect_uri="http://localhost:8080/api/v1/auth/callback",
+        transport=httpx.MockTransport(_mock_idp),
+    )
+    coordinator = OidcCallbackCoordinator(
+        oidc_service=oidc,
+        webhook_secret="wh-secret-http",
+    )
+
+    async def _scenario() -> None:
+        await db_manager.initialize()
+        await repo.upsert_user(UserAccount(telegram_id=778899, display_name="HTTP User"))
+
+        server = OidcHttpServer(coordinator=coordinator, host="127.0.0.1", port=0)
+        await server.start()
+        try:
+            base_url = f"http://127.0.0.1:{server.bound_port}"
+            async with httpx.AsyncClient() as client:
+                health = await client.get(f"{base_url}/healthz")
+                assert health.status_code == 200
+                assert health.json() == {"status": "ok"}
+
+                bad_cb = await client.get(f"{base_url}/api/v1/auth/callback")
+                assert bad_cb.status_code == 400
+
+                _, nonce = oidc.build_authorization_url(778899)
+                ok_cb = await client.get(
+                    f"{base_url}/api/v1/auth/callback",
+                    params={"code": "code_ok", "state": nonce},
+                )
+                assert ok_cb.status_code == 200
+                assert ok_cb.headers["X-Assigned-Role"] == "UPLOADER"
+                assert "http_user" in ok_cb.text
+
+                # Webhook with invalid secret -> 403
+                forbidden_wh = await client.post(
+                    f"{base_url}/api/v1/webhooks/authentik",
+                    json={"event_type": "user_updated", "sub": "sub-http-user-1"},
+                    headers={"X-Authentik-Secret": "bad"},
+                )
+                assert forbidden_wh.status_code == 403
+
+                # Webhook with Bearer token -> 200
+                current_groups[:] = ["music-admins"]
+                ok_wh = await client.post(
+                    f"{base_url}/api/v1/webhooks/authentik",
+                    json={"event_type": "user_updated", "sub": "sub-http-user-1"},
+                    headers={"Authorization": "Bearer wh-secret-http"},
+                )
+                assert ok_wh.status_code == 200
+                assert ok_wh.json()["new_role"] == "ADMIN"
+        finally:
+            await server.stop()
+
+        # Verify hourly sync loop executes and exits cleanly when stop_event is set
+        stop_event = asyncio.Event()
+        current_groups[:] = ["music-moderators"]
+
+        async def _trigger_stop() -> None:
+            await asyncio.sleep(1.1)
+            stop_event.set()
+
+        await asyncio.gather(
+            run_hourly_oidc_sync_loop(oidc, interval_seconds=1, stop_event=stop_event),
+            _trigger_stop(),
+        )
+        synced_user = await repo.get_user(778899)
+        assert synced_user is not None
+        assert synced_user.role == UserRole.MODERATOR
+
+    asyncio.run(_scenario())
+
+
+def test_governance_tag_corrections_and_system_wipe(tmp_path: Path) -> None:
+    """Verify `REQUEST_TAG_CORRECTION`, `APPROVE_TAG_CORRECTIONS`, and `SYSTEM_DESTRUCTIVE_WIPE`."""
+    db_manager = SqliteDatabaseManager(tmp_path / "tags.db")
+    repo = SqliteCatalogRepository(db_manager)
+    gov = GovernanceService(repository=repo, owner_telegram_ids=(1001,))
+
+    async def _scenario() -> None:
+        await db_manager.initialize()
+        owner = await gov.ensure_user(1001, "Owner")
+        uploader = await gov.ensure_user(2002, "Uploader")
+        uploader = await gov.change_user_role(owner, 2002, UserRole.UPLOADER)
+        moderator = await gov.ensure_user(3003, "Moderator")
+        moderator = await gov.change_user_role(owner, 3003, UserRole.MODERATOR)
+
+        await repo.register_ingested_track(
+            job_id="job-t1",
+            metadata=TrackMetadata(
+                title="Stay Alive",
+                artist="EMILIA",
+                album="Stay Alive",
+                year=2016,
+                track_number=1,
+                recording_mbid="rec-stay-alive-1",
+            ),
+            fingerprint=AudioFingerprint(duration_seconds=267, fingerprint="FP_SA_1"),
+            library_path=tmp_path / "01 - Stay Alive.flac",
+            uploaded_by=uploader.telegram_id,
+            has_synced_lyrics=True,
+        )
+
+        recent = await repo.list_library_tracks(limit=5)
+        assert len(recent) == 1
+        assert recent[0].id == "rec-stay-alive-1"
+
+        req, track = await gov.request_tag_correction(
+            actor=uploader,
+            track_id="rec-stay-alive-1",
+            proposed_title="Stay Alive (Remastered)",
+            proposed_artist="Emilia (CV: Rie Takahashi)",
+            proposed_year=2020,
+            reason="Canonical credit",
+        )
+        assert req.id is not None
+        assert req.status == TagCorrectionStatus.PENDING
+        assert track.title == "Stay Alive"
+
+        # Uploader cannot approve tag corrections
+        with pytest.raises(PermissionDeniedError):
+            await gov.approve_tag_correction(uploader, req.id)
+
+        # Moderator approves tag correction
+        resolved, updated_track = await gov.approve_tag_correction(moderator, req.id)
+        assert resolved.status == TagCorrectionStatus.APPROVED
+        assert updated_track.title == "Stay Alive (Remastered)"
+        assert updated_track.artist == "Emilia (CV: Rie Takahashi)"
+        assert updated_track.year == 2020
+
+        # Submit a second request and reject it
+        req2, _ = await gov.request_tag_correction(
+            actor=uploader,
+            track_id="rec-stay-alive-1",
+            proposed_album="Wrong Album",
+        )
+        assert req2.id is not None
+        rejected = await gov.reject_tag_correction(moderator, req2.id)
+        assert rejected.status == TagCorrectionStatus.REJECTED
+
+        # Moderator cannot execute destructive system wipe
+        with pytest.raises(PermissionDeniedError):
+            await gov.wipe_library_catalog(moderator)
+
+        # Owner executes destructive system wipe
+        removed = await gov.wipe_library_catalog(owner)
+        assert removed >= 2
+        assert await repo.list_library_tracks(limit=5) == []
+
+    asyncio.run(_scenario())

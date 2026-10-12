@@ -9,7 +9,10 @@ from src.core.models import (
     AccessRequestStatus,
     AuditAction,
     AuditLogEntry,
+    LibraryTrackRecord,
     Permission,
+    TagCorrectionRequest,
+    TagCorrectionStatus,
     UserAccount,
     UserRole,
 )
@@ -402,3 +405,138 @@ class GovernanceService:
             )
         )
         return target_user
+
+    async def request_tag_correction(
+        self,
+        actor: UserAccount,
+        track_id: str,
+        proposed_title: str | None = None,
+        proposed_artist: str | None = None,
+        proposed_album: str | None = None,
+        proposed_year: int | None = None,
+        reason: str = "",
+    ) -> tuple[TagCorrectionRequest, LibraryTrackRecord]:
+        """Submit a post-ingestion tag correction request (`REQUEST_TAG_CORRECTION`)."""
+        require_permission(actor, Permission.REQUEST_TAG_CORRECTION)
+        track = await self._repo.get_library_track(track_id)
+        if track is None:
+            msg = f"Library track '{track_id}' not found"
+            raise KeyError(msg)
+
+        request = await self._repo.create_tag_correction_request(
+            TagCorrectionRequest(
+                track_id=track.id,
+                requested_by=actor.telegram_id,
+                proposed_title=proposed_title,
+                proposed_artist=proposed_artist,
+                proposed_album=proposed_album,
+                proposed_year=proposed_year,
+                reason=reason,
+            )
+        )
+        await self._repo.append_audit_log(
+            AuditLogEntry(
+                actor_id=actor.telegram_id,
+                action=AuditAction.TAG_CORRECTION_REQUESTED,
+                target_entity=f"track:{track.id}",
+                details={
+                    "request_id": request.id,
+                    "proposed_title": proposed_title,
+                    "proposed_artist": proposed_artist,
+                    "proposed_album": proposed_album,
+                    "proposed_year": proposed_year,
+                    "reason": reason,
+                },
+            )
+        )
+        return request, track
+
+    async def approve_tag_correction(
+        self,
+        actor: UserAccount,
+        request_id: int,
+    ) -> tuple[TagCorrectionRequest, LibraryTrackRecord]:
+        """Approve a pending tag correction request and update track metadata (`APPROVE_TAG_CORRECTIONS`)."""
+        require_permission(actor, Permission.APPROVE_TAG_CORRECTIONS)
+        request = await self._repo.get_tag_correction_request(request_id)
+        if request is None:
+            msg = f"Tag correction request {request_id} not found"
+            raise KeyError(msg)
+
+        updated_track = await self._repo.update_library_track_metadata(
+            track_id=request.track_id,
+            title=request.proposed_title,
+            artist=request.proposed_artist,
+            album=request.proposed_album,
+            year=request.proposed_year,
+        )
+        if updated_track is None:
+            msg = f"Library track '{request.track_id}' not found"
+            raise KeyError(msg)
+
+        resolved = await self._repo.resolve_tag_correction_request(
+            request_id=request_id,
+            status=TagCorrectionStatus.APPROVED,
+            reviewed_by=actor.telegram_id,
+        )
+        assert resolved is not None
+
+        await self._repo.append_audit_log(
+            AuditLogEntry(
+                actor_id=actor.telegram_id,
+                action=AuditAction.TAG_CORRECTION_APPROVED,
+                target_entity=f"track:{updated_track.id}",
+                details={
+                    "request_id": request_id,
+                    "title": updated_track.title,
+                    "artist": updated_track.artist,
+                    "album": updated_track.album,
+                    "year": updated_track.year,
+                },
+            )
+        )
+        return resolved, updated_track
+
+    async def reject_tag_correction(
+        self,
+        actor: UserAccount,
+        request_id: int,
+    ) -> TagCorrectionRequest:
+        """Reject a pending tag correction request (`APPROVE_TAG_CORRECTIONS`)."""
+        require_permission(actor, Permission.APPROVE_TAG_CORRECTIONS)
+        resolved = await self._repo.resolve_tag_correction_request(
+            request_id=request_id,
+            status=TagCorrectionStatus.REJECTED,
+            reviewed_by=actor.telegram_id,
+        )
+        if resolved is None:
+            msg = f"Tag correction request {request_id} not found"
+            raise KeyError(msg)
+
+        await self._repo.append_audit_log(
+            AuditLogEntry(
+                actor_id=actor.telegram_id,
+                action=AuditAction.TAG_CORRECTION_REJECTED,
+                target_entity=f"track:{resolved.track_id}",
+                details={"request_id": request_id},
+            )
+        )
+        return resolved
+
+    async def wipe_library_catalog(
+        self,
+        actor: UserAccount,
+        reason: str = "Owner Destructive Library Wipe",
+    ) -> int:
+        """Execute a destructive library catalog wipe (`SYSTEM_DESTRUCTIVE_WIPE`)."""
+        require_permission(actor, Permission.SYSTEM_DESTRUCTIVE_WIPE)
+        removed_count = await self._repo.wipe_library_catalog()
+        await self._repo.append_audit_log(
+            AuditLogEntry(
+                actor_id=actor.telegram_id,
+                action=AuditAction.SYSTEM_WIPE_EXECUTED,
+                target_entity="system:catalog",
+                details={"removed_records": removed_count, "reason": reason},
+            )
+        )
+        return removed_count

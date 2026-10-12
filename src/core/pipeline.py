@@ -3,7 +3,9 @@
 import hashlib
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from src.core.deduplicator import DeduplicatorService
@@ -30,6 +32,8 @@ from src.core.ports import (
 
 logger = logging.getLogger(__name__)
 
+StageCallback = Callable[[IngestionJob], Awaitable[None]]
+
 
 def _requires_confirmation(
     candidates: list[MetadataCandidate],
@@ -41,6 +45,8 @@ def _requires_confirmation(
     top = candidates[0]
     if top.confidence < threshold:
         return True
+    if top.confidence >= 0.98:
+        return False
     if len(candidates) > 1:
         runner_up = candidates[1]
         if runner_up.confidence >= threshold and abs(top.confidence - runner_up.confidence) < 0.05:
@@ -104,6 +110,88 @@ def _discover_staged_audio_files(job: IngestionJob) -> list[Path]:
     return [job.source_path]
 
 
+def _match_track_from_release(
+    local_meta: TrackMetadata,
+    ordinal_index: int,
+    release_tracks: list[TrackMetadata],
+    fallback_release: TrackMetadata,
+    known_duration: int | None = None,
+) -> TrackMetadata:
+    """Map a local track in a multi-track archive against the MusicBrainz release `medium-list`."""
+    target_disc = local_meta.disc_number or fallback_release.disc_number or 1
+    target_track_num = local_meta.track_number or ordinal_index
+
+    matched_rel_track: TrackMetadata | None = None
+    if release_tracks:
+        # 1. Exact (disc_number, track_number) match
+        for rel_trk in release_tracks:
+            if (rel_trk.disc_number or 1) == target_disc and rel_trk.track_number == target_track_num:
+                matched_rel_track = rel_trk
+                break
+
+        # 2. Match by track_number on single-disc or when local disc is unspecified
+        if matched_rel_track is None:
+            for rel_trk in release_tracks:
+                if rel_trk.track_number == target_track_num:
+                    matched_rel_track = rel_trk
+                    break
+
+        # 3. High title similarity match
+        if matched_rel_track is None and local_meta.title not in {"", "Unknown Title"}:
+            best_ratio = 0.0
+            for rel_trk in release_tracks:
+                ratio = SequenceMatcher(
+                    None,
+                    local_meta.title.strip().lower(),
+                    rel_trk.title.strip().lower(),
+                ).ratio()
+                if ratio > best_ratio and ratio >= 0.80:
+                    best_ratio = ratio
+                    matched_rel_track = rel_trk
+
+        # 4. Ordinal position fallback when track counts align
+        if matched_rel_track is None and 1 <= ordinal_index <= len(release_tracks):
+            matched_rel_track = release_tracks[ordinal_index - 1]
+
+    if matched_rel_track is not None:
+        resolved_artist = (
+            matched_rel_track.artist
+            if matched_rel_track.artist and matched_rel_track.artist != "Unknown Artist"
+            else (local_meta.artist if local_meta.artist != "Unknown Artist" else fallback_release.artist)
+        )
+        return TrackMetadata(
+            title=matched_rel_track.title or local_meta.title,
+            artist=resolved_artist,
+            album=fallback_release.album,
+            album_artist=fallback_release.effective_album_artist,
+            year=fallback_release.year or matched_rel_track.year,
+            track_number=matched_rel_track.track_number or target_track_num,
+            disc_number=matched_rel_track.disc_number or target_disc,
+            genre=local_meta.genre or fallback_release.genre,
+            duration_seconds=known_duration
+            or local_meta.duration_seconds
+            or matched_rel_track.duration_seconds,
+            recording_mbid=matched_rel_track.recording_mbid or local_meta.recording_mbid,
+            release_mbid=fallback_release.release_mbid,
+            isrc=local_meta.isrc or matched_rel_track.isrc,
+        )
+
+    return TrackMetadata(
+        title=local_meta.title,
+        artist=(local_meta.artist if local_meta.artist != "Unknown Artist" else fallback_release.artist),
+        album=fallback_release.album,
+        album_artist=fallback_release.effective_album_artist,
+        year=fallback_release.year,
+        track_number=target_track_num,
+        disc_number=target_disc,
+        genre=local_meta.genre or fallback_release.genre,
+        duration_seconds=known_duration or local_meta.duration_seconds,
+        recording_mbid=local_meta.recording_mbid,
+        release_mbid=fallback_release.release_mbid,
+        isrc=local_meta.isrc,
+    )
+
+
 class IngestionPipeline:
     """Pure domain orchestrator driving audio files through the verification and storage stages."""
 
@@ -126,6 +214,16 @@ class IngestionPipeline:
         self._deduplicator = DeduplicatorService(catalog_repository)
         self._auto_approve_confidence = auto_approve_confidence
 
+    async def _notify_stage(
+        self,
+        job: IngestionJob,
+        stage_callback: StageCallback | None,
+    ) -> None:
+        """Persist `job` state and invoke `stage_callback` if registered."""
+        await self._catalog.save_job(job)
+        if stage_callback is not None:
+            await stage_callback(job)
+
     async def _compute_fingerprint_with_fallback(
         self,
         audio_path: Path,
@@ -147,6 +245,35 @@ class IngestionPipeline:
                 acoustid_mbid=None,
             )
 
+    async def get_job(self, job_id: str) -> IngestionJob | None:
+        """Retrieve a persisted `IngestionJob` by its identifier."""
+        return await self._catalog.get_job(job_id)
+
+    async def _lookup_release_tracklist(
+        self,
+        selected_metadata: TrackMetadata,
+    ) -> list[TrackMetadata]:
+        """Fetch the release tracklist from `self._metadata` if `fetch_release_tracks` is supported."""
+        if not selected_metadata.release_mbid:
+            return []
+        fetch_fn = getattr(self._metadata, "fetch_release_tracks", None)
+        if not callable(fetch_fn):
+            return []
+        try:
+            result = await fetch_fn(
+                selected_metadata.release_mbid,
+                prefer_english=selected_metadata.artist.isascii(),
+            )
+            if isinstance(result, list):
+                return [item for item in result if isinstance(item, TrackMetadata)]
+        except Exception as exc:
+            logger.debug(
+                "Release tracklist lookup failed for %s: %s",
+                selected_metadata.release_mbid,
+                exc,
+            )
+        return []
+
     async def process_file(
         self,
         source_path: Path,
@@ -158,6 +285,7 @@ class IngestionPipeline:
         source_type: SourceType = SourceType.DIRECT_AUDIO,
         sha256_hash: str | None = None,
         started_at: datetime | None = None,
+        stage_callback: StageCallback | None = None,
     ) -> IngestionResult:
         """Run stages 1–7, and continue through 8–10 if confidence meets the auto-approve threshold."""
         resolved_job_id = job_id or uuid.uuid4().hex[:12]
@@ -174,10 +302,11 @@ class IngestionPipeline:
         await self._catalog.save_job(job)
 
         job.state = JobState.EXTRACTING
-        await self._catalog.save_job(job)
+        await self._notify_stage(job, stage_callback)
         staged_files = await self._extractor.extract_or_stage(source_path, resolved_job_id)
         primary_audio = staged_files[0]
         job.scratch_dir = primary_audio.parent
+        job.total_tracks = len(staged_files)
 
         raw_local_meta = await self._metadata.read_local_metadata(primary_audio)
         local_meta = _merge_original_filename_metadata(
@@ -187,7 +316,7 @@ class IngestionPipeline:
         )
 
         job.state = JobState.FINGERPRINTING
-        await self._catalog.save_job(job)
+        await self._notify_stage(job, stage_callback)
         fingerprint = await self._compute_fingerprint_with_fallback(
             primary_audio,
             known_duration=local_meta.duration_seconds,
@@ -204,10 +333,12 @@ class IngestionPipeline:
                 job=job,
                 requires_user_confirmation=False,
                 duplicate=dup_check,
+                tracks_ingested=0,
+                lyrics_embedded_count=0,
             )
 
         job.state = JobState.ENRICHING_METADATA
-        await self._catalog.save_job(job)
+        await self._notify_stage(job, stage_callback)
         candidates = await self._metadata.find_candidates(local_meta, fingerprint)
         job.candidates = candidates
         if candidates:
@@ -225,6 +356,8 @@ class IngestionPipeline:
             return IngestionResult(
                 job=job,
                 requires_user_confirmation=True,
+                tracks_ingested=0,
+                lyrics_embedded_count=0,
             )
 
         selected = candidates[0].metadata
@@ -233,6 +366,7 @@ class IngestionPipeline:
             primary_audio,
             selected,
             extra_audio_paths=staged_files[1:],
+            stage_callback=stage_callback,
         )
 
     async def confirm_candidate(
@@ -240,6 +374,7 @@ class IngestionPipeline:
         job_id: str,
         candidate_index: int,
         staged_audio_path: Path | None = None,
+        stage_callback: StageCallback | None = None,
     ) -> IngestionResult:
         """Resume a job in AWAITING_CONFIRMATION after the user selects a candidate match."""
         job = await self._catalog.get_job(job_id)
@@ -258,6 +393,7 @@ class IngestionPipeline:
             primary_audio = discovered[0]
             extra_paths = discovered[1:]
 
+        job.total_tracks = 1 + len(extra_paths)
         chosen = job.candidates[candidate_index]
         job.confidence_score = chosen.confidence
         job.matched_release_mbid = chosen.metadata.release_mbid
@@ -266,6 +402,7 @@ class IngestionPipeline:
             primary_audio,
             chosen.metadata,
             extra_audio_paths=extra_paths,
+            stage_callback=stage_callback,
         )
 
     async def search_manual_candidates(
@@ -279,7 +416,9 @@ class IngestionPipeline:
             msg = f"Unknown ingestion job: {job_id}"
             raise KeyError(msg)
 
-        primary_audio = _discover_staged_audio_files(job)[0]
+        discovered = _discover_staged_audio_files(job)
+        job.total_tracks = len(discovered)
+        primary_audio = discovered[0]
         raw_local_meta = await self._metadata.read_local_metadata(primary_audio)
         base_meta = _merge_original_filename_metadata(
             raw_local_meta,
@@ -319,7 +458,12 @@ class IngestionPipeline:
             job.confidence_score = candidates[0].confidence
             job.matched_release_mbid = candidates[0].metadata.release_mbid
         await self._catalog.save_job(job)
-        return IngestionResult(job=job, requires_user_confirmation=True)
+        return IngestionResult(
+            job=job,
+            requires_user_confirmation=True,
+            tracks_ingested=0,
+            lyrics_embedded_count=0,
+        )
 
     async def cancel_job(self, job_id: str) -> IngestionJob:
         """Cancel an in-flight or awaiting-confirmation job and clean up its scratch directory."""
@@ -339,57 +483,80 @@ class IngestionPipeline:
         audio_path: Path,
         selected_metadata: TrackMetadata,
         extra_audio_paths: list[Path] | None = None,
+        stage_callback: StageCallback | None = None,
     ) -> IngestionResult:
-        """Execute stages 8–10: fetch lyrics, write tags & move file(s), register catalog, cleanup."""
-        job.selected_metadata = selected_metadata
-        job.matched_release_mbid = selected_metadata.release_mbid or job.matched_release_mbid
+        """Execute stages 8–10: fetch release tracklist, lyrics, write tags & move file(s), cleanup."""
+        extra_list = extra_audio_paths or []
+        job.total_tracks = max(job.total_tracks, 1 + len(extra_list))
+        release_tracks: list[TrackMetadata] = []
+        if extra_list and selected_metadata.release_mbid:
+            release_tracks = await self._lookup_release_tracklist(selected_metadata)
+
+        primary_meta = selected_metadata
+        if release_tracks and not primary_meta.recording_mbid:
+            primary_meta = _match_track_from_release(
+                local_meta=primary_meta,
+                ordinal_index=1,
+                release_tracks=release_tracks,
+                fallback_release=selected_metadata,
+                known_duration=primary_meta.duration_seconds,
+            )
+
+        job.selected_metadata = primary_meta
+        job.matched_release_mbid = primary_meta.release_mbid or job.matched_release_mbid
         job.state = JobState.FETCHING_LYRICS
-        await self._catalog.save_job(job)
-        lyrics = await self._lyrics.fetch_lyrics(selected_metadata)
+        await self._notify_stage(job, stage_callback)
+        lyrics = await self._lyrics.fetch_lyrics(primary_meta)
+        lyrics_count = 1 if (lyrics and lyrics.has_any) else 0
+        job.lyrics_matched_count = lyrics_count
 
         job.state = JobState.ORGANIZING
-        await self._catalog.save_job(job)
+        await self._notify_stage(job, stage_callback)
         final_path = await self._organizer.finalize_track(
             source_audio_path=audio_path,
-            metadata=selected_metadata,
+            metadata=primary_meta,
             lyrics=lyrics,
         )
         job.final_path = final_path
+        tracks_written = 1
+        job.processed_tracks = 1
 
         if job.fingerprint is not None:
             await self._catalog.register_ingested_track(
                 job_id=job.job_id,
-                metadata=selected_metadata,
+                metadata=primary_meta,
                 fingerprint=job.fingerprint,
                 library_path=final_path,
             )
 
-        any_lyrics = bool(lyrics and lyrics.has_any)
-        for index, extra_path in enumerate(extra_audio_paths or [], start=2):
+        for index, extra_path in enumerate(extra_list, start=2):
             extra_local = await self._metadata.read_local_metadata(extra_path)
             extra_fp = await self._compute_fingerprint_with_fallback(
                 extra_path,
                 known_duration=extra_local.duration_seconds,
             )
+            extra_meta = _match_track_from_release(
+                local_meta=extra_local,
+                ordinal_index=index,
+                release_tracks=release_tracks,
+                fallback_release=selected_metadata,
+                known_duration=extra_fp.duration_seconds or extra_local.duration_seconds,
+            )
+            if extra_meta.recording_mbid and not extra_fp.acoustid_mbid:
+                extra_fp = AudioFingerprint(
+                    duration_seconds=extra_fp.duration_seconds,
+                    fingerprint=extra_fp.fingerprint,
+                    acoustid_mbid=extra_meta.recording_mbid,
+                )
             extra_dup = await self._deduplicator.check_track(extra_fp)
             if extra_dup.is_duplicate:
                 continue
-            extra_meta = TrackMetadata(
-                title=extra_local.title,
-                artist=(
-                    extra_local.artist if extra_local.artist != "Unknown Artist" else selected_metadata.artist
-                ),
-                album=selected_metadata.album,
-                album_artist=selected_metadata.effective_album_artist,
-                year=selected_metadata.year,
-                track_number=extra_local.track_number or index,
-                disc_number=extra_local.disc_number or selected_metadata.disc_number or 1,
-                genre=extra_local.genre or selected_metadata.genre,
-                duration_seconds=extra_fp.duration_seconds or extra_local.duration_seconds,
-                recording_mbid=extra_local.recording_mbid,
-                release_mbid=selected_metadata.release_mbid,
-            )
+
             extra_lyrics = await self._lyrics.fetch_lyrics(extra_meta)
+            if extra_lyrics and extra_lyrics.has_any:
+                lyrics_count += 1
+                job.lyrics_matched_count = lyrics_count
+
             extra_final = await self._organizer.finalize_track(
                 source_audio_path=extra_path,
                 metadata=extra_meta,
@@ -401,16 +568,18 @@ class IngestionPipeline:
                 fingerprint=extra_fp,
                 library_path=extra_final,
             )
-            if extra_lyrics and extra_lyrics.has_any:
-                any_lyrics = True
+            tracks_written += 1
+            job.processed_tracks = tracks_written
 
         job.state = JobState.COMPLETED
         job.completed_at = datetime.now(UTC)
-        await self._catalog.save_job(job)
+        await self._notify_stage(job, stage_callback)
 
         await self._extractor.cleanup_job_scratch(job.job_id)
         return IngestionResult(
             job=job,
             requires_user_confirmation=False,
-            lyrics_attached=any_lyrics,
+            lyrics_attached=lyrics_count > 0,
+            tracks_ingested=tracks_written,
+            lyrics_embedded_count=lyrics_count,
         )

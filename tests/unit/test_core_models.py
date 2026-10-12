@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import mutagen
 import pytest
+from mutagen.flac import FLAC, Picture
+from mutagen.id3 import ID3
 
 from src.core.exceptions import (
     ArchiveExtractionError,
@@ -15,18 +17,21 @@ from src.core.exceptions import (
     FingerprintingError,
     UnsupportedAudioFormatError,
 )
-from src.core.extractor import SevenZipArchiveExtractor
+from src.core.extractor import SevenZipArchiveExtractor, find_best_cover_image
 from src.core.fingerprint import ChromaprintFingerprinter
 from src.core.lyrics import LrclibLyricsClient
 from src.core.metadata import (
     MusicBrainzMetadataService,
     compute_metadata_similarity,
     extract_artist_search_variants,
+    extract_bilingual_english,
+    extract_title_search_variants,
+    normalize_primary_artist,
     parse_filename_metadata,
     parse_manual_search_query,
 )
 from src.core.models import AudioFingerprint, LyricsData, MetadataCandidate, TrackMetadata
-from src.core.organizer import LibraryOrganizer
+from src.core.organizer import LibraryOrganizer, parse_lrc_timestamps
 
 MINIMAL_FLAC_BYTES = (
     b"fLaC\x80\x00\x00\x22"
@@ -248,7 +253,7 @@ def test_metadata_service_parses_artist_title_from_stem(tmp_path: Path) -> None:
 
     emilia_meta = parse_filename_metadata("01 - EMILIA(CV:RIE TAKAHASHI) – Stay Alive")
     assert emilia_meta.track_number == 1
-    assert emilia_meta.artist == "EMILIA(CV:RIE TAKAHASHI)"
+    assert emilia_meta.artist == "Rie Takahashi"
     assert emilia_meta.title == "Stay Alive"
 
     disc_meta = parse_filename_metadata("2-05 - Artist Name — Song Title")
@@ -327,13 +332,13 @@ def test_mutagen_tag_reading_and_musicbrainz_candidate_ranking(tmp_path: Path) -
     )
     assert len(candidates) == 2
     top = candidates[0]
-    assert top.metadata.artist == "Emilia (CV: Rie Takahashi)"
+    assert top.metadata.artist == "Rie Takahashi"
     assert top.metadata.title == "Stay Alive"
     assert top.metadata.album == "Stay Alive"
     assert top.metadata.year == 2016
     assert top.metadata.release_mbid == "mb-rel-2016"
     assert top.confidence >= 0.90
-    assert "Emilia (CV: Rie Takahashi) - Stay Alive | Stay Alive (2016)" in top.display_label
+    assert "Rie Takahashi - Stay Alive | Stay Alive (2016)" in top.display_label
 
 
 def test_library_organizer_sanitizes_paths_writes_mutagen_tags_and_lrc(tmp_path: Path) -> None:
@@ -385,11 +390,11 @@ def test_cv_artist_variants_and_manual_search_url_mbid_parsing() -> None:
     """Verify `extract_artist_search_variants` and `parse_manual_search_query` for URLs, MBIDs, and CVs."""
     variants = extract_artist_search_variants("EMILIA(CV:RIE TAKAHASHI)")
     assert "EMILIA(CV:RIE TAKAHASHI)" in variants
-    assert "RIE TAKAHASHI" in variants
+    assert "Rie Takahashi" in variants
     assert "EMILIA" in variants
 
     compact_variants = extract_artist_search_variants("EMILIA(CVRIE TAKAHASHI)")
-    assert "RIE TAKAHASHI" in compact_variants
+    assert "Rie Takahashi" in compact_variants
     assert "EMILIA" in compact_variants
 
     jp_variants = extract_artist_search_variants("エミリア（CV：高橋李依）")
@@ -521,12 +526,12 @@ def test_musicbrainz_english_alias_reconstruction_and_compilation_demotion() -> 
     top = candidates[0]
     assert top.metadata.release_mbid == "ca344c5b-9c69-4283-8383-e7c4c026d571"
     assert top.metadata.album == "Stay Alive"
-    assert top.metadata.artist == "Emilia (CV: Rie Takahashi)"
+    assert top.metadata.artist == "Rie Takahashi"
     assert top.metadata.track_number == 1
     assert top.confidence >= 0.95
     assert top.display_label.startswith("[")
-    # Also offers the original Japanese script candidate
-    assert any(c.metadata.artist == "エミリア(CV:高橋李依)" for c in candidates)
+    # Also offers the original Japanese voice actor script candidate
+    assert any(c.metadata.artist == "高橋李依" for c in candidates)
 
 
 def test_musicbrainz_release_mbid_lookup_and_artist_arid_resolution() -> None:
@@ -622,3 +627,421 @@ def test_musicbrainz_release_mbid_lookup_and_artist_arid_resolution() -> None:
         )
         assert arid_candidates
         assert arid_candidates[0].metadata.recording_mbid == "38b27632-eaa9-4598-bfd1-2a973636d09f"
+
+
+def test_synced_lyrics_embedding_and_cover_art_extraction_and_fetching(tmp_path: Path) -> None:
+    """Verify synced lyrics tags (FLAC & MP3 SYLT), cover.jpg extraction/CAA fetch, and tag corrections."""
+    lrc_text = "[00:01.50] First line\n[00:04.250] Second line\n[01:02:03.00] Late line"
+    parsed_lines = parse_lrc_timestamps(lrc_text)
+    assert parsed_lines == [
+        ("First line", 1500),
+        ("Second line", 4250),
+        ("Late line", 3723000),
+    ]
+
+    # 1. FLAC with embedded Picture + synced & plain lyrics -> writes SYNCEDLYRICS and cover.jpg
+    flac_src = tmp_path / "embedded_art.flac"
+    flac_src.write_bytes(MINIMAL_FLAC_BYTES)
+    flac_obj = FLAC(flac_src)
+    pic = Picture()
+    pic.type = 3
+    pic.mime = "image/jpeg"
+    pic.data = b"\xff\xd8\xff\xe0JFIF-embedded-cover-bytes"
+    flac_obj.add_picture(pic)
+    flac_obj.save()
+
+    organizer = LibraryOrganizer(library_root=tmp_path / "lib")
+    meta = TrackMetadata(
+        title="Stay Alive",
+        artist="Emilia (CV: Rie Takahashi)",
+        album="Stay Alive",
+        year=2016,
+        track_number=1,
+    )
+    lyrics = LyricsData(
+        synced_lyrics="[00:01.50] I stay alive\n[00:05.00] In the dark",
+        plain_lyrics="I stay alive\nIn the dark",
+    )
+    final_flac = asyncio.run(organizer.finalize_track(flac_src, meta, lyrics))
+    assert final_flac.is_file()
+    cover_jpg = final_flac.parent / "cover.jpg"
+    assert cover_jpg.is_file()
+    assert cover_jpg.read_bytes() == b"\xff\xd8\xff\xe0JFIF-embedded-cover-bytes"
+
+    written_flac = FLAC(final_flac)
+    assert written_flac["SYNCEDLYRICS"] == [lyrics.synced_lyrics]
+    assert written_flac["LYRICS"] == [lyrics.synced_lyrics]
+    assert written_flac["UNSYNCEDLYRICS"] == [lyrics.plain_lyrics]
+
+    # Apply post-ingestion tag correction on the finalized FLAC file
+    updated_ok = asyncio.run(
+        organizer.apply_tag_correction(
+            audio_path=final_flac,
+            title="Stay Alive (TV Size)",
+            artist="Emilia",
+            album="Re:Zero ED2",
+            year=2017,
+        )
+    )
+    assert updated_ok is True
+    corrected_easy = mutagen.File(final_flac, easy=True)
+    assert corrected_easy is not None
+    assert corrected_easy["title"] == ["Stay Alive (TV Size)"]
+    assert corrected_easy["artist"] == ["Emilia"]
+    assert corrected_easy["album"] == ["Re:Zero ED2"]
+    assert corrected_easy["date"] == ["2017"]
+
+    # 2. MP3 ID3 SYLT/USLT/TXXX synced lyrics embedding + Cover Art Archive HTTP fallback
+    mp3_src = tmp_path / "song.mp3"
+    # Minimal valid MPEG1 Layer3 frame header so mutagen.id3 can attach an ID3 header
+    mp3_src.write_bytes(b"\xff\xfb\x90\x64" + b"\x00" * 413)
+    id3_init = ID3()
+    id3_init.save(mp3_src)
+
+    def _caa_handler(request: httpx.Request) -> httpx.Response:
+        if "coverartarchive.org/release/ca344c5b-9c69-4283-8383-e7c4c026d571/front" in str(request.url):
+            return httpx.Response(status_code=200, content=b"\xff\xd8\xff\xe0CAA-COVER-ART")
+        return httpx.Response(status_code=404)
+
+    caa_organizer = LibraryOrganizer(
+        library_root=tmp_path / "lib_caa",
+        transport=httpx.MockTransport(_caa_handler),
+    )
+    mp3_meta = TrackMetadata(
+        title="Wishing",
+        artist="Rem (CV: Inori Minase)",
+        album="Wishing",
+        year=2016,
+        track_number=2,
+        release_mbid="ca344c5b-9c69-4283-8383-e7c4c026d571",
+    )
+    final_mp3 = asyncio.run(caa_organizer.finalize_track(mp3_src, mp3_meta, lyrics))
+    assert final_mp3.is_file()
+    caa_cover = final_mp3.parent / "cover.jpg"
+    assert caa_cover.is_file()
+    assert caa_cover.read_bytes() == b"\xff\xd8\xff\xe0CAA-COVER-ART"
+
+    written_id3 = ID3(final_mp3)
+    sylt_frames = written_id3.getall("SYLT")
+    assert len(sylt_frames) == 1
+    assert sylt_frames[0].text == [("I stay alive", 1500), ("In the dark", 5000)]
+    uslt_frames = written_id3.getall("USLT")
+    assert len(uslt_frames) == 1
+
+    # 3. Staged cover image in archive/scratch directory takes priority
+    scratch_dir = tmp_path / "scratch_cover"
+    scratch_dir.mkdir()
+    staged_flac = scratch_dir / "01 - Track.flac"
+    staged_flac.write_bytes(MINIMAL_FLAC_BYTES)
+    staged_cover = scratch_dir / "front.jpg"
+    staged_cover.write_bytes(b"\xff\xd8\xff\xe0STAGED-FRONT-JPG")
+    assert find_best_cover_image(scratch_dir) == staged_cover
+
+    staged_meta = TrackMetadata(title="Track", artist="Artist", album="Staged Album", year=2024)
+    final_staged = asyncio.run(organizer.finalize_track(staged_flac, staged_meta))
+    assert (final_staged.parent / "cover.jpg").read_bytes() == b"\xff\xd8\xff\xe0STAGED-FRONT-JPG"
+
+
+def test_fetch_release_tracks_medium_list_mapping() -> None:
+    """Verify `MusicBrainzMetadataService.fetch_release_tracks` maps all tracks from `medium-list`."""
+    release_payload: dict[str, object] = {
+        "id": "ca344c5b-9c69-4283-8383-e7c4c026d571",
+        "title": "Stay Alive",
+        "date": "2016-08-24",
+        "artist-credit-phrase": "エミリア(CV:高橋李依)",
+        "artist-credit": [
+            {
+                "name": "エミリア",
+                "artist": {
+                    "name": "エミリア",
+                    "sort-name": "Emilia",
+                    "alias-list": [{"alias": "Emilia", "locale": "en", "primary": "primary"}],
+                },
+            },
+            "(CV:",
+            {
+                "name": "高橋李依",
+                "artist": {
+                    "name": "高橋李依",
+                    "sort-name": "Takahashi, Rie",
+                    "alias-list": [{"alias": "Rie Takahashi", "locale": "en", "primary": "primary"}],
+                },
+            },
+            ")",
+        ],
+        "medium-list": [
+            {
+                "position": "1",
+                "track-list": [
+                    {
+                        "number": "1",
+                        "title": "Stay Alive",
+                        "length": "267000",
+                        "recording": {
+                            "id": "rec-mbid-1",
+                            "title": "Stay Alive",
+                        },
+                    },
+                    {
+                        "number": "2",
+                        "title": "Wishing",
+                        "length": "360000",
+                        "recording": {
+                            "id": "rec-mbid-2",
+                            "title": "Wishing",
+                            "artist-credit-phrase": "Rem (CV: Inori Minase)",
+                        },
+                    },
+                ],
+            }
+        ],
+    }
+
+    service = MusicBrainzMetadataService(release_lookup_fn=lambda _mbid: release_payload)
+    tracks = asyncio.run(
+        service.fetch_release_tracks(
+            "ca344c5b-9c69-4283-8383-e7c4c026d571",
+            prefer_english=True,
+        )
+    )
+    assert len(tracks) == 2
+    assert tracks[0].track_number == 1
+    assert tracks[0].title == "Stay Alive"
+    assert tracks[0].artist == "Rie Takahashi"
+    assert tracks[0].recording_mbid == "rec-mbid-1"
+    assert tracks[0].duration_seconds == 267
+    assert tracks[1].track_number == 2
+    assert tracks[1].title == "Wishing"
+    assert tracks[1].artist == "Inori Minase"
+    assert tracks[1].recording_mbid == "rec-mbid-2"
+
+
+def test_primary_artist_character_stripping_and_bilingual_genius_lastfm_enrichment(
+    tmp_path: Path,
+) -> None:
+    """Verify `normalize_primary_artist`, `extract_bilingual_english`, Genius/Last.fm, and LRCLIB search."""
+    # 1. Collaboration & Character/CV artist normalization
+    assert normalize_primary_artist("Rkomi con Elodie") == "Rkomi"
+    assert normalize_primary_artist("Rkomi feat. Elodie") == "Rkomi"
+    assert normalize_primary_artist("Yotsugi Ononoki(Saori Hayami)") == "Saori Hayami"
+    assert normalize_primary_artist("Ononoki Yotsugi (CV: Hayami Saori)") == "Hayami Saori"
+    assert normalize_primary_artist("EMILIA(CV:RIE TAKAHASHI)") == "Rie Takahashi"
+    assert (
+        normalize_primary_artist("斧乃木余接(CV.早見沙織) (Yotsugi Ononoki (CV. Saori Hayami))")
+        == "Saori Hayami"
+    )
+    assert normalize_primary_artist("ClariS") == "ClariS"
+
+    # 2. Bilingual & OP/ED title extraction
+    assert extract_bilingual_english("オレンジミント (Orange Mint)") == "Orange Mint"
+    assert extract_bilingual_english("歌物語 2 (Uta Monogatari 2)") == "Uta Monogatari 2"
+    assert extract_title_search_variants("Tsukimonogatari OP Orange Mint")[0] == "Orange Mint"
+    assert extract_title_search_variants("Tsukimonogatari ED border")[0] == "border"
+
+    # 3. MusicBrainz Character type stripping + legal-name alias avoidance + Genius/Last.fm enrichment
+    def _mb_orange_mint_and_rkomi(
+        meta: TrackMetadata,
+        fp: AudioFingerprint | None,
+    ) -> list[dict[str, object]]:
+        if "coda" in meta.title.lower():
+            return [
+                {
+                    "id": "265a1eca-4f5a-4bee-b441-bc0994ca2d9c",
+                    "title": "La coda del diavolo",
+                    "artist-credit-phrase": "Rkomi con Elodie",
+                    "artist-credit": [
+                        {
+                            "artist": {
+                                "name": "Rkomi",
+                                "type": "Person",
+                                "alias-list": [{"alias": "Mirko Manuele Martorana", "type": "Legal name"}],
+                            }
+                        },
+                        " con ",
+                        {
+                            "artist": {
+                                "name": "Elodie",
+                                "type": "Person",
+                                "alias-list": [{"alias": "Elodie Di Patrizi", "type": "Legal name"}],
+                            }
+                        },
+                    ],
+                    "ext:score": "100",
+                    "release-list": [
+                        {
+                            "id": "07547216-8ea5-4f98-afb5-1aae1dba3b24",
+                            "title": "Taxi Driver",
+                            "date": "2021-11-30",
+                            "medium-list": [{"position": "1", "track-list": [{"number": "2"}]}],
+                        }
+                    ],
+                }
+            ]
+        return [
+            {
+                "id": "37d2ca56-6f5e-455c-b93a-e880d5f3bc1f",
+                "title": "オレンジミント",
+                "artist-credit-phrase": "斧乃木余接(早見沙織)",
+                "artist-credit": [
+                    {
+                        "artist": {
+                            "type": "Character",
+                            "name": "斧乃木余接",
+                            "alias-list": [
+                                {"alias": "Yotsugi Ononoki", "locale": "en", "primary": "primary"}
+                            ],
+                        }
+                    },
+                    "(",
+                    {
+                        "artist": {
+                            "type": "Person",
+                            "name": "早見沙織",
+                            "sort-name": "Hayami, Saori",
+                            "alias-list": [{"alias": "Saori Hayami", "locale": "en", "primary": "primary"}],
+                        }
+                    },
+                    ")",
+                ],
+                "ext:score": "100",
+                "release-list": [
+                    {
+                        "id": "3e1c38ff-7ced-4517-b10d-713f42896c6f",
+                        "title": "オレンジミント",
+                        "date": "2015-05-07",
+                        "medium-list": [{"position": "1", "track-list": [{"number": "1"}]}],
+                    }
+                ],
+            }
+        ]
+
+    def _http_handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "genius.com" in url and "/songs/" in url:
+            return httpx.Response(
+                status_code=200,
+                json={
+                    "response": {
+                        "song": {
+                            "album": {"name": "オレンジミント (Orange Mint)"},
+                            "release_date_components": {"year": 2015},
+                        }
+                    }
+                },
+            )
+        if "genius.com" in url:
+            return httpx.Response(
+                status_code=200,
+                json={
+                    "response": {
+                        "sections": [
+                            {
+                                "hits": [
+                                    {
+                                        "result": {
+                                            "id": 6528618,
+                                            "title": "オレンジミント (Orange Mint)",
+                                            "primary_artist": {
+                                                "name": (
+                                                    "斧乃木余接(CV.早見沙織) "
+                                                    "(Yotsugi Ononoki (CV. Saori Hayami))"
+                                                )
+                                            },
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                },
+            )
+        if "audioscrobbler.com" in url:
+            return httpx.Response(
+                status_code=200,
+                json={
+                    "results": {
+                        "trackmatches": {"track": [{"name": "Orange Mint", "artist": "Saori Hayami"}]}
+                    }
+                },
+            )
+        if "lrclib.net/api/get" in url:
+            return httpx.Response(status_code=404)
+        if "lrclib.net/api/search" in url:
+            return httpx.Response(
+                status_code=200,
+                json=[
+                    {
+                        "trackName": "Orange Mint",
+                        "artistName": "斧乃木余接(早見沙織)",
+                        "duration": 275,
+                        "syncedLyrics": "[00:01.00] Mint lyrics",
+                        "plainLyrics": "Mint lyrics",
+                        "instrumental": False,
+                    }
+                ],
+            )
+        return httpx.Response(status_code=404)
+
+    transport = httpx.MockTransport(_http_handler)
+    service = MusicBrainzMetadataService(
+        lastfm_api_key="test-lfm-key",
+        search_fn=_mb_orange_mint_and_rkomi,
+        http_transport=transport,
+    )
+
+    # Test Rkomi con Elodie -> Rkomi (no legal name alias Mirko Manuele Martorana)
+    rkomi_cands = asyncio.run(
+        service.find_candidates(
+            TrackMetadata(title="La coda del diavolo", artist="Rkomi con Elodie", album="Taxi Driver")
+        )
+    )
+    assert len(rkomi_cands) == 1
+    assert rkomi_cands[0].metadata.artist == "Rkomi"
+    assert rkomi_cands[0].metadata.album_artist == "Rkomi"
+    assert rkomi_cands[0].confidence == 1.0
+
+    # Test Yotsugi Ononoki(Saori Hayami) -> Saori Hayami - Orange Mint
+    om_cands = asyncio.run(
+        service.find_candidates(
+            TrackMetadata(
+                title="オレンジミント",
+                artist="Yotsugi Ononoki(Saori Hayami)",
+                album="オレンジミント",
+            )
+        )
+    )
+    assert om_cands
+    assert om_cands[0].metadata.artist == "Saori Hayami"
+    assert om_cands[0].metadata.title == "Orange Mint"
+    assert om_cands[0].metadata.album == "Orange Mint"
+
+    # 4. LRCLIB `/search` fallback when `/get` returns 404
+    lrc_client = LrclibLyricsClient(transport=transport)
+    om_lyrics = asyncio.run(
+        lrc_client.fetch_lyrics(
+            TrackMetadata(
+                title="Orange Mint",
+                artist="Saori Hayami",
+                album="Orange Mint",
+                duration_seconds=275,
+            )
+        )
+    )
+    assert om_lyrics is not None
+    assert om_lyrics.has_synced is True
+    assert "Mint lyrics" in (om_lyrics.synced_lyrics or "")
+
+    # 5. Plain lyrics & pre-existing embedded lyrics write `.lrc` sidecar
+    organizer = LibraryOrganizer(library_root=tmp_path / "lib_lrc")
+    src_flac = tmp_path / "plain.flac"
+    src_flac.write_bytes(MINIMAL_FLAC_BYTES)
+    plain_only = LyricsData(plain_lyrics="Plain unsynced lyrics line")
+    final_plain = asyncio.run(
+        organizer.finalize_track(
+            src_flac,
+            TrackMetadata(title="La coda del diavolo", artist="Rkomi", album="Taxi Driver", year=2021),
+            plain_only,
+        )
+    )
+    assert final_plain.with_suffix(".lrc").is_file()
+    assert final_plain.with_suffix(".lrc").read_text(encoding="utf-8") == "Plain unsynced lyrics line"

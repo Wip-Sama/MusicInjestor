@@ -7,13 +7,24 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
-from src.core.models import Permission, UserAccount, UserRole
+from src.core.models import IngestionJob, Permission, UserAccount, UserRole
 from src.core.rbac import has_permission, next_demotion_role, next_promotion_role
 
+BTN_MAIN_SONGS = "🎵 Songs"
 BTN_MAIN_QUEUE = "⏳ Queue"
 BTN_MAIN_SSO = "🔐 Authentik SSO"
 BTN_MAIN_ADMIN = "👮 Admin panel"
 BTN_MAIN_INFO = "🤖 Bot information"
+
+RESERVED_MENU_BUTTONS: frozenset[str] = frozenset(
+    {
+        BTN_MAIN_SONGS,
+        BTN_MAIN_QUEUE,
+        BTN_MAIN_SSO,
+        BTN_MAIN_ADMIN,
+        BTN_MAIN_INFO,
+    }
+)
 
 
 def build_guest_onboarding_keyboard(
@@ -57,6 +68,7 @@ def build_main_menu_keyboard(user: UserAccount) -> ReplyKeyboardMarkup:
     """Create the persistent bottom `ReplyKeyboardMarkup` dock under the Telegram text input field."""
     rows: list[list[KeyboardButton]] = [
         [
+            KeyboardButton(text=BTN_MAIN_SONGS),
             KeyboardButton(text=BTN_MAIN_QUEUE),
             KeyboardButton(text=BTN_MAIN_SSO),
         ]
@@ -117,42 +129,95 @@ def build_queued_job_keyboard(job_id: str) -> InlineKeyboardMarkup:
 def build_admin_dashboard_keyboard(
     queued_count: int,
     concurrency_limit: int,
+    pending_tags_count: int = 0,
 ) -> InlineKeyboardMarkup:
     """Create the Administrator Control Panel keyboard (`/admin`, Specification Section 7.1)."""
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text="👥 User Management",
+                callback_data="admin:users",
+            ),
+            InlineKeyboardButton(
+                text=f"⏳ View Queue ({queued_count})",
+                callback_data="admin:queue",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="🔄 Run Authentik Sync",
+                callback_data="admin:sync_all",
+            ),
+            InlineKeyboardButton(
+                text=f"⚙️ Concurrency: [{concurrency_limit}]",
+                callback_data="admin:concurrency",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="📜 Audit Logs",
+                callback_data="admin:audit",
+            ),
+            InlineKeyboardButton(
+                text="❌ Close Panel",
+                callback_data="admin:close",
+            ),
+        ],
+    ]
+    if pending_tags_count > 0:
+        rows.insert(
+            2,
+            [
+                InlineKeyboardButton(
+                    text=f"🏷 Review Tag Edits ({pending_tags_count})",
+                    callback_data="admin:tags",
+                )
+            ],
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_tag_correction_review_keyboard(request_id: int) -> InlineKeyboardMarkup:
+    """Create an inline keyboard for moderators/admins to approve or reject a tag correction request."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="👥 User Management",
-                    callback_data="admin:users",
+                    text="✅ Approve & Apply",
+                    callback_data=f"admin:tag_approve:{request_id}",
                 ),
                 InlineKeyboardButton(
-                    text=f"⏳ View Queue ({queued_count})",
-                    callback_data="admin:queue",
+                    text="❌ Reject",
+                    callback_data=f"admin:tag_reject:{request_id}",
                 ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔄 Run Authentik Sync",
-                    callback_data="admin:sync_all",
-                ),
-                InlineKeyboardButton(
-                    text=f"⚙️ Concurrency: [{concurrency_limit}]",
-                    callback_data="admin:concurrency",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📜 Audit Logs",
-                    callback_data="admin:audit",
-                ),
-                InlineKeyboardButton(
-                    text="❌ Close Panel",
-                    callback_data="admin:close",
-                ),
-            ],
+            ]
         ]
     )
+
+
+def build_paused_jobs_keyboard(paused_jobs: list[IngestionJob]) -> InlineKeyboardMarkup:
+    """Create an inline keyboard allowing moderators/admins to open and resolve paused jobs."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for job in paused_jobs[:10]:
+        filename = job.original_filename or job.source_path.name
+        label = f"🔍 Resolve: {filename} ({job.job_id})"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=label[:64],
+                    callback_data=f"admin:resolve_job:{job.job_id}",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🔙 Back to Control Panel",
+                callback_data="admin:panel",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def build_user_list_keyboard(

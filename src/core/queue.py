@@ -194,7 +194,23 @@ class IngestionQueueWorker:
         target_job = queued_jobs[0]
         return await self.execute_job(target_job.job_id)
 
-    async def execute_job(self, job_id: str) -> IngestionResult | None:
+    async def _dispatch_progress(
+        self,
+        job: IngestionJob,
+        result: IngestionResult | None,
+        call_callback: ProgressCallback | None = None,
+    ) -> None:
+        """Invoke worker-level and per-call progress callbacks."""
+        if self._progress_callback is not None:
+            await self._progress_callback(job, result)
+        if call_callback is not None:
+            await call_callback(job, result)
+
+    async def execute_job(
+        self,
+        job_id: str,
+        progress_callback: ProgressCallback | None = None,
+    ) -> IngestionResult | None:
         """Execute a specific queued job under the worker concurrency semaphore."""
         async with self._condition:
             while self._active_count >= self._concurrency_limit:
@@ -211,8 +227,10 @@ class IngestionQueueWorker:
             job.started_at = datetime.now(UTC)
             await self._catalog.save_job(job)
 
-            if self._progress_callback is not None:
-                await self._progress_callback(job, None)
+            await self._dispatch_progress(job, None, progress_callback)
+
+            async def _on_stage(updated_job: IngestionJob) -> None:
+                await self._dispatch_progress(updated_job, None, progress_callback)
 
             try:
                 result = await self._pipeline.process_file(
@@ -224,6 +242,7 @@ class IngestionQueueWorker:
                     source_type=job.source_type,
                     sha256_hash=job.sha256_hash,
                     started_at=job.started_at,
+                    stage_callback=_on_stage,
                 )
             except Exception as exc:
                 failed_job = await self._catalog.get_job(job.job_id) or job
@@ -236,8 +255,7 @@ class IngestionQueueWorker:
             elapsed = max(0.1, time.monotonic() - started_clock)
             await self._emit_completion_events(result, elapsed)
 
-            if self._progress_callback is not None:
-                await self._progress_callback(result.job, result)
+            await self._dispatch_progress(result.job, result, progress_callback)
 
             return result
         finally:
@@ -308,6 +326,12 @@ class IngestionQueueWorker:
         if job.state == JobState.COMPLETED and job.selected_metadata is not None:
             meta = job.selected_metadata
             ext = (job.final_path.suffix.lstrip(".").upper() if job.final_path else "FLAC") or "FLAC"
+            tracks_written = max(1, result.tracks_ingested)
+            lyrics_embedded = (
+                result.lyrics_embedded_count
+                if result.lyrics_embedded_count > 0
+                else (1 if result.lyrics_attached else 0)
+            )
             await self._governance.append_audit_log(
                 AuditLogEntry(
                     actor_id=uploader.telegram_id,
@@ -318,6 +342,7 @@ class IngestionQueueWorker:
                         "artist": meta.artist,
                         "title": meta.title,
                         "final_path": str(job.final_path),
+                        "tracks_written": tracks_written,
                         "duration_seconds": round(duration_seconds, 2),
                     },
                 )
@@ -327,8 +352,8 @@ class IngestionQueueWorker:
                     job=job,
                     uploader=uploader,
                     metadata=meta,
-                    tracks_written=1,
+                    tracks_written=tracks_written,
                     audio_format=ext,
-                    lyrics_embedded=1 if result.lyrics_attached else 0,
+                    lyrics_embedded=lyrics_embedded,
                     duration_seconds=duration_seconds,
                 )

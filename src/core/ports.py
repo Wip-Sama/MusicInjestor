@@ -10,8 +10,11 @@ from src.core.models import (
     AuditLogEntry,
     DuplicateCheckResult,
     IngestionJob,
+    LibraryTrackRecord,
     LyricsData,
     MetadataCandidate,
+    TagCorrectionRequest,
+    TagCorrectionStatus,
     TrackMetadata,
     UserAccount,
     UserRole,
@@ -120,6 +123,97 @@ class GovernanceRepositoryPort(Protocol):
 
     async def cancel_queued_jobs_for_user(self, user_id: int) -> int:
         """Cancel all QUEUED jobs belonging to `user_id` and return the count cancelled."""
+        ...
+
+    async def get_library_track(self, track_id: str) -> LibraryTrackRecord | None:
+        """Retrieve an ingested library track by its ID (or prefix)."""
+        ...
+
+    async def list_library_tracks(self, limit: int = 20) -> list[LibraryTrackRecord]:
+        """List recent ingested library tracks ordered newest-first."""
+        ...
+
+    async def search_library_tracks(
+        self,
+        query: str,
+        limit: int = 20,
+    ) -> list[LibraryTrackRecord]:
+        """Search library tracks by title, artist, or album substring."""
+        ...
+
+    async def list_album_tracks(
+        self,
+        artist: str,
+        album: str,
+    ) -> list[LibraryTrackRecord]:
+        """Return all library tracks matching `artist` and `album` ordered by track number."""
+        ...
+
+    async def create_tag_correction_request(
+        self,
+        request: TagCorrectionRequest,
+    ) -> TagCorrectionRequest:
+        """Create a new PENDING tag correction request for an ingested library track."""
+        ...
+
+    async def get_tag_correction_request(self, request_id: int) -> TagCorrectionRequest | None:
+        """Retrieve a tag correction request by its ID."""
+        ...
+
+    async def list_pending_tag_correction_requests(self) -> list[TagCorrectionRequest]:
+        """Return all PENDING tag correction requests ordered by creation time."""
+        ...
+
+    async def resolve_tag_correction_request(
+        self,
+        request_id: int,
+        status: TagCorrectionStatus,
+        reviewed_by: int,
+    ) -> TagCorrectionRequest | None:
+        """Mark a tag correction request as APPROVED or REJECTED."""
+        ...
+
+    async def update_library_track_metadata(
+        self,
+        track_id: str,
+        title: str | None = None,
+        artist: str | None = None,
+        album: str | None = None,
+        year: int | None = None,
+    ) -> LibraryTrackRecord | None:
+        """Update the persisted title, artist, album, and year for an ingested track."""
+        ...
+
+    async def update_library_track_full(
+        self,
+        track_id: str,
+        *,
+        title: str | None = None,
+        artist: str | None = None,
+        album: str | None = None,
+        year: int | None = None,
+        track_number: int | None = None,
+        storage_path: Path | None = None,
+        has_synced_lyrics: bool | None = None,
+        recording_mbid: str | None = None,
+        release_mbid: str | None = None,
+    ) -> LibraryTrackRecord | None:
+        """Update metadata, storage path, lyrics flag, and MBIDs for an ingested track."""
+        ...
+
+    async def upsert_scanned_library_track(
+        self,
+        record: LibraryTrackRecord,
+    ) -> LibraryTrackRecord:
+        """Insert or update a library track discovered or reconciled during a filesystem rescan."""
+        ...
+
+    async def delete_library_track(self, track_id: str) -> bool:
+        """Delete a single library track record by ID when its file was removed from disk."""
+        ...
+
+    async def wipe_library_catalog(self) -> int:
+        """Delete all library track records and return the number of deleted tracks."""
         ...
 
 

@@ -7,16 +7,16 @@ from pathlib import Path
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message
+from aiogram.types import InlineKeyboardMarkup, Message
 
 from src.bot.api_server import resolve_local_api_file_path
 from src.bot.keyboards.admin import build_queued_job_keyboard
 from src.bot.keyboards.verification import build_verification_keyboard
 from src.bot.states import IngestionStates
 from src.config.settings import AppSettings
-from src.core.audit import format_queued_job_card
+from src.core.audit import format_ingesting_progress_card, format_queued_job_card
 from src.core.extractor import SUPPORTED_ARCHIVE_EXTENSIONS, SUPPORTED_AUDIO_EXTENSIONS
-from src.core.models import IngestionResult, UserAccount
+from src.core.models import IngestionJob, IngestionResult, JobState, UserAccount
 from src.core.pipeline import IngestionPipeline
 from src.core.ports import GovernanceRepositoryPort
 from src.core.queue import IngestionQueueWorker
@@ -25,6 +25,78 @@ logger = logging.getLogger(__name__)
 
 files_router = Router(name="files")
 _ALL_SUPPORTED_SUFFIXES = SUPPORTED_AUDIO_EXTENSIONS | SUPPORTED_ARCHIVE_EXTENSIONS
+
+
+def render_job_stage_progress(job: IngestionJob) -> str:
+    """Render an in-place live progress bar card for an active `IngestionJob` stage."""
+    filename = html.escape(job.original_filename or job.source_path.name)
+    total = max(1, job.total_tracks)
+    conf_pct = round((job.confidence_score or 1.0) * 100)
+
+    if job.state == JobState.EXTRACTING:
+        return format_ingesting_progress_card(
+            filename=filename,
+            percent=15,
+            extraction_status="Unpacking / Staging...",
+            acoustid_status="Pending...",
+            lyrics_status="Pending...",
+        )
+    if job.state == JobState.FINGERPRINTING:
+        return format_ingesting_progress_card(
+            filename=filename,
+            percent=35,
+            extraction_status=f"Complete ({total} track(s))",
+            acoustid_status="Fingerprinting...",
+            lyrics_status="Pending...",
+        )
+    if job.state == JobState.PROCESSING:
+        return format_ingesting_progress_card(
+            filename=filename,
+            percent=5,
+            extraction_status="Starting...",
+            acoustid_status="Pending...",
+            lyrics_status="Pending...",
+        )
+    if job.state == JobState.ENRICHING_METADATA:
+        return format_ingesting_progress_card(
+            filename=filename,
+            percent=65,
+            extraction_status=f"Complete ({total} track(s))",
+            acoustid_status="Querying MusicBrainz...",
+            lyrics_status="Pending...",
+        )
+    if job.state in {JobState.AWAITING_CONFIRMATION, JobState.AWAITING_INPUT}:
+        return format_ingesting_progress_card(
+            filename=filename,
+            percent=70,
+            extraction_status=f"Complete ({total} track(s))",
+            acoustid_status=f"Ambiguous ({conf_pct}% top match)",
+            lyrics_status="Waiting for release confirmation...",
+            ambiguity_prompt=True,
+        )
+    if job.state == JobState.FETCHING_LYRICS:
+        return format_ingesting_progress_card(
+            filename=filename,
+            percent=80,
+            extraction_status=f"Complete ({total} track(s))",
+            acoustid_status=f"Matched ({conf_pct}% confidence)",
+            lyrics_status=f"Fetching LRCLIB ({job.processed_tracks}/{total})...",
+        )
+    if job.state == JobState.ORGANIZING:
+        return format_ingesting_progress_card(
+            filename=filename,
+            percent=90,
+            extraction_status=f"Complete ({total} track(s))",
+            acoustid_status=f"Matched ({conf_pct}% confidence)",
+            lyrics_status=f"Synced ({job.lyrics_matched_count}/{total}) • Writing tags & cover.jpg...",
+        )
+    return format_ingesting_progress_card(
+        filename=filename,
+        percent=100,
+        extraction_status=f"Complete ({total} track(s))",
+        acoustid_status=f"Matched ({conf_pct}% confidence)",
+        lyrics_status=f"Synced ({job.lyrics_matched_count}/{total} embedded)",
+    )
 
 
 def format_ingestion_summary(result: IngestionResult) -> str:
@@ -36,7 +108,10 @@ def format_ingestion_summary(result: IngestionResult) -> str:
         )
 
     if result.requires_user_confirmation:
+        progress_header = render_job_stage_progress(result.job)
         lines = [
+            progress_header,
+            "",
             f"<b>Confirmation Required</b> (Job <code>{result.job.job_id}</code>)",
             "Multiple or low-confidence matches found. Select a release below:",
         ]
@@ -72,8 +147,13 @@ def format_ingestion_summary(result: IngestionResult) -> str:
             )
         return "\n".join(lines)
 
+    tracks_suffix = (
+        f" • {result.tracks_ingested} tracks ({result.lyrics_embedded_count} synced lyrics)"
+        if result.tracks_ingested > 1 or result.lyrics_embedded_count > 0
+        else ""
+    )
     return (
-        f"<b>Track Ingested</b> (Job <code>{result.job.job_id}</code>)\n"
+        f"<b>Track Ingested</b> (Job <code>{result.job.job_id}</code>){tracks_suffix}\n"
         f"Saved to: <code>{html.escape(str(result.job.final_path))}</code>"
     )
 
@@ -153,24 +233,58 @@ async def _resolve_incoming_file_path(
     return resolved, effective_name
 
 
+async def _edit_or_answer(
+    message: Message,
+    status_message: object | None,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    """Edit `status_message` in-place when available, otherwise send a new message via `message.answer`."""
+    edit_fn = getattr(status_message, "edit_text", None) if status_message is not None else None
+    if inspect.iscoroutinefunction(edit_fn):
+        try:
+            if reply_markup is not None:
+                await edit_fn(text, reply_markup=reply_markup)
+            else:
+                await edit_fn(text)
+            return
+        except Exception as exc:
+            logger.debug("In-place edit_text failed, falling back to message.answer: %s", exc)
+
+    if reply_markup is not None:
+        await message.answer(text, reply_markup=reply_markup)
+    else:
+        await message.answer(text)
+
+
 async def _dispatch_pipeline_result(
     message: Message,
     result: IngestionResult,
     state: FSMContext | None,
+    status_message: object | None = None,
 ) -> None:
-    """Send the appropriate Telegram response and update FSM state for `result`."""
+    """Transition the queued/progress message in-place (or reply) and update FSM state for `result`."""
     summary = format_ingestion_summary(result)
     if result.requires_user_confirmation:
         if state is not None:
             await state.set_state(IngestionStates.awaiting_confirmation)
             await state.update_data(job_id=result.job.job_id)
-        await message.answer(
-            summary,
+        await _edit_or_answer(
+            message=message,
+            status_message=status_message,
+            text=summary,
             reply_markup=build_verification_keyboard(result.job.job_id, result.job.candidates),
         )
         return
 
-    await message.answer(summary)
+    if state is not None:
+        await state.clear()
+
+    await _edit_or_answer(
+        message=message,
+        status_message=status_message,
+        text=summary,
+    )
 
 
 @files_router.message(F.audio | F.document)
@@ -183,7 +297,10 @@ async def handle_incoming_media(
     settings: AppSettings | None = None,
     state: FSMContext | None = None,
 ) -> None:
-    """Resolve incoming audio/archive via Local Bot API, enqueue, and execute ingestion."""
+    """Resolve incoming audio/archive via Local Bot API, enqueue, and execute ingestion with live progress."""
+    if state is not None:
+        await state.clear()
+
     media = message.audio or message.document
     file_id = media.file_id if media is not None else "unknown"
     initial_name = _derive_effective_filename(message, file_id)
@@ -212,36 +329,75 @@ async def handle_incoming_media(
         else:
             active_name = None
 
-        await message.answer(
+        status_msg = await message.answer(
             format_queued_job_card(job, position=position, active_job_filename=active_name),
             reply_markup=build_queued_job_keyboard(job.job_id),
         )
 
+        async def _on_stage_progress(
+            updated_job: IngestionJob,
+            _result: IngestionResult | None = None,
+        ) -> None:
+            if updated_job.state in {
+                JobState.AWAITING_CONFIRMATION,
+                JobState.COMPLETED,
+                JobState.FAILED,
+                JobState.CANCELLED,
+            }:
+                return
+            edit_fn = getattr(status_msg, "edit_text", None)
+            if inspect.iscoroutinefunction(edit_fn):
+                try:
+                    await edit_fn(
+                        render_job_stage_progress(updated_job),
+                        reply_markup=build_queued_job_keyboard(updated_job.job_id),
+                    )
+                except Exception as exc:
+                    logger.debug("Progress bar edit skipped for job %s: %s", updated_job.job_id, exc)
+
         if source_path.is_file():
             try:
-                result = await queue_worker.execute_job(job.job_id)
+                result = await queue_worker.execute_job(
+                    job.job_id,
+                    progress_callback=_on_stage_progress,
+                )
             except Exception as exc:
                 logger.error("Ingestion failed for job %s: %s", job.job_id, exc)
-                await message.answer(
-                    f"⚠️ <b>Ingestion Failed</b> (Job <code>{job.job_id}</code>)\nReason: <code>{exc}</code>"
+                await _edit_or_answer(
+                    message=message,
+                    status_message=status_msg,
+                    text=(
+                        f"⚠️ <b>Ingestion Failed</b> (Job <code>{job.job_id}</code>)\n"
+                        f"Reason: <code>{html.escape(str(exc))}</code>"
+                    ),
                 )
                 return
 
             if result is not None:
-                await _dispatch_pipeline_result(message, result, state)
+                await _dispatch_pipeline_result(
+                    message,
+                    result,
+                    state,
+                    status_message=status_msg,
+                )
         return
 
     if pipeline is not None and source_path.is_file():
-        await message.answer(f"Queued payload <code>{file_id}</code> for ingestion.")
+        status_msg = await message.answer(f"Queued payload <code>{file_id}</code> for ingestion.")
         result = await pipeline.process_file(
             source_path=source_path,
             original_filename=file_name,
             file_size_bytes=file_size,
         )
-        await _dispatch_pipeline_result(message, result, state)
+        await _dispatch_pipeline_result(message, result, state, status_message=status_msg)
         return
 
     await message.answer(f"Queued payload <code>{file_id}</code> for ingestion.")
 
 
-__all__ = ["build_verification_keyboard", "files_router", "format_ingestion_summary"]
+__all__ = [
+    "build_verification_keyboard",
+    "files_router",
+    "format_ingestion_summary",
+    "render_job_stage_progress",
+]

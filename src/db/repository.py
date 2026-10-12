@@ -14,8 +14,11 @@ from src.core.models import (
     DuplicateCheckResult,
     IngestionJob,
     JobState,
+    LibraryTrackRecord,
     MetadataCandidate,
     SourceType,
+    TagCorrectionRequest,
+    TagCorrectionStatus,
     TrackMetadata,
     UserAccount,
     UserRole,
@@ -741,3 +744,424 @@ class SqliteCatalogRepository:
             )
             await conn.commit()
             return int(cursor.rowcount or 0)
+
+    async def get_library_track(self, track_id: str) -> LibraryTrackRecord | None:
+        """Retrieve an ingested library track record by its primary key ID (or prefix)."""
+        async with self._db.connect() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT id, job_id, uploaded_by, storage_path, fingerprint,
+                       duration_seconds, artist, album, title, year,
+                       track_number, has_synced_lyrics, ingested_at
+                FROM library_tracks
+                WHERE id = ? OR id LIKE ?
+                ORDER BY ingested_at DESC
+                LIMIT 1
+                """,
+                (track_id, f"{track_id}%"),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+        return _row_to_library_track(tuple(row))
+
+    async def list_library_tracks(self, limit: int = 20) -> list[LibraryTrackRecord]:
+        """List recently ingested library tracks ordered newest-first."""
+        async with self._db.connect() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT id, job_id, uploaded_by, storage_path, fingerprint,
+                       duration_seconds, artist, album, title, year,
+                       track_number, has_synced_lyrics, ingested_at
+                FROM library_tracks
+                ORDER BY ingested_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            rows = await cursor.fetchall()
+        return [_row_to_library_track(tuple(r)) for r in rows]
+
+    async def search_library_tracks(
+        self,
+        query: str,
+        limit: int = 20,
+    ) -> list[LibraryTrackRecord]:
+        """Search library tracks by title, artist, or album substring (case-insensitive)."""
+        clean_q = query.strip()
+        if not clean_q:
+            return await self.list_library_tracks(limit=limit)
+        pattern = f"%{clean_q}%"
+        async with self._db.connect() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT id, job_id, uploaded_by, storage_path, fingerprint,
+                       duration_seconds, artist, album, title, year,
+                       track_number, has_synced_lyrics, ingested_at
+                FROM library_tracks
+                WHERE title LIKE ? OR artist LIKE ? OR album LIKE ? OR id LIKE ?
+                ORDER BY artist ASC, album ASC, COALESCE(track_number, 1) ASC
+                LIMIT ?
+                """,
+                (pattern, pattern, pattern, f"{clean_q}%", limit),
+            )
+            rows = await cursor.fetchall()
+        return [_row_to_library_track(tuple(r)) for r in rows]
+
+    async def list_album_tracks(
+        self,
+        artist: str,
+        album: str,
+    ) -> list[LibraryTrackRecord]:
+        """Return all library tracks matching `artist` and `album` ordered by track number."""
+        async with self._db.connect() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT id, job_id, uploaded_by, storage_path, fingerprint,
+                       duration_seconds, artist, album, title, year,
+                       track_number, has_synced_lyrics, ingested_at
+                FROM library_tracks
+                WHERE lower(artist) = lower(?) AND lower(album) = lower(?)
+                ORDER BY COALESCE(track_number, 1) ASC, title ASC
+                """,
+                (artist.strip(), album.strip()),
+            )
+            rows = await cursor.fetchall()
+        return [_row_to_library_track(tuple(r)) for r in rows]
+
+    async def create_tag_correction_request(
+        self,
+        request: TagCorrectionRequest,
+    ) -> TagCorrectionRequest:
+        """Create a new PENDING post-ingestion tag correction request."""
+        now_dt = datetime.now(UTC)
+        async with self._db.connect() as conn:
+            cursor = await conn.execute(
+                """
+                INSERT INTO tag_correction_requests (
+                    track_id, requested_by, proposed_title, proposed_artist,
+                    proposed_album, proposed_year, reason, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request.track_id,
+                    request.requested_by,
+                    request.proposed_title,
+                    request.proposed_artist,
+                    request.proposed_album,
+                    request.proposed_year,
+                    request.reason,
+                    TagCorrectionStatus.PENDING.value,
+                    now_dt.isoformat(),
+                ),
+            )
+            await conn.commit()
+            row_id = int(cursor.lastrowid or 0)
+        return TagCorrectionRequest(
+            id=row_id,
+            track_id=request.track_id,
+            requested_by=request.requested_by,
+            proposed_title=request.proposed_title,
+            proposed_artist=request.proposed_artist,
+            proposed_album=request.proposed_album,
+            proposed_year=request.proposed_year,
+            reason=request.reason,
+            status=TagCorrectionStatus.PENDING,
+            created_at=now_dt,
+        )
+
+    async def get_tag_correction_request(
+        self,
+        request_id: int,
+    ) -> TagCorrectionRequest | None:
+        """Retrieve a tag correction request by ID."""
+        async with self._db.connect() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT id, track_id, requested_by, proposed_title, proposed_artist,
+                       proposed_album, proposed_year, reason, status, reviewed_by,
+                       reviewed_at, created_at
+                FROM tag_correction_requests
+                WHERE id = ?
+                """,
+                (request_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+        return _row_to_tag_correction(tuple(row))
+
+    async def list_pending_tag_correction_requests(self) -> list[TagCorrectionRequest]:
+        """List all PENDING tag correction requests ordered FIFO."""
+        async with self._db.connect() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT id, track_id, requested_by, proposed_title, proposed_artist,
+                       proposed_album, proposed_year, reason, status, reviewed_by,
+                       reviewed_at, created_at
+                FROM tag_correction_requests
+                WHERE status = 'PENDING'
+                ORDER BY id ASC
+                """
+            )
+            rows = await cursor.fetchall()
+        return [_row_to_tag_correction(tuple(r)) for r in rows]
+
+    async def resolve_tag_correction_request(
+        self,
+        request_id: int,
+        status: TagCorrectionStatus,
+        reviewed_by: int,
+    ) -> TagCorrectionRequest | None:
+        """Mark a tag correction request as APPROVED or REJECTED."""
+        now_dt = datetime.now(UTC)
+        async with self._db.connect() as conn:
+            await conn.execute(
+                """
+                UPDATE tag_correction_requests
+                SET status = ?, reviewed_by = ?, reviewed_at = ?
+                WHERE id = ?
+                """,
+                (status.value, reviewed_by, now_dt.isoformat(), request_id),
+            )
+            await conn.commit()
+        return await self.get_tag_correction_request(request_id)
+
+    async def update_library_track_metadata(
+        self,
+        track_id: str,
+        title: str | None = None,
+        artist: str | None = None,
+        album: str | None = None,
+        year: int | None = None,
+    ) -> LibraryTrackRecord | None:
+        """Update stored metadata fields on a library track after an approved tag correction."""
+        return await self.update_library_track_full(
+            track_id,
+            title=title,
+            artist=artist,
+            album=album,
+            year=year,
+        )
+
+    async def update_library_track_full(
+        self,
+        track_id: str,
+        *,
+        title: str | None = None,
+        artist: str | None = None,
+        album: str | None = None,
+        year: int | None = None,
+        track_number: int | None = None,
+        storage_path: Path | None = None,
+        has_synced_lyrics: bool | None = None,
+        recording_mbid: str | None = None,
+        release_mbid: str | None = None,
+    ) -> LibraryTrackRecord | None:
+        """Update metadata, storage path, lyrics flag, and MBIDs for an ingested track."""
+        existing = await self.get_library_track(track_id)
+        if existing is None:
+            return None
+
+        new_title = title if title is not None else existing.title
+        new_artist = artist if artist is not None else existing.artist
+        new_album = album if album is not None else existing.album
+        new_year = year if year is not None else existing.year
+        new_track_num = track_number if track_number is not None else existing.track_number
+        new_path = str(storage_path) if storage_path is not None else str(existing.storage_path)
+        new_lyrics_flag = (
+            1 if (has_synced_lyrics if has_synced_lyrics is not None else existing.has_synced_lyrics) else 0
+        )
+
+        async with self._db.connect() as conn:
+            await conn.execute(
+                """
+                UPDATE library_tracks
+                SET title = ?, artist = ?, album = ?, year = ?,
+                    track_number = ?, storage_path = ?, has_synced_lyrics = ?
+                WHERE id = ?
+                """,
+                (
+                    new_title,
+                    new_artist,
+                    new_album,
+                    new_year,
+                    new_track_num,
+                    new_path,
+                    new_lyrics_flag,
+                    existing.id,
+                ),
+            )
+            await conn.execute(
+                """
+                UPDATE catalog_tracks
+                SET title = ?, artist = ?, album = ?, album_artist = ?,
+                    year = ?, track_number = ?, library_path = ?,
+                    recording_mbid = COALESCE(?, recording_mbid),
+                    release_mbid = COALESCE(?, release_mbid)
+                WHERE fingerprint = ?
+                """,
+                (
+                    new_title,
+                    new_artist,
+                    new_album,
+                    new_artist,
+                    new_year,
+                    new_track_num,
+                    new_path,
+                    recording_mbid,
+                    release_mbid,
+                    existing.fingerprint,
+                ),
+            )
+            if existing.job_id and storage_path is not None:
+                await conn.execute(
+                    """
+                    UPDATE ingestion_jobs
+                    SET final_path = ?
+                    WHERE job_id = ?
+                    """,
+                    (new_path, existing.job_id),
+                )
+            await conn.commit()
+        return await self.get_library_track(existing.id)
+
+    async def upsert_scanned_library_track(
+        self,
+        record: LibraryTrackRecord,
+    ) -> LibraryTrackRecord:
+        """Insert or update a library track discovered or reconciled during a filesystem rescan."""
+        now_iso = record.ingested_at.isoformat()
+        job_id = record.job_id or f"rescan-{record.id[:12]}"
+        async with self._db.connect() as conn:
+            await conn.execute(
+                """
+                INSERT INTO library_tracks (
+                    id, job_id, uploaded_by, storage_path, fingerprint,
+                    duration_seconds, artist, album, title, year,
+                    track_number, has_synced_lyrics, ingested_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    storage_path = excluded.storage_path,
+                    fingerprint = excluded.fingerprint,
+                    duration_seconds = excluded.duration_seconds,
+                    artist = excluded.artist,
+                    album = excluded.album,
+                    title = excluded.title,
+                    year = excluded.year,
+                    track_number = excluded.track_number,
+                    has_synced_lyrics = excluded.has_synced_lyrics
+                """,
+                (
+                    record.id,
+                    job_id,
+                    record.uploaded_by,
+                    str(record.storage_path),
+                    record.fingerprint,
+                    record.duration_seconds,
+                    record.artist,
+                    record.album,
+                    record.title,
+                    record.year,
+                    record.track_number,
+                    1 if record.has_synced_lyrics else 0,
+                    now_iso,
+                ),
+            )
+            await conn.execute(
+                """
+                INSERT INTO catalog_tracks (
+                    job_id, title, artist, album, album_artist,
+                    year, track_number, disc_number, duration_seconds,
+                    fingerprint, library_path, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(fingerprint) DO UPDATE SET
+                    title = excluded.title,
+                    artist = excluded.artist,
+                    album = excluded.album,
+                    album_artist = excluded.album_artist,
+                    year = excluded.year,
+                    track_number = excluded.track_number,
+                    library_path = excluded.library_path
+                """,
+                (
+                    job_id,
+                    record.title,
+                    record.artist,
+                    record.album,
+                    record.artist,
+                    record.year,
+                    record.track_number or 1,
+                    1,
+                    int(round(record.duration_seconds)),
+                    record.fingerprint,
+                    str(record.storage_path),
+                    now_iso,
+                ),
+            )
+            await conn.commit()
+        return (await self.get_library_track(record.id)) or record
+
+    async def delete_library_track(self, track_id: str) -> bool:
+        """Delete a single library track record by ID when its file was removed from disk."""
+        existing = await self.get_library_track(track_id)
+        if existing is None:
+            return False
+        async with self._db.connect() as conn:
+            cur = await conn.execute(
+                "DELETE FROM library_tracks WHERE id = ?",
+                (existing.id,),
+            )
+            await conn.execute(
+                "DELETE FROM catalog_tracks WHERE fingerprint = ?",
+                (existing.fingerprint,),
+            )
+            await conn.commit()
+            return bool(cur.rowcount and cur.rowcount > 0)
+
+    async def wipe_library_catalog(self) -> int:
+        """Delete all catalog track, job, and tag correction records (OWNER destructive wipe)."""
+        async with self._db.connect() as conn:
+            cur_lib = await conn.execute("DELETE FROM library_tracks")
+            cur_cat = await conn.execute("DELETE FROM catalog_tracks")
+            await conn.execute("DELETE FROM tag_correction_requests")
+            await conn.execute("DELETE FROM ingestion_jobs")
+            await conn.commit()
+            return int((cur_lib.rowcount or 0) + (cur_cat.rowcount or 0))
+
+
+def _row_to_library_track(row: tuple[object, ...]) -> LibraryTrackRecord:
+    """Map a `library_tracks` table row into a `LibraryTrackRecord`."""
+    return LibraryTrackRecord(
+        id=str(row[0]),
+        job_id=str(row[1]) if row[1] is not None else None,
+        uploaded_by=int(str(row[2])) if row[2] is not None else 0,
+        storage_path=Path(str(row[3])),
+        fingerprint=str(row[4]),
+        duration_seconds=float(str(row[5])),
+        artist=str(row[6]),
+        album=str(row[7]),
+        title=str(row[8]),
+        year=int(str(row[9])) if row[9] is not None else None,
+        track_number=int(str(row[10])) if row[10] is not None else None,
+        has_synced_lyrics=bool(int(str(row[11]))) if row[11] is not None else False,
+        ingested_at=_parse_iso_datetime(row[12]) or datetime.now(UTC),
+    )
+
+
+def _row_to_tag_correction(row: tuple[object, ...]) -> TagCorrectionRequest:
+    """Map a `tag_correction_requests` table row into a `TagCorrectionRequest`."""
+    return TagCorrectionRequest(
+        id=int(str(row[0])),
+        track_id=str(row[1]),
+        requested_by=int(str(row[2])),
+        proposed_title=str(row[3]) if row[3] is not None else None,
+        proposed_artist=str(row[4]) if row[4] is not None else None,
+        proposed_album=str(row[5]) if row[5] is not None else None,
+        proposed_year=int(str(row[6])) if row[6] is not None else None,
+        reason=str(row[7]) if row[7] is not None else "",
+        status=TagCorrectionStatus(str(row[8])),
+        reviewed_by=int(str(row[9])) if row[9] is not None else None,
+        reviewed_at=_parse_iso_datetime(row[10]),
+        created_at=_parse_iso_datetime(row[11]) or datetime.now(UTC),
+    )

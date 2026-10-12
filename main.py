@@ -1,6 +1,7 @@
 """Application entrypoint wiring configuration, SQLite persistence, RBAC, OIDC, queue, and Telegram bot."""
 
 import asyncio
+import contextlib
 import logging
 
 from aiogram import Bot, Dispatcher
@@ -9,6 +10,11 @@ from aiogram.types import BotCommand
 from src.bot.api_server import build_bot_instance
 from src.bot.middlewares.rbac import RbacMiddleware
 from src.bot.notifier import TelegramAdminLogNotifier
+from src.bot.oidc_server import (
+    OidcCallbackCoordinator,
+    OidcHttpServer,
+    run_hourly_oidc_sync_loop,
+)
 from src.bot.routers import build_root_router
 from src.config.settings import AppSettings, load_settings
 from src.core.extractor import SevenZipArchiveExtractor
@@ -27,8 +33,12 @@ logger = logging.getLogger(__name__)
 
 BOT_COMMANDS: tuple[BotCommand, ...] = (
     BotCommand(command="start", description="Open main menu, status & SSO pairing"),
+    BotCommand(command="songs", description="Browse, search, download, edit & export songs"),
+    BotCommand(command="rescan", description="Scan library folder & sync database"),
+    BotCommand(command="cancel", description="Exit any active input or confirmation prompt"),
     BotCommand(command="admin", description="Open Administrator Control Panel (ADMIN+)"),
     BotCommand(command="adduser", description="Authorize user by Telegram ID (ADMIN+)"),
+    BotCommand(command="fixtags", description="Request post-ingestion tag edits"),
     BotCommand(command="queue", description="View active & queued ingestion jobs"),
     BotCommand(command="status", description="Check system, RBAC & queue status"),
     BotCommand(command="help", description="Show usage instructions & commands"),
@@ -62,10 +72,15 @@ def create_ingestion_pipeline(
         app_name=settings.musicbrainz_app_name,
         app_version=settings.musicbrainz_app_version,
         contact=settings.musicbrainz_contact,
+        genius_access_token=settings.genius_access_token,
+        lastfm_api_key=settings.lastfm_api_key,
         enable_network=True,
     )
     lyrics_provider = LrclibLyricsClient(base_url=settings.lrclib_base_url)
-    organizer = LibraryOrganizer(library_root=settings.storage_library_dir)
+    organizer = LibraryOrganizer(
+        library_root=settings.storage_library_dir,
+        enable_network=True,
+    )
     repository = SqliteCatalogRepository(db_manager=db_manager)
 
     return IngestionPipeline(
@@ -88,6 +103,33 @@ async def register_bot_commands(bot: Bot) -> None:
         logger.warning("Could not register bot command menu: %s", exc)
 
 
+async def run_periodic_library_rescan_loop(
+    organizer: LibraryOrganizer,
+    repository: SqliteCatalogRepository,
+    interval_seconds: int = 3600,
+    stop_event: asyncio.Event | None = None,
+) -> None:
+    """Periodically scan `storage/library` and reconcile filesystem changes with SQLite."""
+    effective_stop = stop_event or asyncio.Event()
+    while not effective_stop.is_set():
+        try:
+            await asyncio.wait_for(effective_stop.wait(), timeout=max(1, interval_seconds))
+            break
+        except TimeoutError:
+            pass
+        try:
+            report = await organizer.reconcile_library_with_repository(repository)
+            if report.has_changes:
+                logger.info(
+                    "Periodic library rescan synchronized changes: +%d added, ~%d updated, -%d removed.",
+                    len(report.added_tracks),
+                    len(report.updated_tracks),
+                    len(report.removed_tracks),
+                )
+        except Exception as exc:
+            logger.warning("Periodic library rescan failed: %s", exc)
+
+
 async def run_app(settings: AppSettings | None = None) -> None:
     """Initialize SQLite WAL storage, assemble RBAC/OIDC/Queue services, and start Telegram polling."""
     resolved_settings = settings or load_settings()
@@ -97,6 +139,19 @@ async def run_app(settings: AppSettings | None = None) -> None:
     await db_manager.initialize()
     repository = SqliteCatalogRepository(db_manager=db_manager)
     pipeline = create_ingestion_pipeline(resolved_settings, db_manager)
+
+    organizer = LibraryOrganizer(
+        library_root=resolved_settings.storage_library_dir,
+        enable_network=True,
+    )
+    startup_report = await organizer.reconcile_library_with_repository(repository)
+    logger.info(
+        "Startup library rescan complete: %d unchanged, +%d added, ~%d updated, -%d removed.",
+        startup_report.unchanged_count,
+        len(startup_report.added_tracks),
+        len(startup_report.updated_tracks),
+        len(startup_report.removed_tracks),
+    )
 
     bot = build_bot_instance(resolved_settings)
     notifier = TelegramAdminLogNotifier(
@@ -146,11 +201,52 @@ async def run_app(settings: AppSettings | None = None) -> None:
     dispatcher["notifier"] = notifier
     dispatcher.include_router(build_root_router())
 
+    oidc_http_server: OidcHttpServer | None = None
+    oidc_sync_task: asyncio.Task[None] | None = None
+    background_stop_event = asyncio.Event()
+    rescan_task = asyncio.create_task(
+        run_periodic_library_rescan_loop(
+            organizer=organizer,
+            repository=repository,
+            interval_seconds=resolved_settings.oidc_sync_interval_seconds,
+            stop_event=background_stop_event,
+        )
+    )
+    if resolved_settings.oidc_enabled:
+        coordinator = OidcCallbackCoordinator(
+            oidc_service=oidc_service,
+            bot=bot,
+            webhook_secret=resolved_settings.oidc_webhook_secret,
+        )
+        oidc_http_server = OidcHttpServer(
+            coordinator=coordinator,
+            host=resolved_settings.oidc_listen_host,
+            port=resolved_settings.oidc_listen_port,
+        )
+        await oidc_http_server.start()
+        oidc_sync_task = asyncio.create_task(
+            run_hourly_oidc_sync_loop(
+                oidc_service=oidc_service,
+                interval_seconds=resolved_settings.oidc_sync_interval_seconds,
+                stop_event=background_stop_event,
+            )
+        )
+
     await register_bot_commands(bot)
     logger.info("Starting Music Ingestion Bot polling loop...")
     try:
         await dispatcher.start_polling(bot)
     finally:
+        background_stop_event.set()
+        rescan_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await rescan_task
+        if oidc_sync_task is not None:
+            oidc_sync_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await oidc_sync_task
+        if oidc_http_server is not None:
+            await oidc_http_server.stop()
         await bot.session.close()
 
 

@@ -1,5 +1,6 @@
 """Handlers for `/admin` dashboard, `/adduser`, manual access requests (`access_req:*`), and queue actions."""
 
+import html
 import logging
 
 from aiogram import F, Router
@@ -9,13 +10,18 @@ from aiogram.types import CallbackQuery, Message
 
 from src.bot.keyboards.admin import (
     BTN_MAIN_ADMIN,
+    RESERVED_MENU_BUTTONS,
     build_admin_dashboard_keyboard,
     build_main_menu_keyboard,
+    build_paused_jobs_keyboard,
     build_queued_job_keyboard,
+    build_tag_correction_review_keyboard,
     build_user_detail_keyboard,
     build_user_list_keyboard,
 )
-from src.bot.states import AdminStates
+from src.bot.keyboards.verification import build_verification_keyboard
+from src.bot.routers.files import format_ingestion_summary
+from src.bot.states import AdminStates, IngestionStates
 from src.config.settings import AppSettings
 from src.core.audit import (
     format_admin_dashboard_card,
@@ -23,8 +29,10 @@ from src.core.audit import (
     format_user_detail_card,
 )
 from src.core.exceptions import PermissionDeniedError
-from src.core.models import Permission, UserAccount, UserRole
+from src.core.models import IngestionResult, JobState, Permission, UserAccount, UserRole
 from src.core.oidc import AuthentikOidcService
+from src.core.organizer import LibraryOrganizer
+from src.core.pipeline import IngestionPipeline
 from src.core.ports import GovernanceRepositoryPort
 from src.core.queue import IngestionQueueWorker
 from src.core.rbac import GovernanceService, has_permission
@@ -69,11 +77,15 @@ def parse_admin_callback(data: str) -> tuple[str, int | None, UserRole | None]:
         "concurrency",
         "queue",
         "audit",
+        "tags",
+        "wipe",
         "close",
     }:
         return action, None, None
-    if action in {"user", "block", "resync"} and len(parts) == 3:
+    if action in {"user", "block", "resync", "tag_approve", "tag_reject"} and len(parts) == 3:
         return action, int(parts[2]), None
+    if action == "resolve_job" and len(parts) == 3:
+        return action, None, None
     if action in {"promote", "demote"} and len(parts) == 4:
         return action, int(parts[2]), UserRole(parts[3])
 
@@ -144,8 +156,12 @@ async def handle_admin_command(
     governance_repository: GovernanceRepositoryPort | None = None,
     queue_worker: IngestionQueueWorker | None = None,
     settings: AppSettings | None = None,
+    state: FSMContext | None = None,
 ) -> None:
     """Open the interactive Administrator Control Panel (`/admin`, Specification Section 7.1)."""
+    if state is not None:
+        await state.clear()
+
     if current_user is None or not has_permission(current_user, Permission.MANAGE_USERS):
         await message.answer("🔒 Administrator privileges are required to access <code>/admin</code>.")
         return
@@ -171,8 +187,12 @@ async def handle_adduser_command(
     current_user: UserAccount | None = None,
     governance_service: GovernanceService | None = None,
     governance_repository: GovernanceRepositoryPort | None = None,
+    state: FSMContext | None = None,
 ) -> None:
     """Authorize or promote a user by Telegram ID: `/adduser <telegram_id> [UPLOADER|MODERATOR|ADMIN]`."""
+    if state is not None:
+        await state.clear()
+
     if current_user is None or not has_permission(current_user, Permission.MANAGE_USERS):
         await message.answer("🔒 Administrator privileges are required to use <code>/adduser</code>.")
         return
@@ -208,7 +228,12 @@ async def handle_adduser_command(
     )
 
 
-@admin_router.message(AdminStates.awaiting_new_user_id)
+@admin_router.message(
+    AdminStates.awaiting_new_user_id,
+    F.text,
+    ~F.text.startswith("/"),
+    ~F.text.in_(RESERVED_MENU_BUTTONS),
+)
 async def handle_new_user_id_input(
     message: Message,
     state: FSMContext,
@@ -342,6 +367,7 @@ async def handle_admin_dashboard_callback(
     governance_repository: GovernanceRepositoryPort | None = None,
     oidc_service: AuthentikOidcService | None = None,
     queue_worker: IngestionQueueWorker | None = None,
+    pipeline: IngestionPipeline | None = None,
     settings: AppSettings | None = None,
     state: FSMContext | None = None,
 ) -> None:
@@ -350,20 +376,162 @@ async def handle_admin_dashboard_callback(
         await callback.answer("Admin panel unavailable.", show_alert=True)
         return
 
+    action, target_id, target_role = parse_admin_callback(callback.data)
+    msg = callback.message if isinstance(callback.message, Message) else None
+
+    if action == "resolve_job":
+        job_id = callback.data.split(":", maxsplit=2)[2]
+        if pipeline is None:
+            await callback.answer("Pipeline unavailable.", show_alert=True)
+            return
+        target_job = await pipeline.get_job(job_id)
+        if target_job is None:
+            await callback.answer("Job not found.", show_alert=True)
+            return
+        can_resolve = (
+            has_permission(current_user, Permission.RESOLVE_OTHERS_JOBS)
+            if target_job.user_id != current_user.telegram_id
+            else has_permission(current_user, Permission.RESOLVE_OWN_DISAMBIGUATION)
+        )
+        if not can_resolve:
+            await callback.answer(
+                "🔒 Moderator privileges required to resolve another user's job.",
+                show_alert=True,
+            )
+            return
+        if state is not None:
+            await state.set_state(IngestionStates.awaiting_confirmation)
+            await state.update_data(job_id=target_job.job_id)
+        summary = format_ingestion_summary(IngestionResult(job=target_job, requires_user_confirmation=True))
+        kb = build_verification_keyboard(target_job.job_id, target_job.candidates)
+        if msg is not None:
+            await msg.edit_text(summary, reply_markup=kb)
+        await callback.answer(f"Opened disambiguation for job {target_job.job_id}.")
+        return
+
+    if action in {"tags", "tag_approve", "tag_reject"}:
+        if not has_permission(current_user, Permission.APPROVE_TAG_CORRECTIONS):
+            await callback.answer(
+                "🔒 Moderator privileges required to review tag corrections.",
+                show_alert=True,
+            )
+            return
+        if action == "tags":
+            pending_tags = await governance_repository.list_pending_tag_correction_requests()
+            if not pending_tags:
+                await callback.answer("✅ No pending tag correction requests.", show_alert=True)
+                return
+            first_req = pending_tags[0]
+            track = await governance_repository.get_library_track(first_req.track_id)
+            track_desc = (
+                f"{html.escape(track.artist)} - <b>{html.escape(track.title)}</b> "
+                f"(<i>{html.escape(track.album)}</i>)"
+                if track is not None
+                else f"<code>{html.escape(first_req.track_id)}</code>"
+            )
+            lines = [
+                f"🏷 <b>Pending Tag Correction #{first_req.id}</b> ({len(pending_tags)} pending)",
+                f"• Track: {track_desc}",
+                f"• Requested by: <code>{first_req.requested_by}</code>",
+            ]
+            if first_req.proposed_title:
+                lines.append(f"• Proposed Title: <b>{html.escape(first_req.proposed_title)}</b>")
+            if first_req.proposed_artist:
+                lines.append(f"• Proposed Artist: <b>{html.escape(first_req.proposed_artist)}</b>")
+            if first_req.proposed_album:
+                lines.append(f"• Proposed Album: <b>{html.escape(first_req.proposed_album)}</b>")
+            if first_req.proposed_year:
+                lines.append(f"• Proposed Year: <b>{first_req.proposed_year}</b>")
+            if first_req.reason:
+                lines.append(f"• Reason: <i>{html.escape(first_req.reason)}</i>")
+            if msg is not None and first_req.id is not None:
+                await msg.edit_text(
+                    "\n".join(lines),
+                    reply_markup=build_tag_correction_review_keyboard(first_req.id),
+                )
+            await callback.answer()
+            return
+
+        if governance_service is None or target_id is None:
+            await callback.answer("Governance service unavailable.", show_alert=True)
+            return
+
+        if action == "tag_approve":
+            try:
+                resolved, updated_track = await governance_service.approve_tag_correction(
+                    actor=current_user,
+                    request_id=target_id,
+                )
+            except (KeyError, PermissionDeniedError) as exc:
+                await callback.answer(str(exc), show_alert=True)
+                return
+
+            if updated_track.storage_path.is_file():
+                organizer = LibraryOrganizer(updated_track.storage_path.parent)
+                await organizer.apply_tag_correction(
+                    audio_path=updated_track.storage_path,
+                    title=resolved.proposed_title,
+                    artist=resolved.proposed_artist,
+                    album=resolved.proposed_album,
+                    year=resolved.proposed_year,
+                )
+
+            if msg is not None:
+                artist_esc = html.escape(updated_track.artist)
+                title_esc = html.escape(updated_track.title)
+                await msg.edit_text(
+                    f"✅ <b>Tag Correction #{target_id} Approved &amp; Applied</b>\n"
+                    f"• Track: {artist_esc} - <b>{title_esc}</b>\n"
+                    f"• Album: <i>{html.escape(updated_track.album)}</i>"
+                )
+            await callback.answer("Tag correction approved and written to file!")
+            return
+
+        if action == "tag_reject":
+            try:
+                await governance_service.reject_tag_correction(
+                    actor=current_user,
+                    request_id=target_id,
+                )
+            except (KeyError, PermissionDeniedError) as exc:
+                await callback.answer(str(exc), show_alert=True)
+                return
+            if msg is not None:
+                await msg.edit_text(f"❌ <b>Tag Correction #{target_id} Rejected</b>")
+            await callback.answer("Tag correction rejected.")
+            return
+
+    if action == "wipe":
+        if governance_service is None:
+            await callback.answer("Governance service unavailable.", show_alert=True)
+            return
+        try:
+            removed = await governance_service.wipe_library_catalog(current_user)
+        except PermissionDeniedError as exc:
+            await callback.answer(str(exc), show_alert=True)
+            return
+        if msg is not None:
+            await msg.edit_text(
+                f"🧨 <b>System Catalog Wipe Executed</b>\nRemoved <b>{removed}</b> catalog/track records."
+            )
+        await callback.answer("Catalog wiped.")
+        return
+
     if not has_permission(current_user, Permission.MANAGE_USERS):
         await callback.answer("🔒 Administrator privileges required.", show_alert=True)
         return
 
-    action, target_id, target_role = parse_admin_callback(callback.data)
-    msg = callback.message if isinstance(callback.message, Message) else None
-
     if action == "close":
+        if state is not None:
+            await state.clear()
         if msg is not None:
             await msg.delete()
         await callback.answer("Control panel closed.")
         return
 
     if action == "panel":
+        if state is not None:
+            await state.clear()
         text, queued_count, limit = await _render_dashboard_payload(
             governance_repository,
             queue_worker,
@@ -378,6 +546,8 @@ async def handle_admin_dashboard_callback(
         return
 
     if action == "users":
+        if state is not None:
+            await state.clear()
         users = await governance_repository.list_users()
         pending_reqs = await governance_repository.list_pending_access_requests()
         pending_user_ids = {req.telegram_id for req in pending_reqs}
@@ -505,6 +675,9 @@ async def handle_admin_dashboard_callback(
     if action == "queue":
         queued_jobs = await governance_repository.list_queued_jobs()
         active_jobs = await governance_repository.list_active_jobs()
+        paused_jobs = [
+            j for j in active_jobs if j.state in {JobState.AWAITING_CONFIRMATION, JobState.AWAITING_INPUT}
+        ]
         lines = [f"⏳ <b>Global Ingestion Queue</b> ({len(active_jobs)} active, {len(queued_jobs)} queued)"]
         if not queued_jobs and not active_jobs:
             lines.append("• No jobs currently in queue.")
@@ -513,15 +686,25 @@ async def handle_admin_dashboard_callback(
                 f"#{idx} • <code>{job.original_filename or job.source_path.name}</code> "
                 f"(User <code>{job.user_id}</code>)"
             )
+        for job in paused_jobs[:5]:
+            lines.append(
+                f"⚠️ Paused: <code>{job.original_filename or job.source_path.name}</code> "
+                f"(Job <code>{job.job_id}</code>, User <code>{job.user_id}</code>)"
+            )
         if msg is not None:
             text, queued_count, limit = await _render_dashboard_payload(
                 governance_repository,
                 queue_worker,
                 settings,
             )
+            kb = (
+                build_paused_jobs_keyboard(paused_jobs)
+                if paused_jobs
+                else build_admin_dashboard_keyboard(queued_count, limit)
+            )
             await msg.edit_text(
                 "\n".join(lines) + "\n\n" + text,
-                reply_markup=build_admin_dashboard_keyboard(queued_count, limit),
+                reply_markup=kb,
             )
         await callback.answer()
         return
@@ -547,6 +730,38 @@ async def handle_admin_dashboard_callback(
                 reply_markup=build_admin_dashboard_keyboard(queued_count, limit),
             )
         await callback.answer()
+
+
+@admin_router.message(Command("wipe"))
+async def handle_wipe_command(
+    message: Message,
+    current_user: UserAccount | None = None,
+    governance_service: GovernanceService | None = None,
+    state: FSMContext | None = None,
+) -> None:
+    """Execute a destructive library catalog wipe (`SYSTEM_DESTRUCTIVE_WIPE`, OWNER only)."""
+    if state is not None:
+        await state.clear()
+
+    if current_user is None or not has_permission(current_user, Permission.SYSTEM_DESTRUCTIVE_WIPE):
+        await message.answer("🔒 Only the system <b>OWNER</b> can execute <code>/wipe</code>.")
+        return
+    if governance_service is None:
+        await message.answer("Governance service is not initialized.")
+        return
+
+    parts = (message.text or "").strip().split(maxsplit=1)
+    if len(parts) < 2 or parts[1].strip() != "CONFIRM":
+        await message.answer(
+            "⚠️ <b>Destructive Action Warning</b>\n"
+            "Send <code>/wipe CONFIRM</code> to permanently clear all catalog tracks and job records."
+        )
+        return
+
+    removed = await governance_service.wipe_library_catalog(current_user)
+    await message.answer(
+        f"🧨 <b>System Catalog Wipe Executed</b>\nRemoved <b>{removed}</b> catalog/track records."
+    )
 
 
 @admin_router.callback_query(F.data.in_({"queue:mine", "queue:global"}))
@@ -593,6 +808,7 @@ async def handle_queue_cancel_callback(
     callback: CallbackQuery,
     current_user: UserAccount | None = None,
     queue_worker: IngestionQueueWorker | None = None,
+    state: FSMContext | None = None,
 ) -> None:
     """Cancel a queued job when the uploader or a moderator clicks `[ ❌ Cancel Job ]`."""
     if not callback.data or current_user is None or queue_worker is None:
@@ -608,6 +824,9 @@ async def handle_queue_cancel_callback(
     except KeyError:
         await callback.answer("Job not found.", show_alert=True)
         return
+
+    if state is not None:
+        await state.clear()
 
     if isinstance(callback.message, Message):
         await callback.message.edit_text(

@@ -59,6 +59,14 @@ class AccessRequestStatus(StrEnum):
     REJECTED = "REJECTED"
 
 
+class TagCorrectionStatus(StrEnum):
+    """Lifecycle states of a library track tag correction request."""
+
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+
+
 class SourceType(StrEnum):
     """Ingestion payload origin types."""
 
@@ -81,6 +89,11 @@ class AuditAction(StrEnum):
     INGEST_SUCCESS = "INGEST_SUCCESS"
     DUPLICATE_BLOCKED = "DUPLICATE_BLOCKED"
     CONCURRENCY_UPDATED = "CONCURRENCY_UPDATED"
+    TAG_CORRECTION_REQUESTED = "TAG_CORRECTION_REQUESTED"
+    TAG_CORRECTION_APPROVED = "TAG_CORRECTION_APPROVED"
+    TAG_CORRECTION_REJECTED = "TAG_CORRECTION_REJECTED"
+    OWNERSHIP_TRANSFERRED = "OWNERSHIP_TRANSFERRED"
+    SYSTEM_WIPE_EXECUTED = "SYSTEM_WIPE_EXECUTED"
 
 
 class JobState(StrEnum):
@@ -145,6 +158,75 @@ class AccessRequestRecord:
     reviewed_by: int | None = None
     reviewed_at: datetime | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass(frozen=True, slots=True)
+class LibraryTrackRecord:
+    """Persisted record of an ingested track inside `library_tracks`."""
+
+    id: str
+    job_id: str | None
+    uploaded_by: int
+    storage_path: Path
+    fingerprint: str
+    duration_seconds: float
+    artist: str
+    album: str
+    title: str
+    year: int | None = None
+    track_number: int | None = None
+    has_synced_lyrics: bool = False
+    ingested_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass(frozen=True, slots=True)
+class TagCorrectionRequest:
+    """Request submitted by an uploader/moderator to correct metadata tags on an ingested track."""
+
+    track_id: str
+    requested_by: int
+    proposed_title: str | None = None
+    proposed_artist: str | None = None
+    proposed_album: str | None = None
+    proposed_year: int | None = None
+    reason: str = ""
+    status: TagCorrectionStatus = TagCorrectionStatus.PENDING
+    id: int | None = None
+    reviewed_by: int | None = None
+    reviewed_at: datetime | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass(frozen=True, slots=True)
+class LibraryRescanReport:
+    """Summary of filesystem-to-database reconciliation for `storage/library`."""
+
+    added_tracks: tuple[LibraryTrackRecord, ...] = ()
+    updated_tracks: tuple[LibraryTrackRecord, ...] = ()
+    removed_tracks: tuple[LibraryTrackRecord, ...] = ()
+    unchanged_count: int = 0
+
+    @property
+    def has_changes(self) -> bool:
+        """Return True if any tracks were added, updated, or removed."""
+        return bool(self.added_tracks or self.updated_tracks or self.removed_tracks)
+
+
+@dataclass(frozen=True, slots=True)
+class SongEditProposal:
+    """Dry-run preview payload for a proposed song metadata, cover, or lyrics change."""
+
+    track_id: str
+    action_type: str
+    new_title: str | None = None
+    new_artist: str | None = None
+    new_album: str | None = None
+    new_year: int | None = None
+    new_track_number: int | None = None
+    new_lyrics: str | None = None
+    new_cover_source_path: str | None = None
+    new_recording_mbid: str | None = None
+    new_release_mbid: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,6 +347,9 @@ class IngestionJob:
     matched_release_mbid: str | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    total_tracks: int = 1
+    processed_tracks: int = 0
+    lyrics_matched_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,3 +360,5 @@ class IngestionResult:
     requires_user_confirmation: bool = False
     duplicate: DuplicateCheckResult | None = None
     lyrics_attached: bool = False
+    tracks_ingested: int = 1
+    lyrics_embedded_count: int = 0
