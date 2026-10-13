@@ -162,6 +162,26 @@ def _row_to_job(row: tuple[object, ...]) -> IngestionJob:
     )
 
 
+def _build_track_order_by(sort_by: str) -> str:
+    """Return SQL ORDER BY clause for library track sorting."""
+    normalized = sort_by.strip().lower()
+    if normalized in {"artist", "artist_asc"}:
+        return (
+            "artist COLLATE NOCASE ASC, album COLLATE NOCASE ASC, "
+            "COALESCE(track_number, 1) ASC, title COLLATE NOCASE ASC"
+        )
+    if normalized in {"title", "title_asc"}:
+        return "title COLLATE NOCASE ASC, artist COLLATE NOCASE ASC"
+    if normalized in {"album", "album_asc"}:
+        return "album COLLATE NOCASE ASC, COALESCE(track_number, 1) ASC, title COLLATE NOCASE ASC"
+    if normalized in {"year", "year_desc"}:
+        return (
+            "COALESCE(year, 0) DESC, artist COLLATE NOCASE ASC, "
+            "album COLLATE NOCASE ASC, COALESCE(track_number, 1) ASC"
+        )
+    return "ingested_at DESC, id DESC"
+
+
 class SqliteCatalogRepository:
     """Concrete SQLite adapter implementing both `CatalogRepositoryPort` and `GovernanceRepositoryPort`."""
 
@@ -989,17 +1009,44 @@ class SqliteCatalogRepository:
                 return None
         return _row_to_library_track(tuple(row))
 
-    async def list_library_tracks(self, limit: int = 20) -> list[LibraryTrackRecord]:
-        """List recently ingested library tracks ordered newest-first."""
+    async def count_library_tracks(self, query: str = "") -> int:
+        """Return the total number of library tracks matching query (or all tracks if query is empty)."""
+        clean_q = query.strip()
+        async with self._db.connect() as conn:
+            if not clean_q:
+                cursor = await conn.execute("SELECT COUNT(*) FROM library_tracks")
+                row = await cursor.fetchone()
+                return int(row[0]) if row else 0
+
+            pattern = f"%{clean_q}%"
+            cursor = await conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM library_tracks
+                WHERE title LIKE ? OR artist LIKE ? OR album LIKE ? OR id LIKE ? OR job_id LIKE ?
+                """,
+                (pattern, pattern, pattern, f"{clean_q}%", f"{clean_q}%"),
+            )
+            row = await cursor.fetchone()
+            return int(row[0]) if row else 0
+
+    async def list_library_tracks(
+        self,
+        limit: int = 20,
+        offset: int = 0,
+        sort_by: str = "recent",
+    ) -> list[LibraryTrackRecord]:
+        """List recently ingested library tracks with pagination and sorting."""
+        order_clause = _build_track_order_by(sort_by)
         async with self._db.connect() as conn:
             cursor = await conn.execute(
                 f"""
                 SELECT {_LIBRARY_TRACK_COLUMNS}
                 FROM library_tracks
-                ORDER BY ingested_at DESC
-                LIMIT ?
+                ORDER BY {order_clause}
+                LIMIT ? OFFSET ?
                 """,
-                (limit,),
+                (limit, max(0, offset)),
             )
             rows = await cursor.fetchall()
         return [_row_to_library_track(tuple(r)) for r in rows]
@@ -1008,11 +1055,14 @@ class SqliteCatalogRepository:
         self,
         query: str,
         limit: int = 20,
+        offset: int = 0,
+        sort_by: str = "recent",
     ) -> list[LibraryTrackRecord]:
-        """Search library tracks by title, artist, album, or ID/job_id substring (case-insensitive)."""
+        """Search library tracks by title, artist, album, or ID substring with pagination and sorting."""
         clean_q = query.strip()
         if not clean_q:
-            return await self.list_library_tracks(limit=limit)
+            return await self.list_library_tracks(limit=limit, offset=offset, sort_by=sort_by)
+        order_clause = _build_track_order_by(sort_by)
         pattern = f"%{clean_q}%"
         async with self._db.connect() as conn:
             cursor = await conn.execute(
@@ -1020,10 +1070,10 @@ class SqliteCatalogRepository:
                 SELECT {_LIBRARY_TRACK_COLUMNS}
                 FROM library_tracks
                 WHERE title LIKE ? OR artist LIKE ? OR album LIKE ? OR id LIKE ? OR job_id LIKE ?
-                ORDER BY artist ASC, album ASC, COALESCE(track_number, 1) ASC
-                LIMIT ?
+                ORDER BY {order_clause}
+                LIMIT ? OFFSET ?
                 """,
-                (pattern, pattern, pattern, f"{clean_q}%", f"{clean_q}%", limit),
+                (pattern, pattern, pattern, f"{clean_q}%", f"{clean_q}%", limit, max(0, offset)),
             )
             rows = await cursor.fetchall()
         return [_row_to_library_track(tuple(r)) for r in rows]

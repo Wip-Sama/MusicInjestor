@@ -333,6 +333,44 @@ def _extract_embedded_cover_bytes_sync(audio_path: Path) -> bytes | None:
     return None
 
 
+def _parse_umask_mode(umask: str | int) -> int:
+    """Parse octal string or integer umask into an int."""
+    if isinstance(umask, int):
+        return umask
+    try:
+        cleaned = umask.strip()
+        return int(cleaned, 8) if cleaned else 0o022
+    except ValueError:
+        return 0o022
+
+
+def _apply_file_permissions_sync(path: Path, file_mode: int) -> None:
+    """Apply readable file permissions to `path`."""
+    if not path.is_file():
+        return
+    try:
+        path.chmod(file_mode)
+    except OSError as exc:
+        logger.debug("Could not chmod file %s to %o: %s", path, file_mode, exc)
+
+
+def _apply_dir_permissions_sync(path: Path, root: Path, dir_mode: int) -> None:
+    """Apply directory permissions to `path` and parents up to `root`."""
+    try:
+        curr = path.resolve()
+        resolved_root = root.resolve()
+        while True:
+            try:
+                curr.chmod(dir_mode)
+            except OSError as exc:
+                logger.debug("Could not chmod directory %s to %o: %s", curr, dir_mode, exc)
+            if curr == resolved_root or curr.parent == curr:
+                break
+            curr = curr.parent
+    except Exception as exc:
+        logger.debug("Error while applying directory permissions: %s", exc)
+
+
 class LibraryOrganizer:
     """Formats sanitized target paths, writes tags, extracts/fetches `cover.jpg`, and writes `.lrc`."""
 
@@ -340,16 +378,66 @@ class LibraryOrganizer:
         self,
         library_root: Path,
         *,
+        umask: str | int = "0022",
+        file_mode: int | None = None,
+        dir_mode: int | None = None,
         cover_art_base_url: str = "https://coverartarchive.org",
         transport: httpx.AsyncBaseTransport | None = None,
         enable_network: bool = False,
     ) -> None:
         self._library_root = library_root
+        parsed_umask = _parse_umask_mode(umask)
+        # Guarantee read permissions for everyone: at least 0o644 for files, at least 0o755 for directories.
+        # If umask is more permissive (e.g. 0002 or 0000), group/other write permissions are retained.
+        self._file_mode = file_mode if file_mode is not None else ((0o666 & ~parsed_umask) | 0o644)
+        self._dir_mode = dir_mode if dir_mode is not None else ((0o777 & ~parsed_umask) | 0o755)
         self._cover_art_base_url = cover_art_base_url.rstrip("/")
         self._transport = transport
         self._enable_network = enable_network
         self._is_reconciling: bool = False
         self._reconciliation_status: str = "idle"
+
+    @property
+    def file_mode(self) -> int:
+        """Return the target POSIX file mode (e.g. 0o644)."""
+        return self._file_mode
+
+    @property
+    def dir_mode(self) -> int:
+        """Return the target POSIX directory mode (e.g. 0o755)."""
+        return self._dir_mode
+
+    def apply_file_permissions(self, path: Path) -> None:
+        """Apply readable file permissions to `path`."""
+        _apply_file_permissions_sync(path, self._file_mode)
+
+    def apply_dir_permissions(self, path: Path) -> None:
+        """Apply directory permissions to `path` and parents up to `library_root`."""
+        _apply_dir_permissions_sync(path, self._library_root, self._dir_mode)
+
+    async def fix_library_permissions(self) -> int:
+        """Scan entire library directory recursively and ensure read permissions on all files/dirs."""
+        return await asyncio.to_thread(self._fix_library_permissions_sync)
+
+    def _fix_library_permissions_sync(self) -> int:
+        if not self._library_root.is_dir():
+            return 0
+        fixed = 0
+        self.apply_dir_permissions(self._library_root)
+        try:
+            for root, dirs, files in os.walk(self._library_root):
+                root_path = Path(root)
+                self.apply_dir_permissions(root_path)
+                for d in dirs:
+                    self.apply_dir_permissions(root_path / d)
+                    fixed += 1
+                for f in files:
+                    file_path = root_path / f
+                    self.apply_file_permissions(file_path)
+                    fixed += 1
+        except OSError as exc:
+            logger.warning("Could not fix library permissions for %s: %s", self._library_root, exc)
+        return fixed
 
     @property
     def is_reconciling(self) -> bool:
@@ -390,12 +478,14 @@ class LibraryOrganizer:
         """Ensure `cover.jpg` exists in `target_album_dir` via archive image, embedded tags, or CAA."""
         cover_path = target_album_dir / "cover.jpg"
         if cover_path.is_file():
+            self.apply_file_permissions(cover_path)
             return cover_path
 
         # 1. Check staged/sibling image files unpacked alongside the audio file
         staged_image = find_best_cover_image(source_audio_path.parent, recursive=False)
         if staged_image is not None and staged_image.is_file():
             await asyncio.to_thread(shutil.copy2, staged_image, cover_path)
+            self.apply_file_permissions(cover_path)
             logger.info("Copied staged album cover art from %s to %s", staged_image.name, cover_path)
             return cover_path
 
@@ -403,6 +493,7 @@ class LibraryOrganizer:
         embedded_bytes = await asyncio.to_thread(_extract_embedded_cover_bytes_sync, source_audio_path)
         if embedded_bytes:
             await asyncio.to_thread(cover_path.write_bytes, embedded_bytes)
+            self.apply_file_permissions(cover_path)
             logger.info("Extracted embedded cover art from %s to %s", source_audio_path.name, cover_path)
             return cover_path
 
@@ -423,6 +514,7 @@ class LibraryOrganizer:
                     response = await client.get(url)
                     if response.status_code == 200 and response.content:
                         await asyncio.to_thread(cover_path.write_bytes, response.content)
+                        self.apply_file_permissions(cover_path)
                         logger.info("Fetched cover art from Cover Art Archive (%s) to %s", url, cover_path)
                         return cover_path
             except Exception as exc:
@@ -439,12 +531,14 @@ class LibraryOrganizer:
         """Copy the audio file to its canonical library location, write tags, `cover.jpg`, and `.lrc`."""
         target_audio_path = self.build_target_audio_path(metadata, source_audio_path.suffix)
         target_audio_path.parent.mkdir(parents=True, exist_ok=True)
+        self.apply_dir_permissions(target_audio_path.parent)
 
         effective_lyrics = lyrics
         if effective_lyrics is None or not effective_lyrics.has_any:
             effective_lyrics = await asyncio.to_thread(_extract_existing_lyrics_sync, source_audio_path)
 
         await asyncio.to_thread(shutil.copy2, source_audio_path, target_audio_path)
+        self.apply_file_permissions(target_audio_path)
         await asyncio.to_thread(_write_enriched_tags_sync, target_audio_path, metadata, effective_lyrics)
         await self._ensure_album_cover_art(source_audio_path, target_audio_path.parent, metadata)
         logger.info("Finalized audio track at %s", target_audio_path)
@@ -458,6 +552,7 @@ class LibraryOrganizer:
                     sidecar_text,
                     "utf-8",
                 )
+                self.apply_file_permissions(lrc_path)
                 logger.info("Wrote sidecar lyrics to %s", lrc_path)
 
         return target_audio_path
@@ -476,8 +571,11 @@ class LibraryOrganizer:
         if not audio_path.is_file():
             return False
         if metadata is not None:
-            return await asyncio.to_thread(_write_enriched_tags_sync, audio_path, metadata, None)
-        return await asyncio.to_thread(
+            res = await asyncio.to_thread(_write_enriched_tags_sync, audio_path, metadata, None)
+            if res:
+                self.apply_file_permissions(audio_path)
+            return res
+        res = await asyncio.to_thread(
             _apply_partial_tag_correction_sync,
             audio_path,
             title,
@@ -485,6 +583,9 @@ class LibraryOrganizer:
             album,
             year,
         )
+        if res:
+            self.apply_file_permissions(audio_path)
+        return res
 
     async def read_track_lyrics(self, audio_path: Path) -> LyricsData | None:
         """Read lyrics from the `.lrc` sidecar file if present, falling back to embedded audio tags."""
@@ -500,8 +601,10 @@ class LibraryOrganizer:
         )
         if audio_path.is_file() and cleaned:
             await asyncio.to_thread(_embed_lyrics_into_audio_sync, audio_path, lyrics_obj)
+            self.apply_file_permissions(audio_path)
             lrc_path = audio_path.with_suffix(".lrc")
             await asyncio.to_thread(lrc_path.write_text, cleaned, "utf-8")
+            self.apply_file_permissions(lrc_path)
         return lyrics_obj
 
     async def update_track_cover_art(
@@ -513,9 +616,12 @@ class LibraryOrganizer:
         """Write `cover.jpg` in the album directory and embed the image into `audio_path` tags."""
         cover_path = audio_path.parent / "cover.jpg"
         cover_path.parent.mkdir(parents=True, exist_ok=True)
+        self.apply_dir_permissions(cover_path.parent)
         await asyncio.to_thread(cover_path.write_bytes, cover_bytes)
+        self.apply_file_permissions(cover_path)
         if audio_path.is_file():
             await asyncio.to_thread(_embed_cover_art_into_audio_sync, audio_path, cover_bytes, mime_type)
+            self.apply_file_permissions(audio_path)
         return cover_path
 
     async def relocate_and_retag_track(
@@ -527,6 +633,7 @@ class LibraryOrganizer:
         """Rewrite tags, move `current_path` + `.lrc` + `cover.jpg` if path changed, and clean empty dirs."""
         target_audio_path = self.build_target_audio_path(metadata, current_path.suffix)
         target_audio_path.parent.mkdir(parents=True, exist_ok=True)
+        self.apply_dir_permissions(target_audio_path.parent)
 
         effective_lyrics = lyrics
         if effective_lyrics is None or not effective_lyrics.has_any:
@@ -540,13 +647,16 @@ class LibraryOrganizer:
 
         if not same_file and current_path.is_file():
             await asyncio.to_thread(shutil.copy2, current_path, target_audio_path)
+            self.apply_file_permissions(target_audio_path)
             old_cover = current_path.parent / "cover.jpg"
             new_cover = target_audio_path.parent / "cover.jpg"
             if old_cover.is_file() and not new_cover.is_file():
                 await asyncio.to_thread(shutil.copy2, old_cover, new_cover)
+                self.apply_file_permissions(new_cover)
 
         if target_audio_path.is_file():
             await asyncio.to_thread(_write_enriched_tags_sync, target_audio_path, metadata, effective_lyrics)
+            self.apply_file_permissions(target_audio_path)
             await self._ensure_album_cover_art(target_audio_path, target_audio_path.parent, metadata)
 
         if effective_lyrics is not None and effective_lyrics.has_any:
@@ -554,6 +664,7 @@ class LibraryOrganizer:
             if sidecar_text:
                 lrc_path = target_audio_path.with_suffix(".lrc")
                 await asyncio.to_thread(lrc_path.write_text, sidecar_text, "utf-8")
+                self.apply_file_permissions(lrc_path)
 
         if not same_file:
             await asyncio.to_thread(_cleanup_old_track_location_sync, current_path, self._library_root)
@@ -588,6 +699,8 @@ class LibraryOrganizer:
             _scan_library_filesystem_sync,
             self._library_root,
             existing_records,
+            self._file_mode,
+            self._dir_mode,
         )
 
     async def apply_rescan_report(
@@ -621,6 +734,7 @@ class LibraryOrganizer:
         self._is_reconciling = True
         self._reconciliation_status = "Scanning audio files on disk..."
         try:
+            await self.fix_library_permissions()
             existing = await repository.list_library_tracks(limit=50000)
             report = await self.scan_library_filesystem(existing)
             if report.has_changes:
@@ -787,6 +901,8 @@ def _extract_tail_library_key(path: Path) -> str:
 def _scan_library_filesystem_sync(
     library_root: Path,
     existing_records: list[LibraryTrackRecord],
+    file_mode: int | None = None,
+    dir_mode: int | None = None,
 ) -> LibraryRescanReport:
     """Synchronously scan `library_root` and classify added, updated, removed, and unchanged tracks."""
     if not library_root.exists():
@@ -794,12 +910,22 @@ def _scan_library_filesystem_sync(
 
     discovered_files: list[Path] = []
     try:
+        if dir_mode is not None:
+            _apply_dir_permissions_sync(library_root, library_root, dir_mode)
         for root, dirs, files in os.walk(library_root, followlinks=False):
+            root_path = Path(root)
+            if dir_mode is not None:
+                _apply_dir_permissions_sync(root_path, library_root, dir_mode)
+                for d in dirs:
+                    _apply_dir_permissions_sync(root_path / d, library_root, dir_mode)
             dirs.sort()
             for filename in sorted(files):
-                ext = Path(filename).suffix.lower()
+                file_path = root_path / filename
+                if file_mode is not None:
+                    _apply_file_permissions_sync(file_path, file_mode)
+                ext = file_path.suffix.lower()
                 if ext in SUPPORTED_AUDIO_EXTENSIONS:
-                    discovered_files.append(Path(root) / filename)
+                    discovered_files.append(file_path)
     except OSError as exc:
         logger.warning("Error walking library root %s: %s", library_root, exc)
 

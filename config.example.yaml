@@ -80,3 +80,15 @@ oidc:
   listen_port: 8080
   sync_interval_seconds: 3600
 
+webapp:
+  # Enable built-in HTTP server for Telegram Mini App
+  enabled: true
+  # Public HTTPS URL of the Mini App (e.g. https://music.example.com or Cloudflare Tunnel)
+  # Used by bot to register the persistent Menu Button and launch links
+  url: ""
+  # Path to built frontend static SPA files
+  static_dir: "./webapp/dist"
+  # Host and port for unified HTTP API and static file listener
+  listen_host: "0.0.0.0"
+  listen_port: 8080
+

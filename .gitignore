@@ -33,3 +33,7 @@ storage/library/*
 *.db-shm
 *.db-wal
 
+# Frontend WebApp
+webapp/node_modules/
+webapp/dist/
+

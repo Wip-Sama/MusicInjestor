@@ -39,8 +39,12 @@ from src.bot.keyboards.admin import (
     format_toggle_label,
 )
 from src.bot.keyboards.songs import (
+    SORT_DESCRIPTIONS,
+    SORT_LABELS,
     SongsFieldCallback,
     SongsMenuCallback,
+    SongsPageCallback,
+    SongsSortCallback,
     SongsTrackCallback,
     build_dry_run_confirmation_keyboard,
     build_input_cancel_keyboard,
@@ -50,6 +54,7 @@ from src.bot.keyboards.songs import (
     build_search_prompt_keyboard,
     build_song_action_keyboard,
     build_songs_search_menu_keyboard,
+    build_songs_sort_keyboard,
 )
 from src.bot.keyboards.verification import (
     VerifyActionCallback,
@@ -81,8 +86,12 @@ __all__ = [
     "QueueActionCallback",
     "QueueCancelCallback",
     "RESERVED_MENU_BUTTONS",
+    "SORT_DESCRIPTIONS",
+    "SORT_LABELS",
     "SongsFieldCallback",
     "SongsMenuCallback",
+    "SongsPageCallback",
+    "SongsSortCallback",
     "SongsTrackCallback",
     "VerifyActionCallback",
     "VerifyFieldCallback",
@@ -111,6 +120,7 @@ __all__ = [
     "build_search_prompt_keyboard",
     "build_song_action_keyboard",
     "build_songs_search_menu_keyboard",
+    "build_songs_sort_keyboard",
     "build_tag_correction_review_keyboard",
     "build_user_detail_keyboard",
     "build_user_list_keyboard",

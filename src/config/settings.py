@@ -62,6 +62,14 @@ _YAML_SECTION_KEY_MAP: dict[str, dict[str, str]] = {
         "listen_port": "OIDC_LISTEN_PORT",
         "sync_interval_seconds": "OIDC_SYNC_INTERVAL_SECONDS",
     },
+    "webapp": {
+        "enabled": "WEB_APP_ENABLED",
+        "url": "WEB_APP_URL",
+        "static_dir": "WEB_APP_STATIC_DIR",
+        "dev_mode": "WEB_APP_DEV_MODE",
+        "listen_host": "WEB_LISTEN_HOST",
+        "listen_port": "WEB_LISTEN_PORT",
+    },
 }
 
 
@@ -182,6 +190,14 @@ class AppSettings(BaseModel):
     oidc_listen_port: int = Field(default=8080, ge=0, le=65535)
     oidc_sync_interval_seconds: int = Field(default=3600, ge=60)
 
+    # Telegram Mini App & Web Server settings
+    web_app_enabled: bool = Field(default=True)
+    web_app_url: str = Field(default="")
+    web_app_static_dir: Path = Field(default=Path("./webapp/dist"))
+    web_app_dev_mode: bool = Field(default=True)
+    web_listen_host: str = Field(default="0.0.0.0")
+    web_listen_port: int = Field(default=8080, ge=0, le=65535)
+
     @field_validator("auto_approve_confidence")
     @classmethod
     def validate_confidence_range(cls, value: float) -> float:
@@ -197,6 +213,7 @@ class AppSettings(BaseModel):
         "oidc_authorize_url",
         "oidc_token_url",
         "oidc_userinfo_url",
+        "web_app_url",
     )
     @classmethod
     def strip_trailing_slash(cls, value: str) -> str:
@@ -279,6 +296,8 @@ def load_settings(
         "OIDC_REDIRECT_URI": "oidc_redirect_uri",
         "OIDC_WEBHOOK_SECRET": "oidc_webhook_secret",
         "OIDC_LISTEN_HOST": "oidc_listen_host",
+        "WEB_APP_URL": "web_app_url",
+        "WEB_LISTEN_HOST": "web_listen_host",
     }
     for env_key, field_name in str_mappings.items():
         if env_key in merged_env and merged_env[env_key] != "":
@@ -290,6 +309,7 @@ def load_settings(
         "STORAGE_SCRATCH_DIR": "storage_scratch_dir",
         "STORAGE_LIBRARY_DIR": "storage_library_dir",
         "DATABASE_PATH": "database_path",
+        "WEB_APP_STATIC_DIR": "web_app_static_dir",
     }
     for env_key, field_name in path_mappings.items():
         if env_key in merged_env and merged_env[env_key] != "":
@@ -300,6 +320,12 @@ def load_settings(
 
     if "TELEGRAM_USE_LOCAL_API" in merged_env and merged_env["TELEGRAM_USE_LOCAL_API"] != "":
         raw_kwargs["telegram_use_local_api"] = _parse_bool(merged_env["TELEGRAM_USE_LOCAL_API"])
+
+    if "WEB_APP_ENABLED" in merged_env and merged_env["WEB_APP_ENABLED"] != "":
+        raw_kwargs["web_app_enabled"] = _parse_bool(merged_env["WEB_APP_ENABLED"])
+
+    if "WEB_APP_DEV_MODE" in merged_env and merged_env["WEB_APP_DEV_MODE"] != "":
+        raw_kwargs["web_app_dev_mode"] = _parse_bool(merged_env["WEB_APP_DEV_MODE"])
 
     if "AUTO_APPROVE_CONFIDENCE" in merged_env and merged_env["AUTO_APPROVE_CONFIDENCE"] != "":
         raw_kwargs["auto_approve_confidence"] = float(merged_env["AUTO_APPROVE_CONFIDENCE"])
@@ -318,6 +344,9 @@ def load_settings(
 
     if "OIDC_LISTEN_PORT" in merged_env and merged_env["OIDC_LISTEN_PORT"] != "":
         raw_kwargs["oidc_listen_port"] = int(merged_env["OIDC_LISTEN_PORT"])
+
+    if "WEB_LISTEN_PORT" in merged_env and merged_env["WEB_LISTEN_PORT"] != "":
+        raw_kwargs["web_listen_port"] = int(merged_env["WEB_LISTEN_PORT"])
 
     if "OIDC_SYNC_INTERVAL_SECONDS" in merged_env and merged_env["OIDC_SYNC_INTERVAL_SECONDS"] != "":
         raw_kwargs["oidc_sync_interval_seconds"] = int(merged_env["OIDC_SYNC_INTERVAL_SECONDS"])

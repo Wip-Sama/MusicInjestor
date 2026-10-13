@@ -429,6 +429,21 @@ async def handle_start(
         _render_home_card(current_user),
         reply_markup=reply_kb,
     )
+    if settings and settings.web_app_url.strip():
+        await message.answer(
+            format_screen(
+                title="🎵 Web Studio &amp; Player",
+                context_lines=[
+                    "Launch the native Telegram Mini App for full library browsing, "
+                    "audio streaming with synced lyrics, and visual metadata editing."
+                ],
+                footer_lines=["<i>🧭 Home › Web App</i>"],
+            ),
+            reply_markup=build_home_menu_inline_keyboard(
+                current_user,
+                web_app_url=settings.web_app_url.strip(),
+            ),
+        )
 
 
 @commands_router.message(Command("cancel"))
@@ -653,10 +668,11 @@ async def handle_menu_navigation_callback(
         return
 
     await resolve_back_callback(state, callback.message, "menu:home", reset_to_home=True)
+    web_url = settings.web_app_url if settings and settings.web_app_url.strip() else None
     await safe_edit_text(
         callback.message,
         _render_home_card(current_user),
-        reply_markup=build_home_menu_inline_keyboard(current_user),
+        reply_markup=build_home_menu_inline_keyboard(current_user, web_app_url=web_url),
     )
 
 

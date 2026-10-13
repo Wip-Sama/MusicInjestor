@@ -206,6 +206,27 @@ Before concluding any task that modifies code:
   - Added background reconciliation state tracking (`is_reconciling` and `reconciliation_status` on `LibraryOrganizer` in `src/core/organizer.py`) and implemented a safe lockdown mode freezing song mutations, cover/lyrics updates, manual tag edits, and concurrent `/rescan` triggers while background filesystem synchronization is running.
   - Updated `/status` System Diagnostics (`src/bot/routers/commands.py`) to report live library synchronization state (`🟡 In Progress` vs `🟢 Ready`).
 
+- [x] **M17: Guaranteed Read Permissions (`0o644` / `0o755`), Recursive Permission Repair, and Paginated/Sorted `/songs` Browser**
+  - **Strict Permission Enforcement:** Fixed restrictive `0600` file modes caused by `shutil.copy2` copying metadata from local Bot API containers. Added `apply_file_permissions` (`((0o666 & ~umask) | 0o644)`) and `apply_dir_permissions` (`((0o777 & ~umask) | 0o755)`) across `src/core/organizer.py` and `src/core/extractor.py`. Guaranteed read permissions on ingested audio tracks, `.lrc` sidecars, `cover.jpg` art, staging scratches, and archive extractions so external media servers (Jellyfin, Plex, Navidrome) can read files.
+  - **Recursive Permission Repair:** Added `fix_library_permissions` to `LibraryOrganizer` and wired it into library reconciliation so existing files with restrictive permissions are automatically repaired.
+  - **Library Browser Pagination & Sorting:** Overhauled `/songs` interactive menu (`src/bot/routers/songs.py`, `src/bot/keyboards/songs.py`, `src/db/repository.py`, and `src/core/ports.py`) with 8-item-per-page pagination (`◀ Prev`, `📄 {page} / {total_pages}`, `Next ▶`), track counter indicators (`Tracks X–Y of Z`), sort selection menu (`🔀 Sort: {label} ▾` with options: Recently Added, Artist A–Z, Title A–Z, Album A–Z, Release Year), clear search filter button, and in-place navigation without chat spam.
+
+- [x] **M18 (TMA Phase 1): Unified Web & API Server, Zero-Trust `initData` Cryptographic Validation, RBAC Bridge, Bot Menu Button & React/Vite `@telegram-apps/sdk-react` Scaffold**
+  - Implemented zero-trust `HMAC-SHA256` signature verification in `src/bot/auth.py` strictly adhering to `mini_app_guidelineù.md` Section 4.2 (single URL-decode pass, lexicographical sorting, secret key derivation from `WebAppData` and bot token, constant-time `hmac.compare_digest` verification, and timestamp freshness check).
+  - Built unified `BotWebServer` in `src/bot/webapp_server.py` running on `aiohttp.web`, integrating `/healthz`, `/api/v1/app/auth/me`, Authentik OIDC OAuth/webhooks, and SPA static file serving with `/dist/index.html` fallback.
+  - Added typed settings (`WEB_APP_ENABLED`, `WEB_APP_URL`, `WEB_APP_STATIC_DIR`, `WEB_LISTEN_HOST`, `WEB_LISTEN_PORT`) in `src/config/settings.py` with YAML and `.env` precedence.
+  - Configured persistent Telegram Menu Button (`setChatMenuButton` with `MenuButtonWebApp`) and inline launch buttons (`build_home_menu_inline_keyboard` in `src/bot/keyboards/admin.py` and `src/bot/routers/commands.py`).
+  - Scaffolded modern Telegram Mini App frontend in `webapp/` using React 18, Vite, TypeScript, `@telegram-apps/sdk-react`, `@telegram-apps/telegram-ui`, client-side Telegram bootstrap (`miniApp.ready()`, `miniApp.mount()`, `viewport.expand()`, `swipeBehavior.disableVertical()`), dynamic CSS theme variables (`--tg-theme-*`), and resilient `initData` capture (`sessionStorage`).
+  - Built production bundle (`webapp/dist`) and created unit test suites (`tests/unit/test_webapp_auth.py` and `tests/unit/test_webapp_server.py`), achieving 100% pass rate across all 86 unit and integration tests.
+
 ### Planned Backlog (Future Enhancements)
+- [ ] **Phase 2: Telegram Mini App Music Catalog & Audio Streaming Player**
+  - Implement `/api/v1/app/tracks` search & pagination, cover art stream, and HTTP 206 range-enabled audio streaming with interactive player and synced lyrics in `webapp/`.
+- [ ] **Phase 3: Telegram Mini App Metadata, Cover & Synced Lyrics Studio**
+  - Implement visual metadata editor with dry-run diff preview (`SongEditProposal`), visual cover art cropper/uploader, and interactive LRC editor.
+- [ ] **Phase 4: Telegram Mini App Web Ingestion Hub & Live Queue Board**
+  - Implement multipart audio/archive upload and real-time SSE stage visualizer (0..10) with interactive verification resolution.
+- [ ] **Phase 5: Telegram Mini App Governance, Deep-Linking & Offline Resilience**
+  - Implement admin user management, `?startapp=` deep-linking, and offline Service Worker shell caching.
 - [ ] **Low-Priority Backlog: Admin Folder Structure Viewer & Mass Migration**
   - Allow upper roles (`ADMIN` / `OWNER`) to browse the `storage/library` folder hierarchy in Telegram and run dry-run previewed mass path/tag migrations across the catalog.

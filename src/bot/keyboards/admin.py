@@ -7,6 +7,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
+    WebAppInfo,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
@@ -154,11 +155,14 @@ def append_escape_row(
 def build_home_menu_inline_keyboard(
     user: UserAccount | None = None,
     *,
+    web_app_url: str | None = None,
     include_back: bool = False,
     back_callback: str | None = None,
 ) -> InlineKeyboardMarkup:
     """Build the root single-screen navigation inline keyboard for `/start` and `🏠 Menu`."""
     builder = InlineKeyboardBuilder()
+    if web_app_url and web_app_url.strip():
+        builder.button(text="🚀 Open Web App", web_app=WebAppInfo(url=web_app_url.strip()))
     builder.button(text="🎵 Songs", callback_data="songs:list")
     builder.button(text="⏳ Queue", callback_data=QueueActionCallback(action="mine").pack())
     builder.button(text="🔐 Authentik SSO", callback_data=MenuCallback(action="sso").pack())
@@ -166,7 +170,10 @@ def build_home_menu_inline_keyboard(
     if user is not None and has_permission(user, Permission.MANAGE_USERS):
         builder.button(text="👮 Admin Panel", callback_data=AdminActionCallback(action="panel").pack())
     builder.button(text="ℹ️ Help", callback_data=MenuCallback(action="help").pack())
-    builder.adjust(2)
+    if web_app_url and web_app_url.strip():
+        builder.adjust(1, 2)
+    else:
+        builder.adjust(2)
     if include_back:
         effective_back = back_callback or MenuCallback(action="home").pack()
         append_escape_row(

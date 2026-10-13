@@ -4,6 +4,7 @@ import html
 import inspect
 import json
 import logging
+import math
 from pathlib import Path
 
 import httpx
@@ -20,6 +21,10 @@ from src.bot.keyboards.admin import (
     build_queued_job_keyboard,
 )
 from src.bot.keyboards.songs import (
+    SORT_DESCRIPTIONS,
+    SORT_LABELS,
+    SongsPageCallback,
+    SongsSortCallback,
     build_dry_run_confirmation_keyboard,
     build_input_cancel_keyboard,
     build_metadata_field_keyboard,
@@ -29,6 +34,7 @@ from src.bot.keyboards.songs import (
     build_song_action_keyboard,
     build_song_history_keyboard,
     build_songs_search_menu_keyboard,
+    build_songs_sort_keyboard,
 )
 from src.bot.states import SongManagementStates
 from src.bot.ui import (
@@ -64,6 +70,8 @@ from src.core.ports import CatalogRepositoryPort, GovernanceRepositoryPort
 from src.core.rbac import has_permission
 
 logger = logging.getLogger(__name__)
+
+SONGS_PAGE_SIZE: int = 8
 
 songs_router = Router(name="songs")
 
@@ -129,7 +137,8 @@ def _resolve_organizer(
     if isinstance(organizer_attr, LibraryOrganizer):
         return organizer_attr
     lib_dir = settings.storage_library_dir if settings is not None else Path("./storage/library")
-    return LibraryOrganizer(library_root=lib_dir, enable_network=True)
+    umask_val = settings.umask if settings is not None else "0022"
+    return LibraryOrganizer(library_root=lib_dir, umask=umask_val, enable_network=True)
 
 
 def _resolve_metadata_service(
@@ -209,6 +218,77 @@ async def _resolve_song_provenance_labels(
             modifier_label = f"User {record.modified_by}"
 
     return uploader_label, modifier_label
+
+
+def format_songs_browser_card(
+    *,
+    total_tracks: int,
+    page: int,
+    total_pages: int,
+    sort_by: str,
+    query: str = "",
+    tracks_count: int = 0,
+) -> str:
+    """Render a 3-tier HTML summary card for the paginated & sorted `/songs` library browser."""
+    sort_desc = SORT_DESCRIPTIONS.get(sort_by, "Recently Added (Newest First)")
+    if query:
+        title = f"🎵 Search Results for {html.escape(query)} ({total_tracks})"
+        if total_tracks == 0:
+            return format_screen(
+                title=title,
+                context_lines=[
+                    f"No tracks found matching <code>{html.escape(query)}</code>.",
+                    "Tap <b>❌ Clear Search Filter</b> below or enter a different search query in chat.",
+                ],
+                footer_lines=[
+                    f"<i>Query:</i> <code>{html.escape(query)}</code> • <i>🧭 Home › Songs › Search</i>"
+                ],
+            )
+        start_idx = (page - 1) * SONGS_PAGE_SIZE + 1
+        end_idx = min(total_tracks, start_idx + tracks_count - 1)
+        page_indicator = f"• Page <b>{page}</b> of <b>{total_pages}</b>"
+        track_span = f" (Tracks <code>{start_idx}–{end_idx}</code> of <code>{total_tracks}</code>)"
+        return format_screen(
+            title=title,
+            context_lines=[
+                f"{page_indicator}{track_span}",
+                f"• Sorted by: <b>{html.escape(sort_desc)}</b>",
+                "• Tap a song below to manage it (download, edit tags/cover/lyrics, export).",
+                "• Or type another search query in chat to refine the results.",
+            ],
+            footer_lines=[
+                f"<i>Query:</i> <code>{html.escape(query)}</code> • <i>🧭 Home › Songs › Search</i>"
+            ],
+        )
+
+    title = f"🎵 Music Library Browser ({total_tracks} track(s))"
+    if total_tracks == 0:
+        return format_screen(
+            title=title,
+            context_lines=[
+                "The music library is currently empty.",
+                "Send an audio file or archive (.zip/.7z) to ingest tracks into the library.",
+            ],
+            footer_lines=["<i>🧭 Home › Songs</i>"],
+        )
+
+    start_idx = (page - 1) * SONGS_PAGE_SIZE + 1
+    end_idx = min(total_tracks, start_idx + tracks_count - 1)
+    page_indicator = f"• Page <b>{page}</b> of <b>{total_pages}</b>"
+    track_span = f" (Tracks <code>{start_idx}–{end_idx}</code> of <code>{total_tracks}</code>)"
+    return format_screen(
+        title=title,
+        context_lines=[
+            f"{page_indicator}{track_span}",
+            f"• Sorted by: <b>{html.escape(sort_desc)}</b>",
+            (
+                "• Tap a song below to open its management menu "
+                "(download, edit metadata/cover/lyrics, re-search, export/import)."
+            ),
+            "• Or type a song title, artist, or album right now to filter the list.",
+        ],
+        footer_lines=["<i>🧭 Home › Songs</i>"],
+    )
 
 
 def format_song_detail_card(
@@ -581,12 +661,30 @@ async def handle_songs_command(
         if len(parts) == 2:
             query = parts[1].strip()
 
+    page = 1
+    sort_by = "recent"
+    total_count = await governance_repository.count_library_tracks(query)
+    total_pages = max(1, math.ceil(total_count / SONGS_PAGE_SIZE))
     tracks = (
-        await governance_repository.search_library_tracks(query, limit=15)
+        await governance_repository.search_library_tracks(
+            query,
+            limit=SONGS_PAGE_SIZE,
+            offset=0,
+            sort_by=sort_by,
+        )
         if query
-        else await governance_repository.list_library_tracks(limit=15)
+        else await governance_repository.list_library_tracks(
+            limit=SONGS_PAGE_SIZE,
+            offset=0,
+            sort_by=sort_by,
+        )
     )
     await _reset_to_search_state(state)
+    await state.update_data(
+        song_page=page,
+        song_sort=sort_by,
+        song_query=query,
+    )
     back_cb = await resolve_back_callback(
         state,
         None,
@@ -595,23 +693,23 @@ async def handle_songs_command(
         reset_to_home=True,
     )
 
-    title = (
-        f"🎵 Library Search Results for {html.escape(query)} ({len(tracks)})"
-        if query
-        else f"🎵 Music Library Browser ({len(tracks)} track(s))"
+    card_text = format_songs_browser_card(
+        total_tracks=total_count,
+        page=page,
+        total_pages=total_pages,
+        sort_by=sort_by,
+        query=query,
+        tracks_count=len(tracks),
     )
     await message.answer(
-        format_screen(
-            title=title,
-            context_lines=[
-                "• Tap a song below to open its management menu "
-                "(download, edit metadata/cover/lyrics, re-search, or export/import).",
-                "• Or type a song title, artist, or album right now to filter the list.",
-            ],
-            footer_lines=["<i>🧭 Home › Songs</i>"],
-        ),
+        card_text,
         reply_markup=build_songs_search_menu_keyboard(
             tracks,
+            page=page,
+            total_pages=total_pages,
+            total_count=total_count,
+            sort_by=sort_by,
+            query=query,
             can_rescan=True,
             is_filtered=bool(query),
             back_callback=back_cb,
@@ -668,9 +766,19 @@ async def handle_rescan_command(
     report = await organizer.scan_library_filesystem(existing)
     if not report.has_changes:
         await _reset_to_search_state(state)
+        total_count = len(existing)
+        total_pages = max(1, math.ceil(total_count / SONGS_PAGE_SIZE))
+        page_tracks = existing[:SONGS_PAGE_SIZE]
         await message.answer(
             format_rescan_dry_run_card(report, applied=True),
-            reply_markup=build_songs_search_menu_keyboard(existing[:12], can_rescan=True),
+            reply_markup=build_songs_search_menu_keyboard(
+                page_tracks,
+                page=1,
+                total_pages=total_pages,
+                total_count=total_count,
+                sort_by="recent",
+                can_rescan=True,
+            ),
         )
         return
 
@@ -774,10 +882,11 @@ async def handle_songs_search_text(
     if not _can_access_songs(current_user) or governance_repository is None:
         return
 
-    # Check if the user pasted a Job ID first when no song title matches
-    tracks = await governance_repository.search_library_tracks(text, limit=15)
+    fsm_data = await state.get_data()
+    sort_by = str(fsm_data.get("song_sort") or "recent")
+    total_count = await governance_repository.count_library_tracks(text)
     await _reset_to_search_state(state)
-    if not tracks:
+    if total_count == 0:
         direct_track = await governance_repository.get_library_track(text)
         if direct_track is not None:
             await _reset_to_search_state(state, active_song_id=direct_track.id)
@@ -837,37 +946,229 @@ async def handle_songs_search_text(
                 return
 
         await resolve_back_callback(state, None, "songs:list", default_back="menu:home")
-        all_tracks = await governance_repository.list_library_tracks(limit=10)
+        await state.update_data(song_page=1, song_sort=sort_by, song_query=text)
         await message.answer(
-            format_screen(
-                title="🔍 No Matching Songs Found",
-                context_lines=[
-                    f"No songs found matching <code>{html.escape(text)}</code>.",
-                    "Try another search term or pick from recent tracks below.",
-                ],
-                footer_lines=["<i>🧭 Home › Songs › Search</i>"],
+            format_songs_browser_card(
+                total_tracks=0,
+                page=1,
+                total_pages=1,
+                sort_by=sort_by,
+                query=text,
+                tracks_count=0,
             ),
             reply_markup=build_songs_search_menu_keyboard(
-                all_tracks,
+                [],
+                page=1,
+                total_pages=1,
+                total_count=0,
+                sort_by=sort_by,
+                query=text,
                 can_rescan=True,
                 is_filtered=True,
             ),
         )
         return
 
+    page = 1
+    total_pages = max(1, math.ceil(total_count / SONGS_PAGE_SIZE))
+    tracks = await governance_repository.search_library_tracks(
+        text,
+        limit=SONGS_PAGE_SIZE,
+        offset=0,
+        sort_by=sort_by,
+    )
+    await state.update_data(
+        song_page=page,
+        song_sort=sort_by,
+        song_query=text,
+    )
     await resolve_back_callback(state, None, "songs:list", default_back="menu:home")
+    card_text = format_songs_browser_card(
+        total_tracks=total_count,
+        page=page,
+        total_pages=total_pages,
+        sort_by=sort_by,
+        query=text,
+        tracks_count=len(tracks),
+    )
     await message.answer(
-        format_screen(
-            title=f"🎵 Search Results for {html.escape(text)} ({len(tracks)})",
-            context_lines=["Tap a song to manage it, or type another search query."],
-            footer_lines=[
-                f"<i>Query:</i> <code>{html.escape(text)}</code> • <i>🧭 Home › Songs › Search</i>"
-            ],
-        ),
+        card_text,
         reply_markup=build_songs_search_menu_keyboard(
             tracks,
+            page=page,
+            total_pages=total_pages,
+            total_count=total_count,
+            sort_by=sort_by,
+            query=text,
             can_rescan=True,
             is_filtered=True,
+        ),
+    )
+
+
+@songs_router.callback_query(SongsPageCallback.filter())
+async def handle_songs_page_callback(
+    callback: CallbackQuery,
+    callback_data: SongsPageCallback,
+    state: FSMContext,
+    current_user: UserAccount | None = None,
+    governance_repository: GovernanceRepositoryPort | None = None,
+) -> None:
+    """Handle pagination transitions in the `/songs` library browser in-place."""
+    if not _can_access_songs(current_user):
+        await ack_callback(callback, "Permission denied.", show_alert=True)
+        return
+    if governance_repository is None:
+        await ack_callback(callback, "Repository unavailable.", show_alert=True)
+        return
+
+    fsm_data = await state.get_data()
+    query = str(fsm_data.get("song_query") or "").strip()
+    sort_by = callback_data.sort or str(fsm_data.get("song_sort") or "recent")
+
+    if callback_data.action.startswith("noop"):
+        total_count = await governance_repository.count_library_tracks(query)
+        total_pages = max(1, math.ceil(total_count / SONGS_PAGE_SIZE))
+        if callback_data.action == "noop_first":
+            await ack_callback(callback, "You are already on the first page.")
+        elif callback_data.action == "noop_last":
+            await ack_callback(callback, "You are already on the last page.")
+        else:
+            info_msg = f"Page {callback_data.page} of {total_pages} ({total_count} track(s))"
+            await ack_callback(callback, info_msg)
+        return
+
+    await ack_callback(callback)
+    target_page = max(1, callback_data.page)
+    total_count = await governance_repository.count_library_tracks(query)
+    total_pages = max(1, math.ceil(total_count / SONGS_PAGE_SIZE))
+    target_page = min(target_page, total_pages)
+    offset = (target_page - 1) * SONGS_PAGE_SIZE
+
+    tracks = (
+        await governance_repository.search_library_tracks(
+            query,
+            limit=SONGS_PAGE_SIZE,
+            offset=offset,
+            sort_by=sort_by,
+        )
+        if query
+        else await governance_repository.list_library_tracks(
+            limit=SONGS_PAGE_SIZE,
+            offset=offset,
+            sort_by=sort_by,
+        )
+    )
+
+    await state.update_data(
+        song_page=target_page,
+        song_sort=sort_by,
+        song_query=query,
+    )
+    msg = callback.message
+    back_cb = await resolve_back_callback(
+        state,
+        msg,
+        "songs:list",
+        default_back="menu:home",
+    )
+    card_text = format_songs_browser_card(
+        total_tracks=total_count,
+        page=target_page,
+        total_pages=total_pages,
+        sort_by=sort_by,
+        query=query,
+        tracks_count=len(tracks),
+    )
+    await safe_edit_text(
+        msg,
+        card_text,
+        reply_markup=build_songs_search_menu_keyboard(
+            tracks,
+            page=target_page,
+            total_pages=total_pages,
+            total_count=total_count,
+            sort_by=sort_by,
+            query=query,
+            can_rescan=True,
+            is_filtered=bool(query),
+            back_callback=back_cb,
+        ),
+    )
+
+
+@songs_router.callback_query(SongsSortCallback.filter())
+async def handle_songs_sort_callback(
+    callback: CallbackQuery,
+    callback_data: SongsSortCallback,
+    state: FSMContext,
+    current_user: UserAccount | None = None,
+    governance_repository: GovernanceRepositoryPort | None = None,
+) -> None:
+    """Handle sort order selection in the `/songs` library browser in-place."""
+    if not _can_access_songs(current_user):
+        await ack_callback(callback, "Permission denied.", show_alert=True)
+        return
+    if governance_repository is None:
+        await ack_callback(callback, "Repository unavailable.", show_alert=True)
+        return
+
+    new_sort = callback_data.sort
+    await ack_callback(callback, f"Sorted by {SORT_LABELS.get(new_sort, new_sort)}")
+    fsm_data = await state.get_data()
+    query = str(fsm_data.get("song_query") or "").strip()
+    page = 1
+
+    total_count = await governance_repository.count_library_tracks(query)
+    total_pages = max(1, math.ceil(total_count / SONGS_PAGE_SIZE))
+    tracks = (
+        await governance_repository.search_library_tracks(
+            query,
+            limit=SONGS_PAGE_SIZE,
+            offset=0,
+            sort_by=new_sort,
+        )
+        if query
+        else await governance_repository.list_library_tracks(
+            limit=SONGS_PAGE_SIZE,
+            offset=0,
+            sort_by=new_sort,
+        )
+    )
+
+    await state.update_data(
+        song_page=page,
+        song_sort=new_sort,
+        song_query=query,
+    )
+    msg = callback.message
+    back_cb = await resolve_back_callback(
+        state,
+        msg,
+        "songs:list",
+        default_back="menu:home",
+    )
+    card_text = format_songs_browser_card(
+        total_tracks=total_count,
+        page=page,
+        total_pages=total_pages,
+        sort_by=new_sort,
+        query=query,
+        tracks_count=len(tracks),
+    )
+    await safe_edit_text(
+        msg,
+        card_text,
+        reply_markup=build_songs_search_menu_keyboard(
+            tracks,
+            page=page,
+            total_pages=total_pages,
+            total_count=total_count,
+            sort_by=new_sort,
+            query=query,
+            can_rescan=True,
+            is_filtered=bool(query),
+            back_callback=back_cb,
         ),
     )
 
@@ -921,25 +1222,120 @@ async def handle_songs_callback(
     # 1. List / Back to Songs Menu
     if action == "list":
         await ack_callback(callback)
-        tracks = await governance_repository.list_library_tracks(limit=15)
+        fsm_data = await state.get_data()
+        sort_by = str(fsm_data.get("song_sort") or "recent")
+        page = 1
+        query = ""
+
+        total_count = await governance_repository.count_library_tracks()
+        total_pages = max(1, math.ceil(total_count / SONGS_PAGE_SIZE))
+        tracks = await governance_repository.list_library_tracks(
+            limit=SONGS_PAGE_SIZE,
+            offset=0,
+            sort_by=sort_by,
+        )
         await _reset_to_search_state(state)
+        await state.update_data(
+            song_page=page,
+            song_sort=sort_by,
+            song_query=query,
+        )
         back_cb = await resolve_back_callback(
             state,
             msg,
             "songs:list",
             default_back="menu:home",
         )
-        text = format_screen(
-            title=f"🎵 Music Library Browser ({len(tracks)} track(s))",
-            context_lines=["Tap a song below or type a song title, artist, or album to search."],
-            footer_lines=["<i>🧭 Home › Songs</i>"],
+        card_text = format_songs_browser_card(
+            total_tracks=total_count,
+            page=page,
+            total_pages=total_pages,
+            sort_by=sort_by,
+            query=query,
+            tracks_count=len(tracks),
         )
         await safe_edit_text(
             msg,
-            text,
+            card_text,
             reply_markup=build_songs_search_menu_keyboard(
                 tracks,
+                page=page,
+                total_pages=total_pages,
+                total_count=total_count,
+                sort_by=sort_by,
+                query=query,
                 can_rescan=True,
+                is_filtered=False,
+                back_callback=back_cb,
+            ),
+        )
+        return
+
+    if action == "sort_menu":
+        await ack_callback(callback)
+        fsm_data = await state.get_data()
+        current_sort = str(fsm_data.get("song_sort") or "recent")
+        sort_screen = format_screen(
+            title="🔀 Sort Music Library",
+            context_lines=[
+                f"• Current Sort: <b>{html.escape(SORT_DESCRIPTIONS.get(current_sort, current_sort))}</b>",
+                "• Choose how library tracks should be ordered below:",
+            ],
+            footer_lines=["<i>🧭 Home › Songs › Sort</i>"],
+        )
+        await safe_edit_text(
+            msg,
+            sort_screen,
+            reply_markup=build_songs_sort_keyboard(current_sort),
+        )
+        return
+
+    if action == "clear_search":
+        await ack_callback(callback, "Search filter cleared.")
+        fsm_data = await state.get_data()
+        sort_by = str(fsm_data.get("song_sort") or "recent")
+        page = 1
+        query = ""
+
+        total_count = await governance_repository.count_library_tracks()
+        total_pages = max(1, math.ceil(total_count / SONGS_PAGE_SIZE))
+        tracks = await governance_repository.list_library_tracks(
+            limit=SONGS_PAGE_SIZE,
+            offset=0,
+            sort_by=sort_by,
+        )
+        await _reset_to_search_state(state)
+        await state.update_data(
+            song_page=page,
+            song_sort=sort_by,
+            song_query=query,
+        )
+        back_cb = await resolve_back_callback(
+            state,
+            msg,
+            "songs:list",
+            default_back="menu:home",
+        )
+        card_text = format_songs_browser_card(
+            total_tracks=total_count,
+            page=page,
+            total_pages=total_pages,
+            sort_by=sort_by,
+            query=query,
+            tracks_count=len(tracks),
+        )
+        await safe_edit_text(
+            msg,
+            card_text,
+            reply_markup=build_songs_search_menu_keyboard(
+                tracks,
+                page=page,
+                total_pages=total_pages,
+                total_count=total_count,
+                sort_by=sort_by,
+                query=query,
+                can_rescan=True,
+                is_filtered=False,
                 back_callback=back_cb,
             ),
         )
@@ -1007,11 +1403,18 @@ async def handle_songs_callback(
                 "songs:list",
                 default_back="menu:home",
             )
+            total_count = len(existing)
+            total_pages = max(1, math.ceil(total_count / SONGS_PAGE_SIZE))
+            page_tracks = existing[:SONGS_PAGE_SIZE]
             await safe_edit_text(
                 msg,
                 format_rescan_dry_run_card(report, applied=True),
                 reply_markup=build_songs_search_menu_keyboard(
-                    existing[:12],
+                    page_tracks,
+                    page=1,
+                    total_pages=total_pages,
+                    total_count=total_count,
+                    sort_by="recent",
                     can_rescan=True,
                     back_callback=back_cb,
                 ),
@@ -1045,8 +1448,15 @@ async def handle_songs_callback(
                 },
             )
         )
-        updated_list = await governance_repository.list_library_tracks(limit=15)
+        total_count = await governance_repository.count_library_tracks()
+        total_pages = max(1, math.ceil(total_count / SONGS_PAGE_SIZE))
+        updated_list = await governance_repository.list_library_tracks(
+            limit=SONGS_PAGE_SIZE,
+            offset=0,
+            sort_by="recent",
+        )
         await _reset_to_search_state(state)
+        await state.update_data(song_page=1, song_sort="recent", song_query="")
         back_cb = await resolve_back_callback(
             state,
             msg,
@@ -1058,6 +1468,10 @@ async def handle_songs_callback(
             format_rescan_dry_run_card(report, applied=True),
             reply_markup=build_songs_search_menu_keyboard(
                 updated_list,
+                page=1,
+                total_pages=total_pages,
+                total_count=total_count,
+                sort_by="recent",
                 can_rescan=True,
                 back_callback=back_cb,
             ),

@@ -29,6 +29,38 @@ class SongsFieldCallback(CallbackData, prefix="songs"):
     field: str
 
 
+class SongsPageCallback(CallbackData, prefix="songsp"):
+    """Callback schema for library browser pagination (`songsp:<action>:<page>:<sort>`)."""
+
+    action: str
+    page: int
+    sort: str = "recent"
+
+
+class SongsSortCallback(CallbackData, prefix="songss"):
+    """Callback schema for library browser sorting selection (`songss:<action>:<sort>`)."""
+
+    action: str = "s"
+    sort: str
+
+
+SORT_LABELS: dict[str, str] = {
+    "recent": "🕒 Recent",
+    "artist": "🎤 Artist",
+    "title": "🔤 Title",
+    "album": "💿 Album",
+    "year": "📅 Year",
+}
+
+SORT_DESCRIPTIONS: dict[str, str] = {
+    "recent": "🕒 Recently Added (Newest First)",
+    "artist": "🎤 Artist (A–Z)",
+    "title": "🔤 Title (A–Z)",
+    "album": "💿 Album (A–Z)",
+    "year": "📅 Release Year (Newest First)",
+}
+
+
 def _short_id(track_id: str) -> str:
     """Return a 12-character track ID prefix so Telegram callback data stays well under 64 bytes."""
     return track_id.strip()[:12]
@@ -37,13 +69,18 @@ def _short_id(track_id: str) -> str:
 def build_songs_search_menu_keyboard(
     tracks: list[LibraryTrackRecord],
     *,
+    page: int = 1,
+    total_pages: int = 1,
+    total_count: int = 0,
+    sort_by: str = "recent",
+    query: str = "",
     can_rescan: bool = True,
     is_filtered: bool = False,
     back_callback: str | None = None,
 ) -> InlineKeyboardMarkup:
     """Build the `/songs` library browser (Level 1) or filtered search results keyboard (Level 2)."""
     builder = InlineKeyboardBuilder()
-    for rec in tracks[:12]:
+    for rec in tracks:
         sid = _short_id(rec.id)
         year_part = f" ({rec.year})" if rec.year else ""
         label = f"🎵 {rec.artist} - {rec.title} | {rec.album}{year_part}"
@@ -56,6 +93,36 @@ def build_songs_search_menu_keyboard(
             )
         )
 
+    # Pagination navigation controls
+    if total_pages > 1:
+        prev_data = (
+            SongsPageCallback(action="p", page=max(1, page - 1), sort=sort_by).pack()
+            if page > 1
+            else SongsPageCallback(action="noop_first", page=page, sort=sort_by).pack()
+        )
+        next_data = (
+            SongsPageCallback(action="p", page=min(total_pages, page + 1), sort=sort_by).pack()
+            if page < total_pages
+            else SongsPageCallback(action="noop_last", page=page, sort=sort_by).pack()
+        )
+        info_data = SongsPageCallback(action="noop_info", page=page, sort=sort_by).pack()
+
+        builder.row(
+            InlineKeyboardButton(text="◀ Prev" if page > 1 else "◀", callback_data=prev_data),
+            InlineKeyboardButton(text=f"📄 {page} / {total_pages}", callback_data=info_data),
+            InlineKeyboardButton(text="Next ▶" if page < total_pages else "▶", callback_data=next_data),
+        )
+
+    # Sort selector button
+    current_sort_label = SORT_LABELS.get(sort_by, "Recent")
+    builder.row(
+        InlineKeyboardButton(
+            text=f"🔀 Sort: {current_sort_label} ▾",
+            callback_data=SongsMenuCallback(action="sort_menu").pack(),
+        )
+    )
+
+    # Action row: Search & Export
     builder.row(
         InlineKeyboardButton(
             text="🔎 Search Library",
@@ -66,6 +133,17 @@ def build_songs_search_menu_keyboard(
             callback_data=SongsMenuCallback(action="export_all").pack(),
         ),
     )
+
+    # If filtered, offer a clear search button
+    if is_filtered:
+        truncated_q = f"'{query[:18]}...'" if len(query) > 18 else f"'{query}'"
+        filter_label = f"❌ Clear Search ({truncated_q})" if query else "❌ Clear Search Filter"
+        builder.row(
+            InlineKeyboardButton(
+                text=filter_label,
+                callback_data=SongsMenuCallback(action="clear_search").pack(),
+            )
+        )
 
     if can_rescan:
         builder.row(
@@ -88,6 +166,25 @@ def build_songs_search_menu_keyboard(
             back_callback=effective_back,
             include_home=effective_back != MenuCallback(action="home").pack(),
         )
+    return builder.as_markup()
+
+
+def build_songs_sort_keyboard(current_sort: str = "recent") -> InlineKeyboardMarkup:
+    """Build the sort order selection keyboard for the library browser."""
+    builder = InlineKeyboardBuilder()
+    for sort_key, desc in SORT_DESCRIPTIONS.items():
+        prefix = "✅ " if sort_key == current_sort else ""
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{prefix}{desc}",
+                callback_data=SongsSortCallback(action="s", sort=sort_key).pack(),
+            )
+        )
+    append_escape_row(
+        builder,
+        back_callback=SongsMenuCallback(action="list").pack(),
+        include_home=True,
+    )
     return builder.as_markup()
 
 

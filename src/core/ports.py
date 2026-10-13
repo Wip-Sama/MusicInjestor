@@ -151,16 +151,27 @@ class GovernanceRepositoryPort(Protocol):
         """Retrieve an ingested library track by its ID (or prefix)."""
         ...
 
-    async def list_library_tracks(self, limit: int = 20) -> list[LibraryTrackRecord]:
-        """List recent ingested library tracks ordered newest-first."""
+    async def list_library_tracks(
+        self,
+        limit: int = 20,
+        offset: int = 0,
+        sort_by: str = "recent",
+    ) -> list[LibraryTrackRecord]:
+        """List ingested library tracks with pagination and sorting."""
         ...
 
     async def search_library_tracks(
         self,
         query: str,
         limit: int = 20,
+        offset: int = 0,
+        sort_by: str = "recent",
     ) -> list[LibraryTrackRecord]:
-        """Search library tracks by title, artist, or album substring."""
+        """Search library tracks by title, artist, or album substring with pagination and sorting."""
+        ...
+
+    async def count_library_tracks(self, query: str = "") -> int:
+        """Return the total number of library tracks matching query (or all tracks if query is empty)."""
         ...
 
     async def list_album_tracks(

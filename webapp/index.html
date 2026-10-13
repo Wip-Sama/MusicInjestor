@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <title>Music Ingestion Mini App</title>
+    <!-- Native Telegram WebApp Bridge script -->
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+      :root {
+        --tg-viewport-height: 100vh;
+        --tg-theme-bg-color: #1c1c1e;
+        --tg-theme-secondary-bg-color: #2c2c2e;
+        --tg-theme-section-bg-color: #2c2c2e;
+        --tg-theme-header-bg-color: #1c1c1e;
+        --tg-theme-text-color: #f2f2f7;
+        --tg-theme-subtitle-text-color: #8e8e93;
+        --tg-theme-accent-text-color: #0a84ff;
+        --tg-theme-button-color: #0a84ff;
+        --tg-theme-button-text-color: #ffffff;
+        --tg-theme-section-separator-color: #38383a;
+      }
+
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+        background-color: var(--tg-theme-bg-color, #1c1c1e);
+        color: var(--tg-theme-text-color, #f2f2f7);
+        min-height: var(--tg-viewport-height, 100vh);
+        width: 100%;
+        overflow-x: hidden;
+        -webkit-font-smoothing: antialiased;
+        padding-top: calc(var(--tg-safe-area-inset-top, 0px) + var(--tg-content-safe-area-inset-top, 0px));
+        padding-bottom: var(--tg-safe-area-inset-bottom, 0px);
+        padding-left: var(--tg-safe-area-inset-left, 0px);
+        padding-right: var(--tg-safe-area-inset-right, 0px);
+      }
+
+      #root {
+        min-height: 100%;
+        display: flex;
+        flex-direction: column;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

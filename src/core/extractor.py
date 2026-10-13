@@ -1,6 +1,7 @@
 """Archive unpacking and single-file scratch staging service."""
 
 import asyncio
+import contextlib
 import logging
 import shutil
 import tarfile
@@ -83,16 +84,26 @@ class SevenZipArchiveExtractor:
         if suffix in SUPPORTED_AUDIO_EXTENSIONS:
             staged_path = job_dir / source_path.name
             await asyncio.to_thread(shutil.copy2, source_path, staged_path)
+            with contextlib.suppress(OSError):
+                staged_path.chmod(0o644)
             sibling_cover = find_best_cover_image(source_path.parent, recursive=False)
             if sibling_cover is not None:
                 staged_cover = job_dir / "cover.jpg"
                 if not staged_cover.exists():
                     await asyncio.to_thread(shutil.copy2, sibling_cover, staged_cover)
+                    with contextlib.suppress(OSError):
+                        staged_cover.chmod(0o644)
             logger.info("Staged single audio track for job %s at %s", job_id, staged_path)
             return [staged_path]
 
         if suffix in SUPPORTED_ARCHIVE_EXTENSIONS:
             await self._run_7z_extract(source_path, job_dir)
+            for p in job_dir.rglob("*"):
+                with contextlib.suppress(OSError):
+                    if p.is_file():
+                        p.chmod(0o644)
+                    elif p.is_dir():
+                        p.chmod(0o755)
             discovered = sorted(
                 path
                 for path in job_dir.rglob("*")
@@ -108,6 +119,8 @@ class SevenZipArchiveExtractor:
                 target_cover = audio_dir / "cover.jpg"
                 if not target_cover.exists() and best_image.resolve() != target_cover.resolve():
                     await asyncio.to_thread(shutil.copy2, best_image, target_cover)
+                    with contextlib.suppress(OSError):
+                        target_cover.chmod(0o644)
 
             logger.info(
                 "Extracted %d audio file(s) for job %s into %s",

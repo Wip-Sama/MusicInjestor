@@ -17,12 +17,15 @@ def test_default_settings_and_url_normalization() -> None:
         oidc_authorize_url="https://auth.example.com/application/o/authorize/",
         oidc_token_url="https://auth.example.com/application/o/token/",
         oidc_userinfo_url="https://auth.example.com/application/o/userinfo/",
+        web_app_url="https://music.example.com/",
     )
     assert settings.telegram_local_api_url == "http://localhost:8081"
     assert settings.lrclib_base_url == "https://lrclib.net/api"
     assert settings.oidc_authorize_url == "https://auth.example.com/application/o/authorize"
     assert settings.oidc_token_url == "https://auth.example.com/application/o/token"
     assert settings.oidc_userinfo_url == "https://auth.example.com/application/o/userinfo"
+    assert settings.web_app_url == "https://music.example.com"
+    assert settings.web_app_enabled is True
 
 
 def test_invalid_confidence_and_concurrency_raise_validation_error() -> None:
