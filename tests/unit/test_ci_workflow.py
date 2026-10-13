@@ -50,6 +50,8 @@ def test_github_actions_ci_workflow_structure() -> None:
     docker_job = jobs["docker-build-publish"]
     assert "quality-and-test" in docker_job.get("needs", [])
     docker_steps = docker_job["steps"]
+    run_list = [str(step.get("run", "")) for step in docker_steps]
+    assert any("IMAGE_NAME=${GITHUB_REPOSITORY,,}" in r for r in run_list)
     uses_list = [str(step.get("uses", "")) for step in docker_steps]
     assert any(u.startswith("docker/login-action@") for u in uses_list)
     assert any(u.startswith("docker/metadata-action@") for u in uses_list)
@@ -70,10 +72,11 @@ def test_docker_compose_and_env_support_ghcr_image_pull_and_local_build() -> Non
         compose_data = _load_yaml(PROJECT_ROOT / compose_name)
         bot_service = compose_data["services"]["music-ingest-bot"]
         assert "MUSIC_BOT_IMAGE" in str(bot_service.get("image", ""))
+        assert "ghcr.io/wip-sama/musicinjestor:latest" in str(bot_service.get("image", ""))
         assert "build" in bot_service
 
     env_example = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
-    assert "MUSIC_BOT_IMAGE=ghcr.io/" in env_example
+    assert "MUSIC_BOT_IMAGE=ghcr.io/wip-sama/musicinjestor:latest" in env_example
 
     dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert 'PATH="/app/.venv/bin:${PATH}"' in dockerfile

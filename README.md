@@ -59,7 +59,7 @@ RUN_WSL_DOCKER_TESTS=1 uv run pytest -m docker
 Set `HOST_MUSIC_DIR` in `.env` (e.g., `HOST_MUSIC_DIR=/mnt/nas/music` or `HOST_MUSIC_DIR=D:/Music`) so your external music folder is bind-mounted to `/mnt/music/library` inside the container (see [`docker-compose.example.yaml`](file:///d:/Programming/musicDownloader/docker-compose.example.yaml) and [`config.example.yaml`](file:///d:/Programming/musicDownloader/config.example.yaml)).
 
 - **Option A — Pull Pre-Built Image from GitHub Container Registry (GHCR):**
-  Set `MUSIC_BOT_IMAGE=ghcr.io/<github-owner>/<repo-name>:latest` in `.env`, then run:
+  Set `MUSIC_BOT_IMAGE=ghcr.io/wip-sama/musicinjestor:latest` in `.env`, then run:
   ```bash
   docker compose pull
   docker compose up -d
@@ -75,7 +75,7 @@ docker compose --profile test run --rm test
 ```
 
 ### 5. GitHub Actions CI/CD & Local `act` Testing
-The workflow in [`.github/workflows/ci.yml`](file:///d:/Programming/musicDownloader/.github/workflows/ci.yml) runs `ruff`, `ty`, and `pytest`, then builds and publishes the Docker image to `ghcr.io/<owner>/<repo>` on pushes to `main`/`master` or `v*` version tags.
+The workflow in [`.github/workflows/ci.yml`](file:///d:/Programming/musicDownloader/.github/workflows/ci.yml) runs `ruff`, `ty`, and `pytest`, then builds and publishes the Docker image to `ghcr.io/wip-sama/musicinjestor` on pushes to `main`/`master` or `v*` version tags.
 
 With [`act`](https://github.com/nektos/act) installed (pre-configured via [`.actrc`](file:///d:/Programming/musicDownloader/.actrc) to use `catthehacker/ubuntu:act-latest`), you can test the GitHub Actions jobs locally:
 ```bash

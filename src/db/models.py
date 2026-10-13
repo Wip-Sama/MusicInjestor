@@ -70,7 +70,13 @@ CREATE TABLE IF NOT EXISTS library_tracks (
     year INTEGER,
     track_number INTEGER,
     has_synced_lyrics INTEGER DEFAULT 0,
-    ingested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ingested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP,
+    modified_by INTEGER,
+    modification_count INTEGER NOT NULL DEFAULT 0,
+    telegram_file_id TEXT,
+    source_chat_id INTEGER,
+    source_message_id INTEGER
 );
 """
 
@@ -180,4 +186,13 @@ INGESTION_JOBS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("matched_release_mbid", "TEXT"),
     ("started_at", "TEXT"),
     ("completed_at", "TEXT"),
+)
+
+LIBRARY_TRACKS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("updated_at", "TIMESTAMP"),
+    ("modified_by", "INTEGER"),
+    ("modification_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("telegram_file_id", "TEXT"),
+    ("source_chat_id", "INTEGER"),
+    ("source_message_id", "INTEGER"),
 )

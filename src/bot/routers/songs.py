@@ -1,12 +1,14 @@
 """Interactive `/songs` & `/rescan` router for searching, editing, exporting, and reconciling tracks."""
 
 import html
+import inspect
 import json
 import logging
 from pathlib import Path
 
 import httpx
 from aiogram import F, Router
+from aiogram.enums import ChatAction
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message
@@ -15,6 +17,7 @@ from src.bot.api_server import resolve_local_api_file_path
 from src.bot.keyboards.admin import (
     BTN_MAIN_SONGS,
     RESERVED_MENU_BUTTONS,
+    build_queued_job_keyboard,
 )
 from src.bot.keyboards.songs import (
     build_dry_run_confirmation_keyboard,
@@ -22,11 +25,22 @@ from src.bot.keyboards.songs import (
     build_metadata_field_keyboard,
     build_rescan_confirmation_keyboard,
     build_research_mode_keyboard,
+    build_search_prompt_keyboard,
     build_song_action_keyboard,
+    build_song_history_keyboard,
     build_songs_search_menu_keyboard,
 )
 from src.bot.states import SongManagementStates
+from src.bot.ui import (
+    ack_callback,
+    format_loading_card,
+    format_screen,
+    resolve_back_callback,
+    safe_edit_text,
+    send_chat_action_safe,
+)
 from src.config.settings import AppSettings
+from src.core.audit import format_job_inspector_card
 from src.core.extractor import SUPPORTED_ARCHIVE_EXTENSIONS, SUPPORTED_AUDIO_EXTENSIONS
 from src.core.lyrics import LrclibLyricsClient
 from src.core.metadata import (
@@ -46,7 +60,7 @@ from src.core.models import (
 )
 from src.core.organizer import LibraryOrganizer
 from src.core.pipeline import IngestionPipeline
-from src.core.ports import GovernanceRepositoryPort
+from src.core.ports import CatalogRepositoryPort, GovernanceRepositoryPort
 from src.core.rbac import has_permission
 
 logger = logging.getLogger(__name__)
@@ -166,13 +180,47 @@ def _can_access_songs(user: UserAccount | None) -> bool:
     return has_permission(user, Permission.SUBMIT_INGESTION)
 
 
+async def _resolve_song_provenance_labels(
+    record: LibraryTrackRecord,
+    governance_repository: GovernanceRepositoryPort,
+    catalog_repository: CatalogRepositoryPort | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve human-readable `@username (id)` labels for `uploaded_by` and `modified_by`."""
+    uploader_id = record.uploaded_by
+    if uploader_id <= 0 and record.job_id and catalog_repository is not None:
+        job = await catalog_repository.get_job(record.job_id)
+        if job is not None and job.user_id:
+            uploader_id = job.user_id
+
+    uploader_label: str | None = None
+    if uploader_id > 0:
+        user_obj = await governance_repository.get_user(uploader_id)
+        if user_obj is not None:
+            uploader_label = f"{user_obj.mention_handle} ({user_obj.telegram_id})"
+        else:
+            uploader_label = f"User {uploader_id}"
+
+    modifier_label: str | None = None
+    if record.modified_by and record.modified_by > 0:
+        mod_obj = await governance_repository.get_user(record.modified_by)
+        if mod_obj is not None:
+            modifier_label = f"{mod_obj.mention_handle} ({mod_obj.telegram_id})"
+        else:
+            modifier_label = f"User {record.modified_by}"
+
+    return uploader_label, modifier_label
+
+
 def format_song_detail_card(
     record: LibraryTrackRecord,
     *,
     has_lrc_file: bool,
     has_cover_file: bool,
+    changes_applied: bool = False,
+    uploader_label: str | None = None,
+    modifier_label: str | None = None,
 ) -> str:
-    """Render an HTML summary card for a selected library song."""
+    """Render a 3-tier HTML summary card for a library song with provenance and edit history."""
     year_str = str(record.year) if record.year else "Unknown"
     trk_str = f"{record.track_number:02d}" if record.track_number else "01"
     mins, secs = divmod(int(round(record.duration_seconds)), 60)
@@ -185,18 +233,110 @@ def format_song_detail_card(
         lyrics_badge = "❌ Missing"
     cover_badge = "✅ cover.jpg present" if has_cover_file else "❌ Missing"
 
-    return (
-        "🎵 <b>Song Details &amp; Actions</b>\n"
-        "────────────────────────\n"
-        f"• <b>ID:</b> <code>{html.escape(record.id[:12])}</code>\n"
-        f"• <b>Title:</b> {html.escape(record.title)}\n"
-        f"• <b>Artist:</b> {html.escape(record.artist)}\n"
-        f"• <b>Album:</b> {html.escape(record.album)} ({year_str})\n"
-        f"• <b>Track #:</b> {trk_str} • <b>Duration:</b> {dur_str}\n"
-        f"• <b>Lyrics:</b> {lyrics_badge}\n"
-        f"• <b>Cover Art:</b> {cover_badge}\n"
-        f"• <b>Path:</b> <code>{html.escape(str(record.storage_path))}</code>\n\n"
-        "Select an action below:"
+    resolved_uploader = (
+        uploader_label
+        if uploader_label
+        else (f"User {record.uploaded_by}" if record.uploaded_by > 0 else "Library Rescan / System")
+    )
+    ingested_ts = record.ingested_at.strftime("%Y-%m-%d %H:%M UTC")
+    if record.modification_count > 0 or record.updated_at is not None:
+        mod_count = max(1, record.modification_count)
+        resolved_modifier = (
+            modifier_label
+            if modifier_label
+            else (f"User {record.modified_by}" if record.modified_by else "Editor")
+        )
+        updated_ts = (
+            record.updated_at.strftime("%Y-%m-%d %H:%M UTC") if record.updated_at is not None else "Recently"
+        )
+        mod_line = (
+            f"• Modified: <code>{mod_count} time(s)</code> • "
+            f"Last by <code>{html.escape(resolved_modifier)}</code> on <code>{updated_ts}</code>"
+        )
+    else:
+        mod_line = "• Modified: <code>Never (0 edits)</code>"
+
+    title = (
+        "✅ Changes Applied Successfully — Song Details &amp; Actions"
+        if changes_applied
+        else "🎵 Song Details &amp; Actions"
+    )
+    return format_screen(
+        title=title,
+        context_lines=[
+            f"• Title: <code>{html.escape(record.title)}</code>",
+            f"• Artist: <code>{html.escape(record.artist)}</code>",
+            f"• Album: <code>{html.escape(record.album)}</code> (<code>{year_str}</code>)",
+            f"• Track #: <code>{trk_str}</code> • Duration: <code>{dur_str}</code>",
+            f"• Lyrics: {lyrics_badge}",
+            f"• Cover Art: {cover_badge}",
+            f"• Added By: <code>{html.escape(resolved_uploader)}</code> on <code>{ingested_ts}</code>",
+            mod_line,
+            f"• Path: <code>{html.escape(str(record.storage_path))}</code>",
+        ],
+        footer_lines=[
+            f"<i>Track ID:</i> <code>{html.escape(record.id[:12])}</code> • <i>🧭 Home › Songs › Details</i>"
+        ],
+    )
+
+
+def format_song_history_card(
+    record: LibraryTrackRecord,
+    entries: list[AuditLogEntry],
+    actor_labels: dict[int, str],
+    uploader_label: str | None = None,
+) -> str:
+    """Render a chronological provenance and modification history card for a song."""
+    resolved_uploader = (
+        uploader_label
+        if uploader_label
+        else (f"User {record.uploaded_by}" if record.uploaded_by > 0 else "Library Rescan / System")
+    )
+    ingested_ts = record.ingested_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+    context_lines: list[str] = [
+        f"• Song: <b>{html.escape(record.artist)} — {html.escape(record.title)}</b>",
+        f"• Added By: <code>{html.escape(resolved_uploader)}</code>",
+        f"• Added Date: <code>{ingested_ts}</code>",
+        f"• Total Modifications: <code>{record.modification_count}</code>",
+    ]
+    if record.updated_at is not None:
+        mod_actor = actor_labels.get(record.modified_by or 0) or (
+            f"User {record.modified_by}" if record.modified_by else "Editor"
+        )
+        context_lines.append(
+            f"• Last Modified: <code>{record.updated_at.strftime('%Y-%m-%d %H:%M:%S UTC')}</code> "
+            f"by <code>{html.escape(mod_actor)}</code>"
+        )
+    if record.job_id:
+        context_lines.append(f"• Source Job ID: <code>{html.escape(record.job_id)}</code>")
+
+    if entries:
+        context_lines.append("📜 Chronological Event Log (Newest First):")
+        for entry in entries[:15]:
+            ts = entry.created_at.strftime("%Y-%m-%d %H:%M UTC")
+            actor_str = actor_labels.get(entry.actor_id, f"User {entry.actor_id}")
+            action_str = str(getattr(entry.action, "value", entry.action))
+            detail_parts: list[str] = []
+            if entry.details:
+                for k in ("action_type", "title", "artist", "album", "year"):
+                    if k in entry.details and entry.details[k] is not None:
+                        detail_parts.append(f"{k}={entry.details[k]}")
+            detail_suffix = f" ({html.escape(', '.join(detail_parts))})" if detail_parts else ""
+            context_lines.append(
+                f"  • <code>[{ts}]</code> <b>{html.escape(action_str)}</b> "
+                f"by <code>{html.escape(actor_str)}</code>{detail_suffix}"
+            )
+    else:
+        context_lines.append("• No subsequent edit log entries recorded yet.")
+
+    return format_screen(
+        title="📜 Song Provenance &amp; Edit History",
+        context_lines=context_lines,
+        footer_lines=[
+            f"<i>Track ID:</i> <code>{html.escape(record.id[:12])}</code> • "
+            "<i>🧭 Home › Songs › Details › History</i>"
+        ],
+        expandable=len(entries) > 3,
     )
 
 
@@ -205,7 +345,7 @@ def format_song_edit_dry_run_card(
     proposal: dict[str, object],
     organizer: LibraryOrganizer,
 ) -> str:
-    """Render a Dry-Run Preview Report comparing current song state against `proposal`."""
+    """Render a 3-tier HTML Dry-Run Preview Report comparing current song state against `proposal`."""
     action_type = str(proposal.get("action_type") or "metadata").upper()
     new_title = str(proposal.get("new_title") or record.title)
     new_artist = str(proposal.get("new_artist") or record.artist)
@@ -229,104 +369,108 @@ def format_song_edit_dry_run_card(
     suffix = record.storage_path.suffix or ".flac"
     new_path = organizer.build_target_audio_path(target_meta, suffix)
 
-    lines: list[str] = [
-        f"🧪 <b>Dry-Run Preview ({html.escape(action_type)})</b>",
-        "────────────────────────",
+    context_lines: list[str] = [
         "Please review what is going to change before applying:",
-        "",
     ]
 
     def _diff_line(label: str, old_val: object, new_val: object) -> str:
         old_s = html.escape(str(old_val if old_val is not None else "None"))
         new_s = html.escape(str(new_val if new_val is not None else "None"))
         if old_s != new_s:
-            return f"• <b>{label}:</b> <s>{old_s}</s> ➡️ <b>{new_s}</b>"
-        return f"• <b>{label}:</b> {old_s} <i>(unchanged)</i>"
+            return f"• {label}: <s>{old_s}</s> ➡️ <code>{new_s}</code>"
+        return f"• {label}: <code>{old_s}</code> <i>(unchanged)</i>"
 
-    lines.append(_diff_line("Title", record.title, new_title))
-    lines.append(_diff_line("Artist", record.artist, new_artist))
-    lines.append(_diff_line("Album", record.album, new_album))
-    lines.append(_diff_line("Year", record.year, new_year))
-    lines.append(_diff_line("Track #", record.track_number or 1, new_trk))
+    context_lines.append(_diff_line("Title", record.title, new_title))
+    context_lines.append(_diff_line("Artist", record.artist, new_artist))
+    context_lines.append(_diff_line("Album", record.album, new_album))
+    context_lines.append(_diff_line("Year", record.year, new_year))
+    context_lines.append(_diff_line("Track #", record.track_number or 1, new_trk))
 
     old_path_str = str(record.storage_path)
     new_path_str = str(new_path)
     if old_path_str.replace("\\", "/").lower() != new_path_str.replace("\\", "/").lower():
-        lines.append(
-            f"• <b>File Location:</b>\n"
+        context_lines.append(
+            f"• File Location:\n"
             f"  <code>{html.escape(old_path_str)}</code>\n"
             f"  ➡️ <code>{html.escape(new_path_str)}</code>"
         )
     else:
-        lines.append(f"• <b>File Location:</b> <code>{html.escape(old_path_str)}</code> <i>(in-place)</i>")
+        context_lines.append(f"• File Location: <code>{html.escape(old_path_str)}</code> <i>(in-place)</i>")
 
     new_lyrics = proposal.get("new_lyrics")
     if isinstance(new_lyrics, str) and new_lyrics.strip():
         line_count = len(new_lyrics.strip().splitlines())
         is_synced = "[" in new_lyrics and "]" in new_lyrics
         kind = "Synced LRC" if is_synced else "Plain Text"
-        lines.append(
-            f"• <b>Lyrics:</b> ➡️ <b>Update ({kind}, {line_count} lines)</b> "
-            "(embedded in audio + <code>.lrc</code> sidecar)"
+        context_lines.append(
+            f"• Lyrics: ➡️ Update (<code>{kind}, {line_count} lines</code> — "
+            "embedded in audio + <code>.lrc</code> sidecar)"
         )
 
     cover_size = proposal.get("new_cover_size")
     if cover_size is not None:
         kb = max(1, int(str(cover_size)) // 1024)
-        lines.append(
-            f"• <b>Cover Art:</b> ➡️ <b>Update <code>cover.jpg</code> &amp; embedded picture ({kb} KB)</b>"
+        context_lines.append(
+            f"• Cover Art: ➡️ Update <code>cover.jpg</code> &amp; embedded picture (<code>{kb} KB</code>)"
         )
 
-    lines.append("\nTap <b>Confirm &amp; Apply Changes</b> to execute or <b>Edit Again</b> to adjust.")
-    return "\n".join(lines)
+    return format_screen(
+        title=f"🧪 Dry-Run Preview ({html.escape(action_type)})",
+        context_lines=context_lines,
+        footer_lines=[
+            f"<i>Track ID:</i> <code>{html.escape(record.id[:12])}</code> • "
+            "<i>Confirm &amp; Apply Changes or Edit Again below</i>"
+        ],
+    )
 
 
 def format_rescan_dry_run_card(report: LibraryRescanReport, applied: bool = False) -> str:
-    """Render a summary or Dry-Run Preview Report for a `storage/library` filesystem scan."""
-    header = (
-        "✅ <b>Library Rescan &amp; Sync Complete</b>"
-        if applied
-        else "🧪 <b>Library Rescan Dry-Run Preview</b>"
-    )
-    lines: list[str] = [
-        header,
-        "────────────────────────",
-        f"• <b>Unchanged Tracks:</b> {report.unchanged_count}",
-        f"• <b>Added on Disk:</b> {len(report.added_tracks)}",
-        f"• <b>Modified / Moved on Disk:</b> {len(report.updated_tracks)}",
-        f"• <b>Removed from Disk:</b> {len(report.removed_tracks)}",
+    """Render a 3-tier HTML summary or Dry-Run Preview Report for a `storage/library` filesystem scan."""
+    title = "✅ Library Rescan &amp; Sync Complete" if applied else "🧪 Library Rescan Dry-Run Preview"
+    context_lines: list[str] = [
+        f"• Unchanged Tracks: <code>{report.unchanged_count}</code>",
+        f"• Added on Disk: <code>{len(report.added_tracks)}</code>",
+        f"• Modified / Moved on Disk: <code>{len(report.updated_tracks)}</code>",
+        f"• Removed from Disk: <code>{len(report.removed_tracks)}</code>",
     ]
 
     if report.added_tracks:
-        lines.append("\n<b>➕ Added Tracks:</b>")
+        context_lines.append("➕ Added Tracks:")
         for rec in report.added_tracks[:8]:
-            lines.append(
+            context_lines.append(
                 f"  • {html.escape(rec.artist)} - {html.escape(rec.title)} "
                 f"(<code>{html.escape(rec.storage_path.name)}</code>)"
             )
 
     if report.updated_tracks:
-        lines.append("\n<b>🔄 Modified / Moved Tracks:</b>")
+        context_lines.append("🔄 Modified / Moved Tracks:")
         for rec in report.updated_tracks[:8]:
-            lines.append(
+            context_lines.append(
                 f"  • {html.escape(rec.artist)} - {html.escape(rec.title)} "
                 f"➡️ <code>{html.escape(str(rec.storage_path))}</code>"
             )
 
     if report.removed_tracks:
-        lines.append("\n<b>🗑️ Missing Files (Will Remove from DB):</b>")
+        context_lines.append("🗑️ Missing Files (Will Remove from DB):")
         for rec in report.removed_tracks[:8]:
-            lines.append(
+            context_lines.append(
                 f"  • {html.escape(rec.artist)} - {html.escape(rec.title)} "
                 f"(<code>{html.escape(str(rec.storage_path))}</code>)"
             )
 
     if not applied and report.has_changes:
-        lines.append("\nConfirm below to synchronize the SQLite database with the filesystem:")
+        footers = ["<i>Confirm below to synchronize the SQLite database with the filesystem.</i>"]
     elif not report.has_changes:
-        lines.append("\n✨ <i>Filesystem and SQLite database are completely in sync.</i>")
+        footers = ["<i>✨ Filesystem and SQLite database are completely in sync.</i>"]
+    else:
+        footers = ["<i>🧭 Home › Songs › Rescan</i>"]
 
-    return "\n".join(lines)
+    return format_screen(
+        title=title,
+        context_lines=context_lines,
+        footer_lines=footers,
+        expandable=bool(report.added_tracks or report.updated_tracks or report.removed_tracks),
+    )
 
 
 def _parse_metadata_edit_input(
@@ -412,10 +556,22 @@ async def handle_songs_command(
 ) -> None:
     """Open the interactive `/songs` search & library management menu."""
     if not _can_access_songs(current_user):
-        await message.answer("⛔ You do not have permission to browse or edit the music library.")
+        await message.answer(
+            format_screen(
+                title="⛔ Permission Denied",
+                context_lines=["You do not have permission to browse or edit the music library."],
+                footer_lines=["<i>🧭 Home › Songs</i>"],
+            )
+        )
         return
     if governance_repository is None:
-        await message.answer("⚠️ Library repository is not configured.")
+        await message.answer(
+            format_screen(
+                title="⚠️ Library Unavailable",
+                context_lines=["Library repository is not configured."],
+                footer_lines=["<i>🧭 Home › Songs</i>"],
+            )
+        )
         return
 
     raw_text = (message.text or "").strip()
@@ -431,22 +587,35 @@ async def handle_songs_command(
         else await governance_repository.list_library_tracks(limit=15)
     )
     await _reset_to_search_state(state)
-
-    header = (
-        f"🎵 <b>Library Search Results for</b> <code>{html.escape(query)}</code> ({len(tracks)})"
-        if query
-        else f"🎵 <b>Music Library Browser</b> ({len(tracks)} track(s))"
+    back_cb = await resolve_back_callback(
+        state,
+        None,
+        "songs:list",
+        default_back="menu:home",
+        reset_to_home=True,
     )
-    body = (
-        f"{header}\n"
-        "────────────────────────\n"
-        "• Tap a song below to open its management menu "
-        "(download, edit metadata/cover/lyrics, re-search, or export/import).\n"
-        "• Or simply <b>type a song title, artist, or album</b> right now to filter the list:"
+
+    title = (
+        f"🎵 Library Search Results for {html.escape(query)} ({len(tracks)})"
+        if query
+        else f"🎵 Music Library Browser ({len(tracks)} track(s))"
     )
     await message.answer(
-        body,
-        reply_markup=build_songs_search_menu_keyboard(tracks, can_rescan=True),
+        format_screen(
+            title=title,
+            context_lines=[
+                "• Tap a song below to open its management menu "
+                "(download, edit metadata/cover/lyrics, re-search, or export/import).",
+                "• Or type a song title, artist, or album right now to filter the list.",
+            ],
+            footer_lines=["<i>🧭 Home › Songs</i>"],
+        ),
+        reply_markup=build_songs_search_menu_keyboard(
+            tracks,
+            can_rescan=True,
+            is_filtered=bool(query),
+            back_callback=back_cb,
+        ),
     )
 
 
@@ -461,12 +630,25 @@ async def handle_rescan_command(
 ) -> None:
     """Run a dry-run filesystem scan of `storage/library` and prompt to synchronize SQLite."""
     if not _can_access_songs(current_user):
-        await message.answer("⛔ You do not have permission to rescan the library.")
+        await message.answer(
+            format_screen(
+                title="⛔ Permission Denied",
+                context_lines=["You do not have permission to rescan the library."],
+                footer_lines=["<i>🧭 Home › Songs › Rescan</i>"],
+            )
+        )
         return
     if governance_repository is None:
-        await message.answer("⚠️ Library repository is not configured.")
+        await message.answer(
+            format_screen(
+                title="⚠️ Library Unavailable",
+                context_lines=["Library repository is not configured."],
+                footer_lines=["<i>🧭 Home › Songs › Rescan</i>"],
+            )
+        )
         return
 
+    await send_chat_action_safe(message)
     organizer = _resolve_organizer(pipeline, settings)
     existing = await governance_repository.list_library_tracks(limit=10000)
     report = await organizer.scan_library_filesystem(existing)
@@ -486,6 +668,80 @@ async def handle_rescan_command(
     )
 
 
+async def _deliver_track_audio(
+    msg: Message,
+    trk: LibraryTrackRecord,
+    governance_repository: GovernanceRepositoryPort,
+    *,
+    caption: str | None = None,
+) -> None:
+    """Deliver a track's audio via Telegram message forwarding, cached `file_id`, or `FSInputFile` upload."""
+    bot = getattr(msg, "bot", None)
+    chat_id = getattr(getattr(msg, "chat", None), "id", None)
+    if (
+        trk.source_chat_id is not None
+        and trk.source_message_id is not None
+        and bot is not None
+        and isinstance(chat_id, int)
+    ):
+        forward_fn = getattr(bot, "forward_message", None)
+        if callable(forward_fn):
+            try:
+                forwarded = forward_fn(
+                    chat_id=chat_id,
+                    from_chat_id=trk.source_chat_id,
+                    message_id=trk.source_message_id,
+                )
+                if inspect.isawaitable(forwarded):
+                    await forwarded
+                return
+            except Exception as exc:
+                logger.debug("Forwarding track %s failed, falling back to audio send: %s", trk.id, exc)
+
+    if trk.telegram_file_id:
+        try:
+            if caption is not None:
+                await msg.answer_audio(
+                    trk.telegram_file_id,
+                    title=trk.title,
+                    performer=trk.artist,
+                    caption=caption,
+                )
+            else:
+                await msg.answer_audio(
+                    trk.telegram_file_id,
+                    title=trk.title,
+                    performer=trk.artist,
+                )
+            return
+        except Exception as exc:
+            logger.debug("Cached file_id send for %s failed, uploading from disk: %s", trk.id, exc)
+
+    if caption is not None:
+        sent = await msg.answer_audio(
+            FSInputFile(trk.storage_path),
+            title=trk.title,
+            performer=trk.artist,
+            caption=caption,
+        )
+    else:
+        sent = await msg.answer_audio(
+            FSInputFile(trk.storage_path),
+            title=trk.title,
+            performer=trk.artist,
+        )
+    file_id = getattr(getattr(sent, "audio", None), "file_id", None)
+    sent_chat_id = getattr(getattr(sent, "chat", None), "id", chat_id)
+    sent_msg_id = getattr(sent, "message_id", None)
+    if isinstance(file_id, str) or isinstance(sent_msg_id, int):
+        await governance_repository.cache_track_telegram_file(
+            trk.id,
+            telegram_file_id=file_id if isinstance(file_id, str) else None,
+            source_chat_id=sent_chat_id if isinstance(sent_chat_id, int) else None,
+            source_message_id=sent_msg_id if isinstance(sent_msg_id, int) else None,
+        )
+
+
 @songs_router.message(
     SongManagementStates.awaiting_search_query,
     _is_non_command_text,
@@ -495,30 +751,110 @@ async def handle_songs_search_text(
     state: FSMContext,
     current_user: UserAccount | None = None,
     governance_repository: GovernanceRepositoryPort | None = None,
+    catalog_repository: CatalogRepositoryPort | None = None,
 ) -> None:
-    """Filter library songs when the user types a search query in `awaiting_search_query` state."""
+    """Filter library songs (or inspect a pasted Job ID / Track ID) in `awaiting_search_query` state."""
     text = (message.text or "").strip()
     if not text or text in RESERVED_MENU_BUTTONS:
         return
     if not _can_access_songs(current_user) or governance_repository is None:
         return
 
+    # Check if the user pasted a Job ID first when no song title matches
     tracks = await governance_repository.search_library_tracks(text, limit=15)
     await _reset_to_search_state(state)
     if not tracks:
+        direct_track = await governance_repository.get_library_track(text)
+        if direct_track is not None:
+            await _reset_to_search_state(state, active_song_id=direct_track.id)
+            song_screen = f"songs:view:{direct_track.id[:12]}"
+            back_cb = await resolve_back_callback(
+                state,
+                None,
+                song_screen,
+                default_back="songs:list",
+            )
+            has_lrc = direct_track.storage_path.with_suffix(".lrc").is_file()
+            has_cover = (direct_track.storage_path.parent / "cover.jpg").is_file()
+            up_lbl, mod_lbl = await _resolve_song_provenance_labels(
+                direct_track,
+                governance_repository,
+                catalog_repository,
+            )
+            await message.answer(
+                format_song_detail_card(
+                    direct_track,
+                    has_lrc_file=has_lrc,
+                    has_cover_file=has_cover,
+                    uploader_label=up_lbl,
+                    modifier_label=mod_lbl,
+                ),
+                reply_markup=build_song_action_keyboard(direct_track.id, back_callback=back_cb),
+            )
+            return
+
+        if catalog_repository is not None and len(text) >= 6:
+            matched_job = await catalog_repository.get_job(text)
+            if matched_job is not None:
+                job_screen = f"queue:view:{matched_job.job_id}"
+                back_cb = await resolve_back_callback(
+                    state,
+                    None,
+                    job_screen,
+                    default_back="songs:list",
+                )
+                uploader_lbl: str | None = None
+                if matched_job.user_id:
+                    u_obj = await governance_repository.get_user(matched_job.user_id)
+                    uploader_lbl = (
+                        f"{u_obj.mention_handle} ({u_obj.telegram_id})"
+                        if u_obj is not None
+                        else f"User {matched_job.user_id}"
+                    )
+                await message.answer(
+                    format_job_inspector_card(matched_job, uploader_label=uploader_lbl),
+                    reply_markup=build_queued_job_keyboard(
+                        matched_job.job_id,
+                        state=matched_job.state,
+                        back_callback=back_cb,
+                        include_home=True,
+                    ),
+                )
+                return
+
+        await resolve_back_callback(state, None, "songs:list", default_back="menu:home")
         all_tracks = await governance_repository.list_library_tracks(limit=10)
         await message.answer(
-            f"🔍 No songs found matching <code>{html.escape(text)}</code>.\n"
-            "Try another search term or pick from recent tracks below:",
-            reply_markup=build_songs_search_menu_keyboard(all_tracks, can_rescan=True),
+            format_screen(
+                title="🔍 No Matching Songs Found",
+                context_lines=[
+                    f"No songs found matching <code>{html.escape(text)}</code>.",
+                    "Try another search term or pick from recent tracks below.",
+                ],
+                footer_lines=["<i>🧭 Home › Songs › Search</i>"],
+            ),
+            reply_markup=build_songs_search_menu_keyboard(
+                all_tracks,
+                can_rescan=True,
+                is_filtered=True,
+            ),
         )
         return
 
+    await resolve_back_callback(state, None, "songs:list", default_back="menu:home")
     await message.answer(
-        f"🎵 <b>Search Results for</b> <code>{html.escape(text)}</code> ({len(tracks)})\n"
-        "────────────────────────\n"
-        "Tap a song to manage it, or type another search query:",
-        reply_markup=build_songs_search_menu_keyboard(tracks, can_rescan=True),
+        format_screen(
+            title=f"🎵 Search Results for {html.escape(text)} ({len(tracks)})",
+            context_lines=["Tap a song to manage it, or type another search query."],
+            footer_lines=[
+                f"<i>Query:</i> <code>{html.escape(text)}</code> • <i>🧭 Home › Songs › Search</i>"
+            ],
+        ),
+        reply_markup=build_songs_search_menu_keyboard(
+            tracks,
+            can_rescan=True,
+            is_filtered=True,
+        ),
     )
 
 
@@ -528,87 +864,139 @@ async def handle_songs_callback(
     state: FSMContext,
     current_user: UserAccount | None = None,
     governance_repository: GovernanceRepositoryPort | None = None,
+    catalog_repository: CatalogRepositoryPort | None = None,
     pipeline: IngestionPipeline | None = None,
     settings: AppSettings | None = None,
 ) -> None:
-    """Handle all inline button actions inside the `/songs` interactive menu."""
+    """Handle all inline button actions inside the `/songs` interactive menu in-place."""
     if not _can_access_songs(current_user):
-        await callback.answer("Permission denied.", show_alert=True)
+        await ack_callback(callback, "Permission denied.", show_alert=True)
         return
     if governance_repository is None:
-        await callback.answer("Repository unavailable.", show_alert=True)
+        await ack_callback(callback, "Repository unavailable.", show_alert=True)
         return
 
     raw_data = callback.data or ""
     parts = raw_data.split(":")
     if len(parts) < 2:
-        await callback.answer("Invalid action.", show_alert=True)
+        await ack_callback(callback, "Invalid action.", show_alert=True)
         return
 
     action = parts[1]
-    msg = callback.message if isinstance(callback.message, Message) else None
+    msg = callback.message
     organizer = _resolve_organizer(pipeline, settings)
 
     # 1. List / Back to Songs Menu
     if action == "list":
+        await ack_callback(callback)
         tracks = await governance_repository.list_library_tracks(limit=15)
         await _reset_to_search_state(state)
-        text = (
-            f"🎵 <b>Music Library Browser</b> ({len(tracks)} track(s))\n"
-            "────────────────────────\n"
-            "Tap a song below or type a song title, artist, or album to search:"
+        back_cb = await resolve_back_callback(
+            state,
+            msg,
+            "songs:list",
+            default_back="menu:home",
         )
-        if msg is not None:
-            await msg.edit_text(
-                text,
-                reply_markup=build_songs_search_menu_keyboard(tracks, can_rescan=True),
-            )
-        await callback.answer()
+        text = format_screen(
+            title=f"🎵 Music Library Browser ({len(tracks)} track(s))",
+            context_lines=["Tap a song below or type a song title, artist, or album to search."],
+            footer_lines=["<i>🧭 Home › Songs</i>"],
+        )
+        await safe_edit_text(
+            msg,
+            text,
+            reply_markup=build_songs_search_menu_keyboard(
+                tracks,
+                can_rescan=True,
+                back_callback=back_cb,
+            ),
+        )
         return
 
     if action == "search_prompt":
+        await ack_callback(callback)
         await _reset_to_search_state(state)
-        if msg is not None:
-            await msg.answer("🔎 <b>Type a song title, artist, or album name</b> to search the library:")
-        await callback.answer()
+        await safe_edit_text(
+            msg,
+            format_screen(
+                title="🔎 Search Music Library",
+                context_lines=["Type a song title, artist, or album name in chat to filter the library."],
+                footer_lines=["<i>🧭 Home › Songs › Search</i>"],
+            ),
+            reply_markup=build_search_prompt_keyboard(),
+        )
         return
 
-    # 2. Export entire library JSON
+    # 2. Export entire library JSON (permanent artifact)
     if action == "export_all":
+        await ack_callback(callback, "Exported library JSON.")
+        await send_chat_action_safe(callback, ChatAction.UPLOAD_DOCUMENT)
         await _reset_to_search_state(state)
         tracks = await governance_repository.list_library_tracks(limit=1000)
         bundles = [await organizer.export_song_bundle(t) for t in tracks]
         json_bytes = json.dumps(bundles, indent=2, ensure_ascii=False).encode("utf-8")
-        if msg is not None:
+        if isinstance(msg, Message):
             await msg.answer_document(
                 BufferedInputFile(json_bytes, filename="library_songs_export.json"),
-                caption=f"📤 Exported <b>{len(bundles)}</b> song(s) from the library.",
+                caption=(
+                    f"<b>📤 Library Export Complete</b>\n"
+                    f"<blockquote>Exported <code>{len(bundles)}</code> song(s) from the library.</blockquote>"
+                ),
             )
-        await callback.answer("Exported library JSON.")
         return
 
     # 3. Rescan dry-run & apply
     if action == "rescan_dryrun":
+        await ack_callback(callback)
+        await send_chat_action_safe(callback)
+        await safe_edit_text(
+            msg,
+            format_loading_card(
+                "Scanning Library Folder",
+                "Inspecting audio files, sidecar lyrics, and cover art on disk...",
+                "🧭 Home › Songs › Rescan",
+            ),
+        )
         existing = await governance_repository.list_library_tracks(limit=10000)
         report = await organizer.scan_library_filesystem(existing)
-        if msg is not None:
-            if report.has_changes:
-                await state.update_data(pending_song_proposal=None, active_meta_field=None)
-                await state.set_state(SongManagementStates.awaiting_dry_run_confirmation)
-                await msg.edit_text(
-                    format_rescan_dry_run_card(report, applied=False),
-                    reply_markup=build_rescan_confirmation_keyboard(),
-                )
-            else:
-                await _reset_to_search_state(state)
-                await msg.edit_text(
-                    format_rescan_dry_run_card(report, applied=True),
-                    reply_markup=build_songs_search_menu_keyboard(existing[:12], can_rescan=True),
-                )
-        await callback.answer()
+        if report.has_changes:
+            await state.update_data(pending_song_proposal=None, active_meta_field=None)
+            await state.set_state(SongManagementStates.awaiting_dry_run_confirmation)
+            await safe_edit_text(
+                msg,
+                format_rescan_dry_run_card(report, applied=False),
+                reply_markup=build_rescan_confirmation_keyboard(),
+            )
+        else:
+            await _reset_to_search_state(state)
+            back_cb = await resolve_back_callback(
+                state,
+                msg,
+                "songs:list",
+                default_back="menu:home",
+            )
+            await safe_edit_text(
+                msg,
+                format_rescan_dry_run_card(report, applied=True),
+                reply_markup=build_songs_search_menu_keyboard(
+                    existing[:12],
+                    can_rescan=True,
+                    back_callback=back_cb,
+                ),
+            )
         return
 
     if action == "rescan_apply":
+        await ack_callback(callback, "Database synchronized with library folder.")
+        await send_chat_action_safe(callback)
+        await safe_edit_text(
+            msg,
+            format_loading_card(
+                "Synchronizing Library Database",
+                "Applying filesystem changes to SQLite...",
+                "🧭 Home › Songs › Rescan",
+            ),
+        )
         existing = await governance_repository.list_library_tracks(limit=10000)
         report = await organizer.scan_library_filesystem(existing)
         await organizer.apply_rescan_report(report, governance_repository)
@@ -627,123 +1015,214 @@ async def handle_songs_callback(
         )
         updated_list = await governance_repository.list_library_tracks(limit=15)
         await _reset_to_search_state(state)
-        if msg is not None:
-            await msg.edit_text(
-                format_rescan_dry_run_card(report, applied=True),
-                reply_markup=build_songs_search_menu_keyboard(updated_list, can_rescan=True),
-            )
-        await callback.answer("Database synchronized with library folder.")
+        back_cb = await resolve_back_callback(
+            state,
+            msg,
+            "songs:list",
+            default_back="menu:home",
+        )
+        await safe_edit_text(
+            msg,
+            format_rescan_dry_run_card(report, applied=True),
+            reply_markup=build_songs_search_menu_keyboard(
+                updated_list,
+                can_rescan=True,
+                back_callback=back_cb,
+            ),
+        )
         return
 
     # Actions requiring a `track_id` in `parts[2]`
     if len(parts) < 3:
-        await callback.answer("Missing track ID.", show_alert=True)
+        await ack_callback(callback, "Missing track ID.", show_alert=True)
         return
 
     track_id_prefix = parts[2]
     record = await governance_repository.get_library_track(track_id_prefix)
     if record is None:
-        await callback.answer("Song not found in database.", show_alert=True)
+        await ack_callback(callback, "Song not found in database.", show_alert=True)
         return
+
+    short_sid = record.id[:12]
+    song_screen = f"songs:view:{short_sid}"
 
     # 4. View single song card
     if action == "view":
+        await ack_callback(callback)
         await _reset_to_search_state(state, active_song_id=record.id)
+        back_cb = await resolve_back_callback(
+            state,
+            msg,
+            song_screen,
+            default_back="songs:list",
+        )
         has_lrc = record.storage_path.with_suffix(".lrc").is_file()
         has_cover = (record.storage_path.parent / "cover.jpg").is_file()
-        card = format_song_detail_card(record, has_lrc_file=has_lrc, has_cover_file=has_cover)
-        if msg is not None:
-            await msg.edit_text(
-                card,
-                reply_markup=build_song_action_keyboard(record.id),
-            )
-        await callback.answer()
+        up_lbl, mod_lbl = await _resolve_song_provenance_labels(
+            record,
+            governance_repository,
+            catalog_repository,
+        )
+        card = format_song_detail_card(
+            record,
+            has_lrc_file=has_lrc,
+            has_cover_file=has_cover,
+            uploader_label=up_lbl,
+            modifier_label=mod_lbl,
+        )
+        await safe_edit_text(
+            msg,
+            card,
+            reply_markup=build_song_action_keyboard(record.id, back_callback=back_cb),
+        )
         return
 
-    # 5. Retrieve / Download Song File
+    # 4b. View chronological song provenance & modification history
+    if action == "history":
+        await ack_callback(callback)
+        await _reset_to_search_state(state, active_song_id=record.id)
+        await resolve_back_callback(
+            state,
+            msg,
+            f"songs:history:{short_sid}",
+            default_back=song_screen,
+        )
+        up_lbl, _ = await _resolve_song_provenance_labels(
+            record,
+            governance_repository,
+            catalog_repository,
+        )
+        track_logs = await governance_repository.list_entity_audit_logs(record.id, limit=30)
+        if record.job_id:
+            job_logs = await governance_repository.list_entity_audit_logs(
+                f"job:{record.job_id}",
+                limit=10,
+            )
+            combined_by_key = {
+                (e.created_at, e.actor_id, str(e.action), e.target_entity): e
+                for e in [*track_logs, *job_logs]
+            }
+            track_logs = sorted(
+                combined_by_key.values(),
+                key=lambda item: item.created_at,
+                reverse=True,
+            )
+        actor_labels: dict[int, str] = {}
+        actor_ids = {e.actor_id for e in track_logs if e.actor_id > 0}
+        if record.modified_by and record.modified_by > 0:
+            actor_ids.add(record.modified_by)
+        for aid in actor_ids:
+            u = await governance_repository.get_user(aid)
+            actor_labels[aid] = f"{u.mention_handle} ({u.telegram_id})" if u is not None else f"User {aid}"
+        await safe_edit_text(
+            msg,
+            format_song_history_card(
+                record,
+                track_logs,
+                actor_labels,
+                uploader_label=up_lbl,
+            ),
+            reply_markup=build_song_history_keyboard(record.id),
+        )
+        return
+
+    # 5. Retrieve / Download Song File (permanent artifact, forwarded or cached file_id when available)
     if action == "get_track":
         await _reset_to_search_state(state, active_song_id=record.id)
-        if not record.storage_path.is_file():
-            await callback.answer("Audio file is missing on disk. Run Rescan.", show_alert=True)
+        if (
+            not record.storage_path.is_file()
+            and not record.telegram_file_id
+            and record.source_message_id is None
+        ):
+            await ack_callback(callback, "Audio file is missing on disk. Run Rescan.", show_alert=True)
             return
-        if msg is not None:
-            await msg.answer_audio(
-                FSInputFile(record.storage_path),
-                title=record.title,
-                performer=record.artist,
+        await ack_callback(callback, "Sent song file.")
+        await send_chat_action_safe(callback, ChatAction.UPLOAD_VOICE)
+        if isinstance(msg, Message):
+            await _deliver_track_audio(
+                msg,
+                record,
+                governance_repository,
                 caption=(
-                    f"🎵 <b>{html.escape(record.artist)} - {html.escape(record.title)}</b> "
-                    f"({html.escape(record.album)})"
+                    f"<b>🎵 {html.escape(record.artist)} - {html.escape(record.title)}</b>\n"
+                    f"<blockquote>Album: <code>{html.escape(record.album)}</code></blockquote>"
                 ),
             )
             lrc_path = record.storage_path.with_suffix(".lrc")
             if lrc_path.is_file():
                 await msg.answer_document(
                     FSInputFile(lrc_path),
-                    caption="📝 Synchronized <code>.lrc</code> sidecar lyrics",
+                    caption=(
+                        "<b>📝 Synchronized Lyrics</b>\n"
+                        "<blockquote>Sidecar <code>.lrc</code> file</blockquote>"
+                    ),
                 )
-        await callback.answer("Sent song file.")
         return
 
-    # 6. Retrieve / Download Full Album
+    # 6. Retrieve / Download Full Album (permanent artifact)
     if action == "get_album":
         await _reset_to_search_state(state, active_song_id=record.id)
         album_tracks = await governance_repository.list_album_tracks(record.artist, record.album)
         if not album_tracks:
             album_tracks = [record]
-        if msg is not None:
+        available_tracks = [
+            trk
+            for trk in album_tracks
+            if trk.storage_path.is_file() or trk.telegram_file_id or trk.source_message_id is not None
+        ]
+        if not available_tracks:
+            await ack_callback(callback, "Album audio files are missing on disk.", show_alert=True)
+            return
+        await ack_callback(callback, "Sent album tracks.")
+        await send_chat_action_safe(callback, ChatAction.UPLOAD_VOICE)
+        if isinstance(msg, Message):
             cover_path = record.storage_path.parent / "cover.jpg"
             if cover_path.is_file():
                 await msg.answer_photo(
                     FSInputFile(cover_path),
                     caption=(
-                        f"💿 <b>{html.escape(record.artist)} - {html.escape(record.album)}</b> "
-                        f"({len(album_tracks)} track(s))"
+                        f"<b>💿 {html.escape(record.artist)} - {html.escape(record.album)}</b>\n"
+                        f"<blockquote><code>{len(available_tracks)}</code> track(s)</blockquote>"
                     ),
                 )
-            sent_count = 0
-            for trk in album_tracks:
-                if trk.storage_path.is_file():
-                    await msg.answer_audio(
-                        FSInputFile(trk.storage_path),
-                        title=trk.title,
-                        performer=trk.artist,
-                    )
-                    sent_count += 1
-            if sent_count == 0:
-                await callback.answer("Album audio files are missing on disk.", show_alert=True)
-                return
-        await callback.answer("Sent album tracks.")
+            for trk in available_tracks:
+                await _deliver_track_audio(msg, trk, governance_repository)
         return
 
     # 7. Open Metadata Field Picker
     if action == "edit_meta":
+        await ack_callback(callback)
         await state.update_data(
             active_song_id=record.id,
             active_meta_field="multi",
             pending_song_proposal=None,
         )
         await state.set_state(SongManagementStates.awaiting_metadata_input)
-        prompt = (
-            f"✏️ <b>Edit Metadata for {html.escape(record.artist)} - {html.escape(record.title)}</b>\n"
-            "────────────────────────\n"
-            f"• <b>Current Title:</b> <code>{html.escape(record.title)}</code>\n"
-            f"• <b>Current Artist:</b> <code>{html.escape(record.artist)}</code>\n"
-            f"• <b>Current Album:</b> <code>{html.escape(record.album)}</code>\n"
-            f"• <b>Current Year:</b> <code>{record.year or 'Unknown'}</code>\n"
-            f"• <b>Current Track #:</b> <code>{record.track_number or 1}</code>\n\n"
-            "Tap a specific field button below, or send a message right now in the format:\n"
-            "<code>artist: Saori Hayami | title: Orange Mint | album: Orange Mint | year: 2015</code>"
+        prompt = format_screen(
+            title=f"✏️ Edit Metadata — {html.escape(record.artist)} - {html.escape(record.title)}",
+            context_lines=[
+                f"• Current Title: <code>{html.escape(record.title)}</code>",
+                f"• Current Artist: <code>{html.escape(record.artist)}</code>",
+                f"• Current Album: <code>{html.escape(record.album)}</code>",
+                f"• Current Year: <code>{record.year or 'Unknown'}</code>",
+                f"• Current Track #: <code>{record.track_number or 1}</code>",
+                "Tap a field button below, or send a multi-field message:",
+                "<code>artist: Saori Hayami | title: Orange Mint | album: Orange Mint | year: 2015</code>",
+            ],
+            footer_lines=[
+                f"<i>Track ID:</i> <code>{html.escape(record.id[:12])}</code> • "
+                "<i>🧭 Home › Songs › Edit Metadata</i>"
+            ],
         )
-        if msg is not None:
-            await msg.edit_text(
-                prompt,
-                reply_markup=build_metadata_field_keyboard(record.id),
-            )
-        await callback.answer()
+        await safe_edit_text(
+            msg,
+            prompt,
+            reply_markup=build_metadata_field_keyboard(record.id),
+        )
         return
 
     if action == "field" and len(parts) >= 4:
+        await ack_callback(callback)
         field_name = parts[3]
         await state.update_data(
             active_song_id=record.id,
@@ -763,39 +1242,54 @@ async def handle_songs_callback(
             ),
         }
         label, current_val = field_labels.get(field_name, ("Value", record.title))
-        if msg is not None:
-            await msg.edit_text(
-                f"✏️ <b>Enter new {html.escape(label)}</b>\n"
-                f"Current value: <code>{html.escape(current_val)}</code>\n\n"
-                "Reply with the new value below (a dry-run preview will be shown before saving):",
-                reply_markup=build_metadata_field_keyboard(record.id),
-            )
-        await callback.answer()
+        await safe_edit_text(
+            msg,
+            format_screen(
+                title=f"✏️ Enter New {html.escape(label)}",
+                context_lines=[
+                    f"Current value: <code>{html.escape(current_val)}</code>",
+                    "Reply with the new value below (a dry-run preview will be shown before saving).",
+                ],
+                footer_lines=[
+                    f"<i>Track ID:</i> <code>{html.escape(record.id[:12])}</code> • "
+                    "<i>🧭 Home › Songs › Edit Metadata</i>"
+                ],
+            ),
+            reply_markup=build_metadata_field_keyboard(record.id),
+        )
         return
 
     # 8. Edit Cover Art Prompt
     if action == "edit_cover":
+        await ack_callback(callback)
         await state.update_data(
             active_song_id=record.id,
             active_meta_field=None,
             pending_song_proposal=None,
         )
         await state.set_state(SongManagementStates.awaiting_cover_input)
-        if msg is not None:
-            await msg.edit_text(
-                f"🖼️ <b>Edit Cover Art for {html.escape(record.artist)} - {html.escape(record.title)}</b>\n"
-                "────────────────────────\n"
-                "Send a <b>Photo</b>, an image <b>Document</b> (<code>.jpg</code> / <code>.png</code>), "
-                "or paste a direct <b>Image URL</b> (<code>https://...</code>).\n\n"
-                "<i>You will see a dry-run confirmation preview before <code>cover.jpg</code> "
-                "and embedded audio tags are updated.</i>",
-                reply_markup=build_input_cancel_keyboard(record.id),
-            )
-        await callback.answer()
+        await safe_edit_text(
+            msg,
+            format_screen(
+                title=f"🖼️ Edit Cover Art — {html.escape(record.artist)} - {html.escape(record.title)}",
+                context_lines=[
+                    "Send a Photo, an image Document (<code>.jpg</code> / <code>.png</code>), "
+                    "or paste a direct Image URL (<code>https://...</code>).",
+                    "A dry-run confirmation preview will be shown before <code>cover.jpg</code> "
+                    "and embedded audio tags are updated.",
+                ],
+                footer_lines=[
+                    f"<i>Track ID:</i> <code>{html.escape(record.id[:12])}</code> • "
+                    "<i>🧭 Home › Songs › Edit Cover</i>"
+                ],
+            ),
+            reply_markup=build_input_cancel_keyboard(record.id),
+        )
         return
 
     # 9. Edit Lyrics Prompt
     if action == "edit_lyrics":
+        await ack_callback(callback)
         await state.update_data(
             active_song_id=record.id,
             active_meta_field=None,
@@ -803,62 +1297,90 @@ async def handle_songs_callback(
         )
         await state.set_state(SongManagementStates.awaiting_lyrics_input)
         existing_lyrics = await organizer.read_track_lyrics(record.storage_path)
-        preview_snippet = ""
+        context_lines: list[str] = [
+            "Send a <code>.lrc</code> or <code>.txt</code> file, or paste the lyrics text "
+            "directly in chat (timestamped <code>[mm:ss.xx]</code> or plain text).",
+            "Both embedded audio lyrics tags and the sidecar <code>.lrc</code> file "
+            "will be updated after confirmation.",
+        ]
         if existing_lyrics and (existing_lyrics.synced_lyrics or existing_lyrics.plain_lyrics):
             raw_lyr = existing_lyrics.synced_lyrics or existing_lyrics.plain_lyrics or ""
-            first_lines = "\n".join(raw_lyr.splitlines()[:4])
-            preview_snippet = f"\n<b>Current Lyrics Preview:</b>\n<pre>{html.escape(first_lines)}</pre>\n"
-        if msg is not None:
-            await msg.edit_text(
-                f"📝 <b>Edit Lyrics for {html.escape(record.artist)} - {html.escape(record.title)}</b>\n"
-                "────────────────────────"
-                f"{preview_snippet}\n"
-                "Send a <code>.lrc</code> or <code>.txt</code> file, or paste the lyrics text "
-                "directly in chat (timestamped <code>[mm:ss.xx]</code> or plain text).\n\n"
-                "<i>Both the embedded audio lyrics tags and the sidecar <code>.lrc</code> file "
-                "will be updated after confirmation.</i>",
-                reply_markup=build_input_cancel_keyboard(record.id),
-            )
-        await callback.answer()
+            first_lines = " / ".join(raw_lyr.splitlines()[:3])
+            context_lines.insert(0, f"Current Preview: <code>{html.escape(first_lines)}</code>")
+        await safe_edit_text(
+            msg,
+            format_screen(
+                title=f"📝 Edit Lyrics — {html.escape(record.artist)} - {html.escape(record.title)}",
+                context_lines=context_lines,
+                footer_lines=[
+                    f"<i>Track ID:</i> <code>{html.escape(record.id[:12])}</code> • "
+                    "<i>🧭 Home › Songs › Edit Lyrics</i>"
+                ],
+            ),
+            reply_markup=build_input_cancel_keyboard(record.id),
+        )
         return
 
     # 10. Auto / Custom Re-Search Menu
     if action == "research":
+        await ack_callback(callback)
         await _reset_to_search_state(state, active_song_id=record.id)
-        if msg is not None:
-            await msg.edit_text(
-                f"🔎 <b>Re-Search Song Data ({html.escape(record.artist)} - "
-                f"{html.escape(record.title)})</b>\n"
-                "────────────────────────\n"
-                "Choose whether to automatically re-query <b>MusicBrainz + Genius + Last.fm + LRCLIB</b> "
-                "or enter a custom search query / MusicBrainz URL / MBID:",
-                reply_markup=build_research_mode_keyboard(record.id),
-            )
-        await callback.answer()
+        await safe_edit_text(
+            msg,
+            format_screen(
+                title=f"🔎 Re-Search Song Data ({html.escape(record.artist)} - {html.escape(record.title)})",
+                context_lines=[
+                    "Choose whether to automatically re-query MusicBrainz + Genius + Last.fm + LRCLIB "
+                    "or enter a custom search query / MusicBrainz URL / MBID."
+                ],
+                footer_lines=[
+                    f"<i>Track ID:</i> <code>{html.escape(record.id[:12])}</code> • "
+                    "<i>🧭 Home › Songs › Re-Search</i>"
+                ],
+            ),
+            reply_markup=build_research_mode_keyboard(record.id),
+        )
         return
 
     if action == "research_custom":
+        await ack_callback(callback)
         await state.update_data(
             active_song_id=record.id,
             active_meta_field=None,
             pending_song_proposal=None,
         )
         await state.set_state(SongManagementStates.awaiting_research_query)
-        if msg is not None:
-            await msg.edit_text(
-                f"⌨️ <b>Custom Re-Search for {html.escape(record.artist)} - {html.escape(record.title)}</b>\n"
-                "────────────────────────\n"
-                "Send any of the following:\n"
-                "• <code>Artist - Title | Album</code>\n"
-                "• <code>artist: Saori Hayami | title: Orange Mint</code>\n"
-                "• A MusicBrainz Release or Recording URL / UUID\n"
-                "• An ISRC code (<code>isrc:JP...</code>)",
-                reply_markup=build_research_mode_keyboard(record.id),
-            )
-        await callback.answer()
+        await safe_edit_text(
+            msg,
+            format_screen(
+                title=f"⌨️ Custom Re-Search — {html.escape(record.artist)} - {html.escape(record.title)}",
+                context_lines=[
+                    "Send any of the following:",
+                    "• <code>Artist - Title | Album</code>",
+                    "• <code>artist: Saori Hayami | title: Orange Mint</code>",
+                    "• A MusicBrainz Release or Recording URL / UUID",
+                    "• An ISRC code (<code>isrc:JP...</code>)",
+                ],
+                footer_lines=[
+                    f"<i>Track ID:</i> <code>{html.escape(record.id[:12])}</code> • "
+                    "<i>🧭 Home › Songs › Custom Re-Search</i>"
+                ],
+            ),
+            reply_markup=build_research_mode_keyboard(record.id),
+        )
         return
 
     if action == "research_auto":
+        await ack_callback(callback, "Found enriched match. Review dry-run preview.")
+        await send_chat_action_safe(callback)
+        await safe_edit_text(
+            msg,
+            format_loading_card(
+                "Querying MusicBrainz, Genius, Last.fm &amp; LRCLIB",
+                f"Looking up enriched metadata and lyrics for <code>{html.escape(record.title)}</code>...",
+                "🧭 Home › Songs › Re-Search",
+            ),
+        )
         meta_svc = _resolve_metadata_service(pipeline, settings)
         lyrics_client = _resolve_lyrics_client(pipeline, settings)
         seed_meta = (
@@ -898,50 +1420,58 @@ async def handle_songs_callback(
             pending_song_proposal=proposal,
         )
         await state.set_state(SongManagementStates.awaiting_dry_run_confirmation)
-        if msg is not None:
-            await msg.edit_text(
-                format_song_edit_dry_run_card(record, proposal, organizer),
-                reply_markup=build_dry_run_confirmation_keyboard(record.id, retry_action="research"),
-            )
-        await callback.answer("Found enriched match. Review dry-run preview.")
+        await safe_edit_text(
+            msg,
+            format_song_edit_dry_run_card(record, proposal, organizer),
+            reply_markup=build_dry_run_confirmation_keyboard(record.id, retry_action="research"),
+        )
         return
 
     # 11. Export & Import single song JSON
     if action == "export":
+        await ack_callback(callback, "Exported song JSON.")
+        await send_chat_action_safe(callback, ChatAction.UPLOAD_DOCUMENT)
         await _reset_to_search_state(state, active_song_id=record.id)
         bundle = await organizer.export_song_bundle(record)
         json_text = json.dumps(bundle, indent=2, ensure_ascii=False)
         safe_filename = f"{record.artist} - {record.title}.json".replace("/", "_").replace("\\", "_")
-        if msg is not None:
+        if isinstance(msg, Message):
             await msg.answer_document(
                 BufferedInputFile(json_text.encode("utf-8"), filename=safe_filename),
                 caption=(
-                    f"📤 <b>Exported Song Data:</b> {html.escape(record.artist)} - "
-                    f"{html.escape(record.title)}\n"
-                    "You can edit this JSON and re-import it via <b>📥 Import Data</b>."
+                    f"<b>📤 Exported Song Data: {html.escape(record.artist)} - "
+                    f"{html.escape(record.title)}</b>\n"
+                    "<blockquote>Edit this JSON and re-import via "
+                    "<code>📥 Import Data</code>.</blockquote>"
                 ),
             )
-        await callback.answer("Exported song JSON.")
         return
 
     if action == "import":
+        await ack_callback(callback)
         await state.update_data(
             active_song_id=record.id,
             active_meta_field=None,
             pending_song_proposal=None,
         )
         await state.set_state(SongManagementStates.awaiting_import_payload)
-        if msg is not None:
-            await msg.edit_text(
-                f"📥 <b>Import Song Data for {html.escape(record.artist)} - {html.escape(record.title)}</b>\n"
-                "────────────────────────\n"
-                "Upload a <code>.json</code> file or paste a JSON object with any of these keys:\n"
-                '<code>{"title": "...", "artist": "...", "album": "...", '
-                '"year": 2020, "track_number": 1, "lyrics": "..."}</code>\n\n'
-                "<i>A dry-run preview will be shown for your confirmation before applying.</i>",
-                reply_markup=build_input_cancel_keyboard(record.id),
-            )
-        await callback.answer()
+        await safe_edit_text(
+            msg,
+            format_screen(
+                title=f"📥 Import Song Data — {html.escape(record.artist)} - {html.escape(record.title)}",
+                context_lines=[
+                    "Upload a <code>.json</code> file or paste a JSON object with any of these keys:",
+                    '<code>{"title": "...", "artist": "...", "album": "...", '
+                    '"year": 2020, "track_number": 1, "lyrics": "..."}</code>',
+                    "A dry-run preview will be shown for your confirmation before applying.",
+                ],
+                footer_lines=[
+                    f"<i>Track ID:</i> <code>{html.escape(record.id[:12])}</code> • "
+                    "<i>🧭 Home › Songs › Import</i>"
+                ],
+            ),
+            reply_markup=build_input_cancel_keyboard(record.id),
+        )
         return
 
     # 12. Confirm & Apply Dry-Run Proposal
@@ -949,8 +1479,19 @@ async def handle_songs_callback(
         fsm_data = await state.get_data()
         raw_proposal = fsm_data.get("pending_song_proposal")
         if not isinstance(raw_proposal, dict):
-            await callback.answer("No pending changes to apply.", show_alert=True)
+            await ack_callback(callback, "No pending changes to apply.", show_alert=True)
             return
+
+        await ack_callback(callback, "Changes applied!")
+        await send_chat_action_safe(callback)
+        await safe_edit_text(
+            msg,
+            format_loading_card(
+                "Applying Song Changes",
+                "Writing audio tags, sidecar lyrics, and updating library catalog...",
+                f"Track ID: {html.escape(record.id[:12])}",
+            ),
+        )
 
         new_title = str(raw_proposal.get("new_title") or record.title)
         new_artist = str(raw_proposal.get("new_artist") or record.artist)
@@ -1004,6 +1545,7 @@ async def handle_songs_callback(
         final_lyrics = await organizer.read_track_lyrics(new_path)
         has_synced_flag = bool(final_lyrics and (final_lyrics.has_synced or final_lyrics.has_any))
 
+        actor_id = current_user.telegram_id if current_user is not None else 0
         updated_record = await governance_repository.update_library_track_full(
             record.id,
             title=new_title,
@@ -1015,8 +1557,8 @@ async def handle_songs_callback(
             has_synced_lyrics=has_synced_flag,
             recording_mbid=updated_meta.recording_mbid,
             release_mbid=updated_meta.release_mbid,
+            modified_by=actor_id,
         )
-        actor_id = current_user.telegram_id if current_user is not None else 0
         await governance_repository.append_audit_log(
             AuditLogEntry(
                 actor_id=actor_id,
@@ -1035,22 +1577,34 @@ async def handle_songs_callback(
 
         effective_rec = updated_record or record
         await _reset_to_search_state(state, active_song_id=effective_rec.id)
+        back_cb = await resolve_back_callback(
+            state,
+            msg,
+            f"songs:view:{effective_rec.id[:12]}",
+            default_back="songs:list",
+        )
         has_lrc = effective_rec.storage_path.with_suffix(".lrc").is_file()
         has_cover = (effective_rec.storage_path.parent / "cover.jpg").is_file()
-        if msg is not None:
-            await msg.edit_text(
-                "✅ <b>Changes Applied Successfully!</b>\n\n"
-                + format_song_detail_card(
-                    effective_rec,
-                    has_lrc_file=has_lrc,
-                    has_cover_file=has_cover,
-                ),
-                reply_markup=build_song_action_keyboard(effective_rec.id),
-            )
-        await callback.answer("Changes applied!")
+        up_lbl, mod_lbl = await _resolve_song_provenance_labels(
+            effective_rec,
+            governance_repository,
+            catalog_repository,
+        )
+        await safe_edit_text(
+            msg,
+            format_song_detail_card(
+                effective_rec,
+                has_lrc_file=has_lrc,
+                has_cover_file=has_cover,
+                changes_applied=True,
+                uploader_label=up_lbl,
+                modifier_label=mod_lbl,
+            ),
+            reply_markup=build_song_action_keyboard(effective_rec.id, back_callback=back_cb),
+        )
         return
 
-    await callback.answer()
+    await ack_callback(callback)
 
 
 @songs_router.message(
@@ -1072,7 +1626,13 @@ async def handle_metadata_edit_input(
     target_field = str(data.get("active_meta_field") or "multi")
     record = await governance_repository.get_library_track(track_id)
     if record is None:
-        await message.answer("⚠️ Song no longer exists in the database.")
+        await message.answer(
+            format_screen(
+                title="⚠️ Song Not Found",
+                context_lines=["Song no longer exists in the database."],
+                footer_lines=["<i>🧭 Home › Songs</i>"],
+            )
+        )
         await state.clear()
         return
 
@@ -1104,7 +1664,13 @@ async def handle_lyrics_edit_input(
     track_id = str(data.get("active_song_id") or "")
     record = await governance_repository.get_library_track(track_id)
     if record is None:
-        await message.answer("⚠️ Song no longer exists in the database.")
+        await message.answer(
+            format_screen(
+                title="⚠️ Song Not Found",
+                context_lines=["Song no longer exists in the database."],
+                footer_lines=["<i>🧭 Home › Songs</i>"],
+            )
+        )
         await state.clear()
         return
 
@@ -1118,7 +1684,13 @@ async def handle_lyrics_edit_input(
 
     if not lyrics_text:
         await message.answer(
-            "⚠️ Please paste non-empty lyrics text or upload a <code>.lrc</code>/<code>.txt</code> file.",
+            format_screen(
+                title="⚠️ Empty Lyrics Input",
+                context_lines=[
+                    "Please paste non-empty lyrics text or upload a <code>.lrc</code>/<code>.txt</code> file."
+                ],
+                footer_lines=[f"<i>Track ID:</i> <code>{html.escape(record.id[:12])}</code>"],
+            ),
             reply_markup=build_input_cancel_keyboard(record.id),
         )
         return
@@ -1160,10 +1732,17 @@ async def handle_cover_edit_input(
     track_id = str(data.get("active_song_id") or "")
     record = await governance_repository.get_library_track(track_id)
     if record is None:
-        await message.answer("⚠️ Song no longer exists in the database.")
+        await message.answer(
+            format_screen(
+                title="⚠️ Song Not Found",
+                context_lines=["Song no longer exists in the database."],
+                footer_lines=["<i>🧭 Home › Songs</i>"],
+            )
+        )
         await state.clear()
         return
 
+    await send_chat_action_safe(message)
     cover_bytes: bytes | None = None
     mime_type = "image/jpeg"
 
@@ -1197,8 +1776,14 @@ async def handle_cover_edit_input(
 
     if not cover_bytes:
         await message.answer(
-            "⚠️ Could not read cover image. Please send a Photo, an image file, "
-            "or a valid <code>https://</code> image URL.",
+            format_screen(
+                title="⚠️ Invalid Cover Image",
+                context_lines=[
+                    "Could not read cover image. Please send a Photo, an image file, "
+                    "or a valid <code>https://</code> image URL."
+                ],
+                footer_lines=[f"<i>Track ID:</i> <code>{html.escape(record.id[:12])}</code>"],
+            ),
             reply_markup=build_input_cancel_keyboard(record.id),
         )
         return
@@ -1242,10 +1827,17 @@ async def handle_custom_research_input(
     track_id = str(data.get("active_song_id") or "")
     record = await governance_repository.get_library_track(track_id)
     if record is None:
-        await message.answer("⚠️ Song no longer exists in the database.")
+        await message.answer(
+            format_screen(
+                title="⚠️ Song Not Found",
+                context_lines=["Song no longer exists in the database."],
+                footer_lines=["<i>🧭 Home › Songs</i>"],
+            )
+        )
         await state.clear()
         return
 
+    await send_chat_action_safe(message)
     base_meta = TrackMetadata(
         title=record.title,
         artist=record.artist,
@@ -1304,7 +1896,13 @@ async def handle_import_payload_input(
     track_id = str(data.get("active_song_id") or "")
     record = await governance_repository.get_library_track(track_id)
     if record is None:
-        await message.answer("⚠️ Song no longer exists in the database.")
+        await message.answer(
+            format_screen(
+                title="⚠️ Song Not Found",
+                context_lines=["Song no longer exists in the database."],
+                footer_lines=["<i>🧭 Home › Songs</i>"],
+            )
+        )
         await state.clear()
         return
 
@@ -1320,7 +1918,11 @@ async def handle_import_payload_input(
         parsed = json.loads(raw_json_str)
     except Exception:
         await message.answer(
-            "⚠️ Invalid JSON payload. Please send a valid JSON object or <code>.json</code> file.",
+            format_screen(
+                title="⚠️ Invalid JSON Payload",
+                context_lines=["Please send a valid JSON object or <code>.json</code> file."],
+                footer_lines=[f"<i>Track ID:</i> <code>{html.escape(record.id[:12])}</code>"],
+            ),
             reply_markup=build_input_cancel_keyboard(record.id),
         )
         return
@@ -1329,7 +1931,11 @@ async def handle_import_payload_input(
         parsed = parsed[0]
     if not isinstance(parsed, dict):
         await message.answer(
-            "⚠️ JSON payload must be an object containing song metadata fields.",
+            format_screen(
+                title="⚠️ Invalid JSON Structure",
+                context_lines=["JSON payload must be an object containing song metadata fields."],
+                footer_lines=[f"<i>Track ID:</i> <code>{html.escape(record.id[:12])}</code>"],
+            ),
             reply_markup=build_input_cancel_keyboard(record.id),
         )
         return
@@ -1375,9 +1981,13 @@ async def handle_dry_run_unexpected_text(
     track_id = str(data.get("active_song_id") or "")
     if isinstance(raw_proposal, dict) and track_id:
         await message.answer(
-            "⚠️ <b>Pending Dry-Run Preview</b>\n"
-            "Please tap <b>✅ Confirm &amp; Apply Changes</b> or <b>❌ Cancel</b> below "
-            "(or send <code>/cancel</code> to discard):",
+            format_screen(
+                title="⚠️ Pending Dry-Run Preview",
+                context_lines=[
+                    "Please use the buttons below to confirm &amp; apply or cancel the pending changes."
+                ],
+                footer_lines=[f"<i>Track ID:</i> <code>{html.escape(track_id[:12])}</code>"],
+            ),
             reply_markup=build_dry_run_confirmation_keyboard(track_id),
         )
         return

@@ -17,6 +17,7 @@ from src.core.models import (
     IngestionJob,
     IngestionResult,
     JobState,
+    LyricsData,
     MetadataCandidate,
     SourceType,
     TrackMetadata,
@@ -274,6 +275,57 @@ class IngestionPipeline:
             )
         return []
 
+    async def prepare_for_review(self, job_id: str) -> IngestionResult:
+        """Stage, fingerprint, and enrich candidates for `job_id` without waiting on queue slots."""
+        job = await self._catalog.get_job(job_id)
+        if job is None:
+            msg = f"Unknown ingestion job: {job_id}"
+            raise KeyError(msg)
+
+        job.state = JobState.AWAITING_CONFIRMATION
+        await self._catalog.save_job(job)
+
+        if job.source_path.is_file() and not job.candidates:
+            staged_files = await self._extractor.extract_or_stage(job.source_path, job.job_id)
+            primary_audio = staged_files[0]
+            job.scratch_dir = primary_audio.parent
+            job.total_tracks = len(staged_files)
+
+            raw_local_meta = await self._metadata.read_local_metadata(primary_audio)
+            local_meta = _merge_original_filename_metadata(
+                raw_local_meta,
+                primary_audio.stem,
+                job.original_filename,
+            )
+            if job.fingerprint is None:
+                job.fingerprint = await self._compute_fingerprint_with_fallback(
+                    primary_audio,
+                    known_duration=local_meta.duration_seconds,
+                )
+            candidates = await self._metadata.find_candidates(local_meta, job.fingerprint)
+            job.candidates = candidates
+            if candidates:
+                job.confidence_score = candidates[0].confidence
+                job.matched_release_mbid = candidates[0].metadata.release_mbid
+                job.selected_metadata = candidates[0].metadata
+            else:
+                job.selected_metadata = local_meta
+        elif job.selected_metadata is None:
+            if job.candidates:
+                job.selected_metadata = job.candidates[0].metadata
+            else:
+                stem = Path(job.original_filename or job.source_path.name).stem
+                job.selected_metadata = parse_filename_metadata(stem)
+
+        job.state = JobState.AWAITING_CONFIRMATION
+        await self._catalog.save_job(job)
+        return IngestionResult(
+            job=job,
+            requires_user_confirmation=True,
+            tracks_ingested=0,
+            lyrics_embedded_count=0,
+        )
+
     async def process_file(
         self,
         source_path: Path,
@@ -286,6 +338,7 @@ class IngestionPipeline:
         sha256_hash: str | None = None,
         started_at: datetime | None = None,
         stage_callback: StageCallback | None = None,
+        force_confirmation: bool = False,
     ) -> IngestionResult:
         """Run stages 1–7, and continue through 8–10 if confidence meets the auto-approve threshold."""
         resolved_job_id = job_id or uuid.uuid4().hex[:12]
@@ -337,21 +390,49 @@ class IngestionPipeline:
                 lyrics_embedded_count=0,
             )
 
+        persisted_midflight = await self._catalog.get_job(resolved_job_id)
+        was_paused = persisted_midflight is not None and persisted_midflight.state == JobState.PAUSED
+        if persisted_midflight is not None and persisted_midflight.state == JobState.CANCELLED:
+            await self._extractor.cleanup_job_scratch(resolved_job_id)
+            return IngestionResult(
+                job=persisted_midflight,
+                requires_user_confirmation=False,
+                tracks_ingested=0,
+                lyrics_embedded_count=0,
+            )
+
         job.state = JobState.ENRICHING_METADATA
-        await self._notify_stage(job, stage_callback)
+        if not was_paused:
+            await self._notify_stage(job, stage_callback)
         candidates = await self._metadata.find_candidates(local_meta, fingerprint)
         job.candidates = candidates
         if candidates:
             job.confidence_score = candidates[0].confidence
             job.matched_release_mbid = candidates[0].metadata.release_mbid
+            job.selected_metadata = candidates[0].metadata
+        else:
+            job.selected_metadata = local_meta
 
-        if _requires_confirmation(candidates, self._auto_approve_confidence):
+        latest_persisted = await self._catalog.get_job(resolved_job_id)
+        if latest_persisted is not None and latest_persisted.state in {
+            JobState.PAUSED,
+            JobState.AWAITING_CONFIRMATION,
+            JobState.AWAITING_INPUT,
+        }:
+            was_paused = True
+
+        if (
+            force_confirmation
+            or was_paused
+            or _requires_confirmation(candidates, self._auto_approve_confidence)
+        ):
             job.state = JobState.AWAITING_CONFIRMATION
             await self._catalog.save_job(job)
             logger.info(
-                "Job %s requires interactive confirmation (%d candidate(s))",
+                "Job %s requires interactive confirmation (%d candidate(s), forced=%s)",
                 resolved_job_id,
                 len(candidates),
+                force_confirmation or was_paused,
             )
             return IngestionResult(
                 job=job,
@@ -405,6 +486,66 @@ class IngestionPipeline:
             stage_callback=stage_callback,
         )
 
+    async def complete_custom_ingestion(
+        self,
+        job_id: str,
+        metadata: TrackMetadata,
+        *,
+        custom_lyrics: LyricsData | None = None,
+        custom_cover_bytes: bytes | None = None,
+        custom_cover_mime: str = "image/jpeg",
+        stage_callback: StageCallback | None = None,
+    ) -> IngestionResult:
+        """Finalize a reviewed job using custom/edited metadata, optional custom lyrics, and cover art."""
+        job = await self._catalog.get_job(job_id)
+        if job is None:
+            msg = f"Unknown ingestion job: {job_id}"
+            raise KeyError(msg)
+
+        discovered = _discover_staged_audio_files(job)
+        if (
+            len(discovered) == 1
+            and discovered[0] == job.source_path
+            and job.scratch_dir is None
+            and job.source_path.is_file()
+        ):
+            staged_files = await self._extractor.extract_or_stage(job.source_path, job.job_id)
+            job.scratch_dir = staged_files[0].parent
+            discovered = staged_files
+
+        primary_audio = discovered[0]
+        extra_paths = discovered[1:]
+        job.total_tracks = 1 + len(extra_paths)
+
+        if job.fingerprint is None and primary_audio.is_file():
+            job.fingerprint = await self._compute_fingerprint_with_fallback(
+                primary_audio,
+                known_duration=metadata.duration_seconds,
+            )
+
+        if custom_cover_bytes and primary_audio.parent.is_dir():
+            (primary_audio.parent / "cover.jpg").write_bytes(custom_cover_bytes)
+
+        result = await self._complete_ingestion(
+            job,
+            primary_audio,
+            metadata,
+            extra_audio_paths=extra_paths,
+            stage_callback=stage_callback,
+            custom_lyrics=custom_lyrics,
+        )
+
+        if custom_cover_bytes and result.job.final_path is not None and result.job.final_path.is_file():
+            update_cover_fn = getattr(self._organizer, "update_track_cover_art", None)
+            if callable(update_cover_fn):
+                await update_cover_fn(
+                    result.job.final_path,
+                    custom_cover_bytes,
+                    mime_type=custom_cover_mime,
+                )
+
+        return result
+
     async def search_manual_candidates(
         self,
         job_id: str,
@@ -457,6 +598,9 @@ class IngestionPipeline:
         if candidates:
             job.confidence_score = candidates[0].confidence
             job.matched_release_mbid = candidates[0].metadata.release_mbid
+            job.selected_metadata = candidates[0].metadata
+        else:
+            job.selected_metadata = manual_meta
         await self._catalog.save_job(job)
         return IngestionResult(
             job=job,
@@ -484,6 +628,7 @@ class IngestionPipeline:
         selected_metadata: TrackMetadata,
         extra_audio_paths: list[Path] | None = None,
         stage_callback: StageCallback | None = None,
+        custom_lyrics: LyricsData | None = None,
     ) -> IngestionResult:
         """Execute stages 8–10: fetch release tracklist, lyrics, write tags & move file(s), cleanup."""
         extra_list = extra_audio_paths or []
@@ -506,7 +651,7 @@ class IngestionPipeline:
         job.matched_release_mbid = primary_meta.release_mbid or job.matched_release_mbid
         job.state = JobState.FETCHING_LYRICS
         await self._notify_stage(job, stage_callback)
-        lyrics = await self._lyrics.fetch_lyrics(primary_meta)
+        lyrics = custom_lyrics if custom_lyrics is not None else await self._lyrics.fetch_lyrics(primary_meta)
         lyrics_count = 1 if (lyrics and lyrics.has_any) else 0
         job.lyrics_matched_count = lyrics_count
 

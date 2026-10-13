@@ -864,6 +864,12 @@ def _inspect_library_audio_file_sync(
         track_number=meta.track_number or (existing.track_number if existing is not None else 1),
         has_synced_lyrics=has_synced,
         ingested_at=existing.ingested_at if existing is not None else datetime.now(UTC),
+        updated_at=existing.updated_at if existing is not None else None,
+        modified_by=existing.modified_by if existing is not None else None,
+        modification_count=existing.modification_count if existing is not None else 0,
+        telegram_file_id=existing.telegram_file_id if existing is not None else None,
+        source_chat_id=existing.source_chat_id if existing is not None else None,
+        source_message_id=existing.source_message_id if existing is not None else None,
     )
 
 

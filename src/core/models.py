@@ -94,12 +94,15 @@ class AuditAction(StrEnum):
     TAG_CORRECTION_REJECTED = "TAG_CORRECTION_REJECTED"
     OWNERSHIP_TRANSFERRED = "OWNERSHIP_TRANSFERRED"
     SYSTEM_WIPE_EXECUTED = "SYSTEM_WIPE_EXECUTED"
+    JOB_PAUSED = "JOB_PAUSED"
+    JOB_UNLOCKED = "JOB_UNLOCKED"
 
 
 class JobState(StrEnum):
     """Lifecycle states of an ingestion job across queue and pipeline stages."""
 
     QUEUED = "QUEUED"
+    PAUSED = "PAUSED"
     PENDING = "PENDING"
     PROCESSING = "PROCESSING"
     EXTRACTING = "EXTRACTING"
@@ -177,6 +180,12 @@ class LibraryTrackRecord:
     track_number: int | None = None
     has_synced_lyrics: bool = False
     ingested_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime | None = None
+    modified_by: int | None = None
+    modification_count: int = 0
+    telegram_file_id: str | None = None
+    source_chat_id: int | None = None
+    source_message_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

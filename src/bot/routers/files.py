@@ -10,9 +10,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardMarkup, Message
 
 from src.bot.api_server import resolve_local_api_file_path
-from src.bot.keyboards.admin import build_queued_job_keyboard
+from src.bot.keyboards.admin import build_back_to_home_keyboard, build_queued_job_keyboard
 from src.bot.keyboards.verification import build_verification_keyboard
 from src.bot.states import IngestionStates
+from src.bot.ui import format_screen, safe_answer, safe_edit_text
 from src.config.settings import AppSettings
 from src.core.audit import format_ingesting_progress_card, format_queued_job_card
 from src.core.extractor import SUPPORTED_ARCHIVE_EXTENSIONS, SUPPORTED_AUDIO_EXTENSIONS
@@ -100,19 +101,23 @@ def render_job_stage_progress(job: IngestionJob) -> str:
 
 
 def format_ingestion_summary(result: IngestionResult) -> str:
-    """Format a user-facing Telegram HTML message summarizing an IngestionResult."""
+    """Format a user-facing 3-tier Telegram HTML message summarizing an IngestionResult."""
     if result.duplicate is not None and result.duplicate.is_duplicate:
-        return (
-            f"<b>Duplicate Rejected</b> ({result.duplicate.match_reason})\n"
-            f"Existing file: <code>{html.escape(str(result.duplicate.existing_path))}</code>"
+        reason = html.escape(result.duplicate.match_reason or "duplicate")
+        return format_screen(
+            title=f"⚠️ Duplicate Rejected ({reason})",
+            context_lines=[
+                f"Existing file: <code>{html.escape(str(result.duplicate.existing_path))}</code>",
+            ],
+            footer_lines=[f"<i>Job ID:</i> <code>{html.escape(result.job.job_id)}</code>"],
         )
 
     if result.requires_user_confirmation:
-        progress_header = render_job_stage_progress(result.job)
-        lines = [
-            progress_header,
-            "",
-            f"<b>Confirmation Required</b> (Job <code>{result.job.job_id}</code>)",
+        filename = html.escape(result.job.original_filename or result.job.source_path.name)
+        total = max(1, result.job.total_tracks)
+        conf_pct = round((result.job.confidence_score or 1.0) * 100)
+        lines: list[str] = [
+            f"Payload: <code>{filename}</code> ({total} track(s), {conf_pct}% top match)",
             "Multiple or low-confidence matches found. Select a release below:",
         ]
         if result.job.candidates:
@@ -137,24 +142,30 @@ def format_ingestion_summary(result: IngestionResult) -> str:
                         f'{html.escape(cand.metadata.recording_mbid)}">MB</a>'
                     )
                 lines.append(
-                    f"<b>{idx}. [{pct}%]</b> {artist_esc} - {title_esc}\n"
+                    f"<code>{idx}. [{pct}%]</code> {artist_esc} - {title_esc}\n"
                     f"   📀 <i>{album_esc}{year_part}</i>{type_part}{disambig_part}{mb_link}"
                 )
-            lines.append("")
-            lines.append(
-                "💡 <i>Tap <b>Manual Search / Link</b> to send a MusicBrainz URL/MBID, "
-                "<code>Artist - Title | Album</code>, or just the voice actor/artist name.</i>"
-            )
-        return "\n".join(lines)
+        return format_screen(
+            title="⚠️ Confirmation Required",
+            context_lines=lines,
+            footer_lines=[
+                f"<i>Job ID:</i> <code>{html.escape(result.job.job_id)}</code> • "
+                "<i>Tap Manual Search / Link to refine by URL, MBID, or artist</i>"
+            ],
+            expandable=True,
+        )
 
     tracks_suffix = (
         f" • {result.tracks_ingested} tracks ({result.lyrics_embedded_count} synced lyrics)"
         if result.tracks_ingested > 1 or result.lyrics_embedded_count > 0
         else ""
     )
-    return (
-        f"<b>Track Ingested</b> (Job <code>{result.job.job_id}</code>){tracks_suffix}\n"
-        f"Saved to: <code>{html.escape(str(result.job.final_path))}</code>"
+    return format_screen(
+        title=f"✅ Track Ingested{tracks_suffix}",
+        context_lines=[
+            f"Saved to: <code>{html.escape(str(result.job.final_path))}</code>",
+        ],
+        footer_lines=[f"<i>Job ID:</i> <code>{html.escape(result.job.job_id)}</code>"],
     )
 
 
@@ -196,11 +207,14 @@ async def _resolve_incoming_file_path(
     fallback_path = scratch_dir / file_name
     bot = getattr(message, "bot", None)
     get_file_fn = getattr(bot, "get_file", None)
-    if bot is None or not inspect.iscoroutinefunction(get_file_fn):
+    if bot is None or not callable(get_file_fn):
         return fallback_path, file_name
 
     try:
-        tg_file = await get_file_fn(file_id)
+        raw_tg_file = get_file_fn(file_id)
+        if not inspect.isawaitable(raw_tg_file):
+            return fallback_path, file_name
+        tg_file = await raw_tg_file
     except Exception as exc:
         logger.warning("bot.get_file(%s) failed: %s", file_id, exc)
         return fallback_path, file_name
@@ -221,12 +235,14 @@ async def _resolve_incoming_file_path(
 
     if not resolved.is_file():
         download_fn = getattr(bot, "download_file", None)
-        if inspect.iscoroutinefunction(download_fn):
+        if callable(download_fn):
             scratch_dir.mkdir(parents=True, exist_ok=True)
             download_target = scratch_dir / effective_name
             try:
-                await download_fn(reported_path, destination=download_target)
-                return download_target, effective_name
+                dl_res = download_fn(reported_path, destination=download_target)
+                if inspect.isawaitable(dl_res):
+                    await dl_res
+                    return download_target, effective_name
             except Exception as exc:
                 logger.warning("bot.download_file(%s) failed: %s", reported_path, exc)
 
@@ -240,21 +256,14 @@ async def _edit_or_answer(
     reply_markup: InlineKeyboardMarkup | None = None,
 ) -> None:
     """Edit `status_message` in-place when available, otherwise send a new message via `message.answer`."""
-    edit_fn = getattr(status_message, "edit_text", None) if status_message is not None else None
-    if inspect.iscoroutinefunction(edit_fn):
+    if status_message is not None:
         try:
-            if reply_markup is not None:
-                await edit_fn(text, reply_markup=reply_markup)
-            else:
-                await edit_fn(text)
-            return
+            if await safe_edit_text(status_message, text, reply_markup=reply_markup):
+                return
         except Exception as exc:
             logger.debug("In-place edit_text failed, falling back to message.answer: %s", exc)
 
-    if reply_markup is not None:
-        await message.answer(text, reply_markup=reply_markup)
-    else:
-        await message.answer(text)
+    await safe_answer(message, text, reply_markup=reply_markup)
 
 
 async def _dispatch_pipeline_result(
@@ -284,6 +293,7 @@ async def _dispatch_pipeline_result(
         message=message,
         status_message=status_message,
         text=summary,
+        reply_markup=build_back_to_home_keyboard(),
     )
 
 
@@ -329,7 +339,8 @@ async def handle_incoming_media(
         else:
             active_name = None
 
-        status_msg = await message.answer(
+        status_msg = await safe_answer(
+            message,
             format_queued_job_card(job, position=position, active_job_filename=active_name),
             reply_markup=build_queued_job_keyboard(job.job_id),
         )
@@ -339,21 +350,21 @@ async def handle_incoming_media(
             _result: IngestionResult | None = None,
         ) -> None:
             if updated_job.state in {
+                JobState.PAUSED,
                 JobState.AWAITING_CONFIRMATION,
                 JobState.COMPLETED,
                 JobState.FAILED,
                 JobState.CANCELLED,
             }:
                 return
-            edit_fn = getattr(status_msg, "edit_text", None)
-            if inspect.iscoroutinefunction(edit_fn):
-                try:
-                    await edit_fn(
-                        render_job_stage_progress(updated_job),
-                        reply_markup=build_queued_job_keyboard(updated_job.job_id),
-                    )
-                except Exception as exc:
-                    logger.debug("Progress bar edit skipped for job %s: %s", updated_job.job_id, exc)
+            try:
+                await safe_edit_text(
+                    status_msg,
+                    render_job_stage_progress(updated_job),
+                    reply_markup=build_queued_job_keyboard(updated_job.job_id, state=updated_job.state),
+                )
+            except Exception as exc:
+                logger.debug("Progress bar edit skipped for job %s: %s", updated_job.job_id, exc)
 
         if source_path.is_file():
             try:
@@ -366,14 +377,36 @@ async def handle_incoming_media(
                 await _edit_or_answer(
                     message=message,
                     status_message=status_msg,
-                    text=(
-                        f"⚠️ <b>Ingestion Failed</b> (Job <code>{job.job_id}</code>)\n"
-                        f"Reason: <code>{html.escape(str(exc))}</code>"
+                    text=format_screen(
+                        title="⚠️ Ingestion Failed",
+                        context_lines=[f"Reason: <code>{html.escape(str(exc))}</code>"],
+                        footer_lines=[f"<i>Job ID:</i> <code>{html.escape(job.job_id)}</code>"],
                     ),
+                    reply_markup=build_back_to_home_keyboard(),
                 )
                 return
 
             if result is not None:
+                if (
+                    result.job.state == JobState.COMPLETED
+                    and message.audio is not None
+                    and governance_repository is not None
+                ):
+                    recent_tracks = await governance_repository.list_library_tracks(limit=20)
+                    for trk in recent_tracks:
+                        if trk.job_id == result.job.job_id or (
+                            result.job.final_path is not None and trk.storage_path == result.job.final_path
+                        ):
+                            chat_id = getattr(getattr(message, "chat", None), "id", None)
+                            msg_id = getattr(message, "message_id", None)
+                            await governance_repository.cache_track_telegram_file(
+                                trk.id,
+                                telegram_file_id=message.audio.file_id,
+                                source_chat_id=chat_id if isinstance(chat_id, int) else None,
+                                source_message_id=msg_id if isinstance(msg_id, int) else None,
+                            )
+                            break
+
                 await _dispatch_pipeline_result(
                     message,
                     result,
@@ -382,8 +415,13 @@ async def handle_incoming_media(
                 )
         return
 
+    queued_fallback_card = format_screen(
+        title="⏳ Ingestion Queued",
+        context_lines=[f"Queued payload <code>{html.escape(file_id)}</code> for ingestion."],
+        footer_lines=["<i>🧭 Home › Ingestion</i>"],
+    )
     if pipeline is not None and source_path.is_file():
-        status_msg = await message.answer(f"Queued payload <code>{file_id}</code> for ingestion.")
+        status_msg = await message.answer(queued_fallback_card)
         result = await pipeline.process_file(
             source_path=source_path,
             original_filename=file_name,
@@ -392,7 +430,7 @@ async def handle_incoming_media(
         await _dispatch_pipeline_result(message, result, state, status_message=status_msg)
         return
 
-    await message.answer(f"Queued payload <code>{file_id}</code> for ingestion.")
+    await message.answer(queued_fallback_card)
 
 
 __all__ = [

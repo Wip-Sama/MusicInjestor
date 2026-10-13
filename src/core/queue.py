@@ -168,22 +168,82 @@ class IngestionQueueWorker:
                 return index
         return 0
 
-    async def cancel_job(self, job_id: str, actor: UserAccount) -> IngestionJob:
-        """Cancel a `QUEUED` or `AWAITING_CONFIRMATION` job if permitted."""
-        job = await self._catalog.get_job(job_id)
-        if job is None:
-            msg = f"Unknown job {job_id}"
-            raise KeyError(msg)
-
+    def _authorize_job_control(self, job: IngestionJob, actor: UserAccount) -> None:
+        """Verify that `actor` is allowed to control `job` (owner or moderator+)."""
         is_owner_of_job = job.user_id is not None and job.user_id == actor.telegram_id
         if is_owner_of_job:
             require_permission(actor, Permission.VIEW_OWN_JOBS)
         elif not has_permission(actor, Permission.RESOLVE_OTHERS_JOBS):
             raise PermissionDeniedError(
-                f"User {actor.telegram_id} cannot cancel job {job_id} owned by {job.user_id}."
+                f"User {actor.telegram_id} cannot modify job {job.job_id} owned by {job.user_id}."
             )
 
-        return await self._pipeline.cancel_job(job_id)
+    async def cancel_job(self, job_id: str, actor: UserAccount) -> IngestionJob:
+        """Cancel a `QUEUED`, `PAUSED`, or `AWAITING_CONFIRMATION` job if permitted."""
+        job = await self._catalog.get_job(job_id)
+        if job is None:
+            msg = f"Unknown job {job_id}"
+            raise KeyError(msg)
+
+        self._authorize_job_control(job, actor)
+        return await self._pipeline.cancel_job(job.job_id)
+
+    async def pause_job(self, job_id: str, actor: UserAccount) -> IngestionJob:
+        """Pause/hold a pending job so it awaits manual review or explicit unlock."""
+        job = await self._catalog.get_job(job_id)
+        if job is None:
+            msg = f"Unknown job {job_id}"
+            raise KeyError(msg)
+
+        self._authorize_job_control(job, actor)
+        job.state = JobState.PAUSED
+        await self._catalog.save_job(job)
+        await self._governance.append_audit_log(
+            AuditLogEntry(
+                actor_id=actor.telegram_id,
+                action=AuditAction.JOB_PAUSED,
+                target_entity=f"job:{job.job_id}",
+                details={"filename": job.original_filename or job.source_path.name},
+            )
+        )
+        return job
+
+    async def unlock_job(self, job_id: str, actor: UserAccount) -> IngestionJob:
+        """Unlock a `PAUSED` job back to `QUEUED` so it can be processed."""
+        job = await self._catalog.get_job(job_id)
+        if job is None:
+            msg = f"Unknown job {job_id}"
+            raise KeyError(msg)
+
+        self._authorize_job_control(job, actor)
+        job.state = JobState.QUEUED
+        await self._catalog.save_job(job)
+        await self._governance.append_audit_log(
+            AuditLogEntry(
+                actor_id=actor.telegram_id,
+                action=AuditAction.JOB_UNLOCKED,
+                target_entity=f"job:{job.job_id}",
+                details={"filename": job.original_filename or job.source_path.name},
+            )
+        )
+        return job
+
+    async def review_job_manually(
+        self,
+        job_id: str,
+        actor: UserAccount,
+        progress_callback: ProgressCallback | None = None,
+    ) -> IngestionResult | None:
+        """Prepare and transition a queued/paused job into `AWAITING_CONFIRMATION` for manual review."""
+        job = await self._catalog.get_job(job_id)
+        if job is None:
+            msg = f"Unknown job {job_id}"
+            raise KeyError(msg)
+
+        self._authorize_job_control(job, actor)
+        result = await self._pipeline.prepare_for_review(job.job_id)
+        await self._dispatch_progress(result.job, result, progress_callback)
+        return result
 
     async def process_next_queued_job(self) -> IngestionResult | None:
         """Acquire a concurrency slot, pop the oldest `QUEUED` job in FIFO order, and execute it."""
@@ -210,6 +270,7 @@ class IngestionQueueWorker:
         self,
         job_id: str,
         progress_callback: ProgressCallback | None = None,
+        force_confirmation: bool = False,
     ) -> IngestionResult | None:
         """Execute a specific queued job under the worker concurrency semaphore."""
         async with self._condition:
@@ -220,6 +281,8 @@ class IngestionQueueWorker:
         try:
             job = await self._catalog.get_job(job_id)
             if job is None or job.state == JobState.CANCELLED:
+                return None
+            if job.state == JobState.PAUSED and not force_confirmation:
                 return None
 
             started_clock = time.monotonic()
@@ -243,6 +306,7 @@ class IngestionQueueWorker:
                     sha256_hash=job.sha256_hash,
                     started_at=job.started_at,
                     stage_callback=_on_stage,
+                    force_confirmation=force_confirmation,
                 )
             except Exception as exc:
                 failed_job = await self._catalog.get_job(job.job_id) or job
@@ -277,7 +341,7 @@ class IngestionQueueWorker:
         """Reset any interrupted in-flight jobs back to `QUEUED` on startup and return the FIFO queue."""
         active = await self._governance.list_active_jobs()
         for job in active:
-            if job.state not in {JobState.AWAITING_CONFIRMATION, JobState.AWAITING_INPUT}:
+            if job.state not in {JobState.AWAITING_CONFIRMATION, JobState.AWAITING_INPUT, JobState.PAUSED}:
                 job.state = JobState.QUEUED
                 await self._catalog.save_job(job)
         return await self._governance.list_queued_jobs()

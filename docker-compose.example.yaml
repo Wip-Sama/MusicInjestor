@@ -34,7 +34,7 @@ services:
       - ./storage/telegram-bot-api:/var/lib/telegram-bot-api
 
   music-ingest-bot:
-    image: ${MUSIC_BOT_IMAGE:-ghcr.io/owner/musicdownloader:latest}
+    image: ${MUSIC_BOT_IMAGE:-ghcr.io/wip-sama/musicinjestor:latest}
     build:
       context: .
       dockerfile: Dockerfile

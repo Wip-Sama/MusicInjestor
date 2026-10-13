@@ -1,15 +1,30 @@
 """Unit tests for the Telegram interface layer (`src.bot`)."""
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aiogram import Bot, Dispatcher
 from aiogram.client.telegram import PRODUCTION
-from aiogram.types import CallbackQuery, Message, User
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import (
+    AnswerCallbackQuery,
+    DeleteMessage,
+    EditMessageText,
+    ForwardMessage,
+    SendAudio,
+    SendChatAction,
+    SendMessage,
+    TelegramMethod,
+)
+from aiogram.types import Audio, CallbackQuery, Chat, InlineKeyboardMarkup, Message, Update, User
 
 from src.bot.api_server import build_telegram_api_server, resolve_local_api_file_path
 from src.bot.keyboards import (
+    BTN_BACK_LABEL,
+    BTN_HOME_LABEL,
     BTN_MAIN_ADMIN,
     BTN_MAIN_INFO,
     BTN_MAIN_QUEUE,
@@ -19,11 +34,14 @@ from src.bot.keyboards import (
     build_admin_dashboard_keyboard,
     build_guest_onboarding_keyboard,
     build_main_menu_keyboard,
+    build_manual_search_keyboard,
     build_oidc_link_keyboard,
     build_queued_job_keyboard,
+    build_song_action_keyboard,
     build_user_detail_keyboard,
     build_user_list_keyboard,
     build_verification_keyboard,
+    format_toggle_label,
 )
 from src.bot.middlewares import RbacMiddleware
 from src.bot.routers import build_root_router
@@ -41,6 +59,8 @@ from src.bot.routers.admin import (
 from src.bot.routers.commands import (
     handle_cancel_command,
     handle_fixtags_command,
+    handle_help,
+    handle_menu_navigation_callback,
     handle_queue_command,
     handle_sso_command,
     handle_start,
@@ -66,6 +86,15 @@ from src.bot.routers.verification import (
     handle_manual_search_query,
     handle_verification_callback,
     parse_verification_callback,
+)
+from src.bot.ui import (
+    ack_callback,
+    format_loading_card,
+    format_screen,
+    safe_answer,
+    safe_edit_text,
+    send_chat_action_safe,
+    strip_copy_text_buttons,
 )
 from src.config.settings import AppSettings
 from src.core.extractor import SevenZipArchiveExtractor
@@ -126,10 +155,16 @@ def test_verification_keyboard_and_callback_parsing() -> None:
         )
     ]
     markup = build_verification_keyboard("job99", candidates)
-    assert len(markup.inline_keyboard) == 2
+    assert len(markup.inline_keyboard) == 5
     first_btn = markup.inline_keyboard[0][0]
     assert first_btn.callback_data == "verify:select:job99:0"
     assert first_btn.text.startswith("1. [82%] Artist - Track A")
+    assert markup.inline_keyboard[1][0].callback_data == "queue:get_file:job99"
+    assert markup.inline_keyboard[1][1].callback_data == "verify:edit:job99"
+    assert markup.inline_keyboard[2][0].callback_data == "verify:manual:job99"
+    assert markup.inline_keyboard[2][1].callback_data == "verify:auto_enrich:job99"
+    assert markup.inline_keyboard[3][0].callback_data == "queue:pause:job99"
+    assert markup.inline_keyboard[3][1].callback_data == "verify:cancel:job99"
 
     action, job_id, idx = parse_verification_callback("verify:select:job99:0")
     assert action == "select"
@@ -179,7 +214,15 @@ def test_admin_and_onboarding_keyboards_and_parsers() -> None:
     assert approval_kb.inline_keyboard[0][0].callback_data == "access_req:approve:7:UPLOADER"
 
     queue_kb = build_queued_job_keyboard("job-uuid-1")
-    assert queue_kb.inline_keyboard[0][0].callback_data == "queue:cancel:job-uuid-1"
+    assert queue_kb.inline_keyboard[0][0].callback_data == "queue:get_file:job-uuid-1"
+    assert queue_kb.inline_keyboard[0][1].callback_data == "queue:review:job-uuid-1"
+    assert queue_kb.inline_keyboard[1][0].callback_data == "queue:pause:job-uuid-1"
+    assert queue_kb.inline_keyboard[1][1].callback_data == "queue:cancel:job-uuid-1"
+    paused_kb = build_queued_job_keyboard("job-uuid-1", state=JobState.PAUSED)
+    assert paused_kb.inline_keyboard[0][0].callback_data == "queue:get_file:job-uuid-1"
+    assert paused_kb.inline_keyboard[0][1].callback_data == "queue:review:job-uuid-1"
+    assert paused_kb.inline_keyboard[1][0].callback_data == "queue:unlock:job-uuid-1"
+    assert paused_kb.inline_keyboard[1][1].callback_data == "queue:cancel:job-uuid-1"
 
     dash_kb = build_admin_dashboard_keyboard(queued_count=3, concurrency_limit=2)
     assert len(dash_kb.inline_keyboard) == 3
@@ -200,6 +243,8 @@ def test_admin_and_onboarding_keyboards_and_parsers() -> None:
     detail_kb = build_user_detail_keyboard(sample_user)
     assert detail_kb.inline_keyboard[0][0].callback_data == "admin:promote:987654321:MODERATOR"
     assert detail_kb.inline_keyboard[0][1].callback_data == "admin:demote:987654321:GUEST"
+    assert detail_kb.inline_keyboard[2][0].callback_data == "admin:user_uploads:987654321"
+    assert detail_kb.inline_keyboard[2][1].callback_data == "admin:user_changes:987654321"
 
     assert parse_access_request_callback("access_req:request") == ("request", None, None)
     assert parse_access_request_callback("access_req:approve:12:MODERATOR") == (
@@ -212,6 +257,8 @@ def test_admin_and_onboarding_keyboards_and_parsers() -> None:
     assert parse_admin_callback("admin:panel") == ("panel", None, None)
     assert parse_admin_callback("admin:add_user") == ("add_user", None, None)
     assert parse_admin_callback("admin:user:987654321") == ("user", 987654321, None)
+    assert parse_admin_callback("admin:user_uploads:987654321") == ("user_uploads", 987654321, None)
+    assert parse_admin_callback("admin:user_changes:987654321") == ("user_changes", 987654321, None)
     assert parse_admin_callback("admin:promote:987654321:ADMIN") == (
         "promote",
         987654321,
@@ -257,7 +304,8 @@ def test_format_ingestion_summary_variants() -> None:
     confirm_result = IngestionResult(job=job, requires_user_confirmation=True)
     confirm_html = format_ingestion_summary(confirm_result)
     assert "Confirmation Required" in confirm_html
-    assert "<b>1. [98%]</b>" in confirm_html
+    assert "<code>1. [98%]</code>" in confirm_html
+    assert "<blockquote expandable>" in confirm_html
     assert "https://musicbrainz.org/release/ca344c5b-9c69-4283-8383-e7c4c026d571" in confirm_html
 
     job.final_path = Path("/music/Artist/Album/01 - a.flac")
@@ -1163,7 +1211,7 @@ def test_songs_interactive_menu_dry_run_editing_export_import_and_rescan(tmp_pat
         )
         rescan_preview = _last_arg(msg.answer)
         assert "Library Rescan Dry-Run Preview" in rescan_preview
-        assert "Added on Disk:</b> 1" in rescan_preview
+        assert "Added on Disk: <code>1</code>" in rescan_preview
 
         cb.data = "songs:rescan_apply"
         await handle_songs_callback(
@@ -1242,6 +1290,7 @@ def test_fsm_state_reset_and_audio_upload_isolation_prevent_stuck_states() -> No
 
         await handle_dry_run_unexpected_text(msg, state=fsm)
         assert "Pending Dry-Run Preview" in _last_arg(msg.answer)
+        assert "/cancel" not in _last_arg(msg.answer)
 
         await handle_cancel_command(msg, state=fsm)
         fsm.clear.assert_awaited()
@@ -1269,5 +1318,906 @@ def test_fsm_state_reset_and_audio_upload_isolation_prevent_stuck_states() -> No
             ),
         )
         assert fsm.set_state.await_count == 0 or state_data.get("active_song_id") == "stuck-id-2"
+
+    asyncio.run(_scenario())
+
+
+def test_ux_audit_rules_in_place_mutation_typography_and_ergonomics(tmp_path: Path) -> None:
+    """Verify the 5 UX Audit Rules: in-place mutation, callbacks, 3-tier HTML, keyboards, and latency."""
+    # Rule 3: 3-tier HTML hierarchy (`<b>Header</b>`, `<blockquote>`, `<code>`/`<i>` footer)
+    screen = format_screen(
+        title="🎛️ Dashboard",
+        context_lines=["Line 1", "Line 2"],
+        footer_lines=["<i>Breadcrumb</i> • <code>ID-1</code>"],
+        expandable=True,
+    )
+    assert screen.startswith("<b>🎛️ Dashboard</b>\n<blockquote expandable>")
+    assert "</blockquote>\n<i>Breadcrumb</i> • <code>ID-1</code>" in screen
+    assert screen.count("<b>") == 1
+
+    loading = format_loading_card("Scanning", "Please wait...", "🧭 Home › Rescan")
+    assert "<b>⏳ Scanning</b>" in loading
+    assert "<blockquote>Please wait...</blockquote>" in loading
+
+    # Rule 4: Toggle states, CopyTextButton, and 2-tier escape navigation (`◀ Back` and `🏠 Menu`)
+    assert format_toggle_label("Parallel Queue", True) == "✅ [Active] Parallel Queue"
+    assert format_toggle_label("Parallel Queue", False) == "⬜ [Disabled] Parallel Queue"
+
+    guest_kb = build_guest_onboarding_keyboard("https://auth.example.com", telegram_id=555666)
+    copy_payloads = [
+        btn.copy_text.text for row in guest_kb.inline_keyboard for btn in row if btn.copy_text is not None
+    ]
+    assert copy_payloads == ["555666"]
+
+    oidc_kb = build_oidc_link_keyboard("https://auth.example.com", subject="sub-uuid-999")
+    assert any(
+        btn.copy_text is not None and btn.copy_text.text == "sub-uuid-999"
+        for row in oidc_kb.inline_keyboard
+        for btn in row
+    )
+
+    song_kb = build_song_action_keyboard("track-uuid-123456")
+    song_buttons = [btn for row in song_kb.inline_keyboard for btn in row]
+    assert any(
+        btn.copy_text is not None and btn.copy_text.text == "track-uuid-123456" for btn in song_buttons
+    )
+    assert any(btn.text == BTN_BACK_LABEL for btn in song_buttons)
+    assert any(btn.text == BTN_HOME_LABEL for btn in song_buttons)
+
+    manual_kb = build_manual_search_keyboard("job-42")
+    manual_buttons = [btn for row in manual_kb.inline_keyboard for btn in row]
+    assert any(
+        btn.text == BTN_BACK_LABEL and btn.callback_data == "verify:back:job-42" for btn in manual_buttons
+    )
+    assert any(btn.text == BTN_HOME_LABEL and btn.callback_data == "menu:home" for btn in manual_buttons)
+
+    # Rules 1, 2, and 5: In-place mutation (`safe_edit_text`), unmodified suppression, caption fallback,
+    # and zero `msg.answer` inside callback handlers (`songs:search_prompt`, `menu:*`, `verify:back`)
+    async def _scenario() -> None:
+        msg = MagicMock(spec=Message)
+        msg.text = "existing text"
+        msg.caption = None
+        msg.answer = AsyncMock()
+        msg.edit_text = AsyncMock(
+            side_effect=TelegramBadRequest(
+                method=EditMessageText(chat_id=1, message_id=1, text="same"),
+                message="Bad Request: message is not modified",
+            )
+        )
+        # Should suppress "message is not modified" without raising
+        assert await safe_edit_text(msg, "same") is False
+
+        # Caption-only message should mutate via `edit_caption`
+        caption_msg = MagicMock(spec=Message)
+        caption_msg.text = None
+        caption_msg.caption = "old caption"
+        caption_msg.edit_caption = AsyncMock()
+        assert await safe_edit_text(caption_msg, "new caption") is True
+        caption_msg.edit_caption.assert_awaited_once_with(caption="new caption")
+
+        # Verify `handle_help` contains zero legacy CLI command dumps
+        msg.edit_text = AsyncMock()
+        await handle_help(msg)
+        help_html = _last_arg(msg.answer)
+        assert "/fixtags" not in help_html
+        assert "/wipe" not in help_html
+        assert "<blockquote expandable>" in help_html
+
+        # Verify `songs:search_prompt` and `menu:*` callbacks edit in-place and never call `msg.answer`
+        db = SqliteDatabaseManager(tmp_path / "ux.db")
+        repo = SqliteCatalogRepository(db)
+        await db.initialize()
+        owner = UserAccount(telegram_id=1001, display_name="Owner", role=UserRole.OWNER)
+        await repo.upsert_user(owner)
+
+        fsm = MagicMock()
+        fsm.set_state = AsyncMock()
+        fsm.update_data = AsyncMock()
+        fsm.clear = AsyncMock()
+
+        msg.answer.reset_mock()
+        msg.edit_text.reset_mock()
+        cb = MagicMock(spec=CallbackQuery)
+        cb.message = msg
+        cb.answer = AsyncMock()
+        cb.bot = MagicMock(send_chat_action=AsyncMock())
+        msg.chat = MagicMock(id=1001)
+
+        cb.data = "songs:search_prompt"
+        await handle_songs_callback(
+            cb,
+            state=fsm,
+            current_user=owner,
+            governance_repository=repo,
+        )
+        msg.answer.assert_not_awaited()
+        msg.edit_text.assert_awaited_once()
+        assert "Search Music Library" in _last_arg(msg.edit_text)
+
+        for nav_action in ("menu:home", "menu:status", "menu:sso", "menu:help"):
+            cb.data = nav_action
+            await handle_menu_navigation_callback(
+                cb,
+                state=fsm,
+                current_user=owner,
+                governance_repository=repo,
+            )
+        msg.answer.assert_not_awaited()
+
+        await send_chat_action_safe(cb)
+        cb.bot.send_chat_action.assert_awaited()
+        await ack_callback(cb, "Toast")
+
+    asyncio.run(_scenario())
+
+
+def test_real_aiogram_dispatcher_living_screen_navigation_and_fallbacks(tmp_path: Path) -> None:
+    """Simulate real `aiogram.Dispatcher`, `Bot`, `Message`, and `CallbackQuery` button navigation."""
+    db = SqliteDatabaseManager(tmp_path / "real_sim.db")
+    repo = SqliteCatalogRepository(db)
+    gov = GovernanceService(repo, owner_telegram_ids=(1001,))
+    lib_dir = tmp_path / "library"
+    scratch_dir = tmp_path / "scratch"
+    organizer = LibraryOrganizer(lib_dir)
+
+    candidates = [
+        MetadataCandidate(
+            metadata=TrackMetadata(
+                title="Stay Alive",
+                artist="Rie Takahashi",
+                album="Stay Alive",
+                year=2016,
+                track_number=1,
+                duration_seconds=266,
+                recording_mbid="rec-stay-alive",
+                release_mbid="rel-stay-alive",
+            ),
+            confidence=1.0,
+        )
+    ]
+    pipeline = IngestionPipeline(
+        extractor=SevenZipArchiveExtractor(scratch_root=scratch_dir),
+        fingerprinter=StubFingerprinter("fp-stay-alive"),
+        metadata_provider=StubMetadataProvider(candidates),
+        lyrics_provider=StubLyricsProvider(),
+        organizer=organizer,
+        catalog_repository=repo,
+    )
+    worker = IngestionQueueWorker(
+        pipeline=pipeline,
+        catalog_repository=repo,
+        governance_repository=repo,
+    )
+    settings = AppSettings(
+        telegram_api_id=12345,
+        telegram_api_hash="0123456789abcdef",
+        telegram_bot_token="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+        storage_scratch_dir=scratch_dir,
+        storage_library_dir=lib_dir,
+        database_path=tmp_path / "real_sim.db",
+    )
+
+    async def _scenario() -> None:
+        await db.initialize()
+
+        # Seed a real song in the library ("Rie Takahashi - Stay Alive")
+        src_audio = tmp_path / "01 - Stay Alive.flac"
+        src_audio.write_bytes(b"fLaC-stay-alive")
+        final_path = await organizer.finalize_track(
+            src_audio,
+            candidates[0].metadata,
+            LyricsData(synced_lyrics="[00:01.00] Stay Alive"),
+        )
+        await repo.register_ingested_track(
+            job_id="job-rie-1",
+            metadata=candidates[0].metadata,
+            fingerprint=AudioFingerprint(duration_seconds=266, fingerprint="fp-stay-alive"),
+            library_path=final_path,
+        )
+
+        # Wire real aiogram Bot and Dispatcher with RbacMiddleware and build_root_router()
+        bot = Bot(token=settings.telegram_bot_token)
+        rbac_mw = RbacMiddleware(governance_service=gov, oidc_enabled=False)
+        dp = Dispatcher()
+        dp.message.outer_middleware(rbac_mw)
+        dp.callback_query.outer_middleware(rbac_mw)
+        dp["pipeline"] = pipeline
+        dp["settings"] = settings
+        dp["governance_repository"] = repo
+        dp["governance_service"] = gov
+        dp["queue_worker"] = worker
+        dp.include_router(build_root_router())
+
+        tg_user = User(id=1001, is_bot=False, first_name="Owner", username="owner_u")
+        tg_chat = Chat(id=1001, type="private")
+
+        dispatched_methods: list[TelegramMethod[object]] = []
+        screen_state: dict[str, object] = {
+            "message_id": 100,
+            "text": "",
+            "reply_markup": None,
+            "reject_copy_text": False,
+        }
+        next_update_id = 1
+
+        async def _fake_make_request(
+            _bot: Bot,
+            method: TelegramMethod[object],
+            timeout: int | None = None,
+        ) -> object:
+            _ = timeout
+            dispatched_methods.append(method)
+            if isinstance(method, SendMessage):
+                markup = method.reply_markup
+                if (
+                    screen_state["reject_copy_text"]
+                    and isinstance(markup, InlineKeyboardMarkup)
+                    and any(
+                        getattr(btn, "copy_text", None) is not None
+                        for row in markup.inline_keyboard
+                        for btn in row
+                    )
+                ):
+                    raise TelegramBadRequest(
+                        method=method,
+                        message="Bad Request: BUTTON_TYPE_INVALID",
+                    )
+                msg_id = int(str(screen_state["message_id"])) + 1
+                screen_state["message_id"] = msg_id
+                screen_state["text"] = method.text
+                screen_state["reply_markup"] = markup
+                return Message(
+                    message_id=msg_id,
+                    date=datetime.now(UTC),
+                    chat=tg_chat,
+                    from_user=tg_user,
+                    text=method.text,
+                    reply_markup=markup if isinstance(markup, InlineKeyboardMarkup) else None,
+                )
+            if isinstance(method, EditMessageText):
+                markup = method.reply_markup
+                if (
+                    screen_state["reject_copy_text"]
+                    and isinstance(markup, InlineKeyboardMarkup)
+                    and any(
+                        getattr(btn, "copy_text", None) is not None
+                        for row in markup.inline_keyboard
+                        for btn in row
+                    )
+                ):
+                    raise TelegramBadRequest(
+                        method=method,
+                        message="Bad Request: BUTTON_TYPE_INVALID",
+                    )
+                screen_state["text"] = method.text
+                screen_state["reply_markup"] = markup
+                return Message(
+                    message_id=int(str(screen_state["message_id"])),
+                    date=datetime.now(UTC),
+                    chat=tg_chat,
+                    from_user=tg_user,
+                    text=method.text,
+                    reply_markup=markup,
+                )
+            if isinstance(method, (AnswerCallbackQuery, SendChatAction, DeleteMessage)):
+                return True
+            return True
+
+        bot.session.__dict__["make_request"] = _fake_make_request
+
+        async def _send_user_text(text: str) -> str:
+            nonlocal next_update_id
+            msg_id = int(str(screen_state["message_id"])) + 1
+            screen_state["message_id"] = msg_id
+            user_msg = Message(
+                message_id=msg_id,
+                date=datetime.now(UTC),
+                chat=tg_chat,
+                from_user=tg_user,
+                text=text,
+            )
+            upd = Update(update_id=next_update_id, message=user_msg)
+            next_update_id += 1
+            await dp.feed_update(bot, upd)
+            return str(screen_state["text"])
+
+        async def _click_button(label_substring: str) -> str:
+            nonlocal next_update_id
+            markup = screen_state["reply_markup"]
+            assert isinstance(markup, InlineKeyboardMarkup), (
+                f"Expected InlineKeyboardMarkup on screen, got {markup!r} for text={screen_state['text']!r}"
+            )
+            matched_callback: str | None = None
+            available: list[str] = []
+            for row in markup.inline_keyboard:
+                for btn in row:
+                    available.append(btn.text)
+                    if label_substring in btn.text and btn.callback_data:
+                        matched_callback = btn.callback_data
+                        break
+                if matched_callback is not None:
+                    break
+            assert matched_callback is not None, (
+                f"Button matching {label_substring!r} not found in {available}"
+            )
+
+            before_count = len(dispatched_methods)
+            active_msg = Message(
+                message_id=int(str(screen_state["message_id"])),
+                date=datetime.now(UTC),
+                chat=tg_chat,
+                from_user=tg_user,
+                text=str(screen_state["text"]),
+                reply_markup=markup,
+            )
+            cb_query = CallbackQuery(
+                id=f"cb-{next_update_id}",
+                from_user=tg_user,
+                chat_instance="ci-1",
+                message=active_msg,
+                data=matched_callback,
+            )
+            upd = Update(update_id=next_update_id, callback_query=cb_query)
+            next_update_id += 1
+            await dp.feed_update(bot, upd)
+
+            recent = dispatched_methods[before_count:]
+            assert any(isinstance(m, AnswerCallbackQuery) for m in recent), (
+                f"Callback {matched_callback!r} did not dispatch AnswerCallbackQuery!"
+            )
+            assert any(isinstance(m, EditMessageText) for m in recent), (
+                f"Callback {matched_callback!r} did not dispatch EditMessageText!"
+            )
+            assert not any(isinstance(m, SendMessage) for m in recent), (
+                f"Callback {matched_callback!r} sent a new message instead of editing in-place!"
+            )
+            return str(screen_state["text"])
+
+        try:
+            # 1. User opens `/songs` -> searches `"rie"` -> clicks song -> navigates submenus & `◀ Back`
+            text = await _send_user_text("/songs")
+            assert "Music Library Browser (1 track(s))" in text
+
+            text = await _send_user_text("rie")
+            assert "Search Results for rie (1)" in text
+
+            # Clicking `◀ Back` from filtered search results returns to full Music Library Browser!
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "Music Library Browser (1 track(s))" in text
+
+            # Search `"rie"` again and click the song button (`Rie Takahashi - Stay Alive`)
+            text = await _send_user_text("rie")
+            assert "Search Results for rie (1)" in text
+            text = await _click_button("Rie Takahashi - Stay Alive")
+            assert "Song Details &amp; Actions" in text
+
+            # Navigate into Edit Metadata -> Edit Title -> Back to Song Details
+            text = await _click_button("Edit Name / Metadata")
+            assert "Edit Metadata" in text
+            text = await _click_button("Edit Title")
+            assert "Enter New Title" in text
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "Song Details &amp; Actions" in text
+
+            # Navigate into Edit Cover -> Back to Song Details
+            text = await _click_button("Edit Cover")
+            assert "Edit Cover Art" in text
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "Song Details &amp; Actions" in text
+
+            # Navigate into Edit Lyrics -> Back to Song Details
+            text = await _click_button("Edit Lyrics")
+            assert "Edit Lyrics" in text
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "Song Details &amp; Actions" in text
+
+            # Navigate into Auto Re-Search -> Custom Search -> Back to Song Details
+            text = await _click_button("Auto Re-Search")
+            assert "Re-Search Song Data" in text
+            text = await _click_button("Custom Search")
+            assert "Custom Re-Search" in text
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "Song Details &amp; Actions" in text
+
+            # Navigate into Import Data -> Back to Song Details
+            text = await _click_button("Import Data")
+            assert "Import Song Data" in text
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "Song Details &amp; Actions" in text
+
+            # Click `◀ Back` from Song Details -> returns to Music Library Browser
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "Music Library Browser (1 track(s))" in text
+
+            # Click `🔎 Search Library` -> `◀ Back` -> `🔄 Rescan Library Folder` -> `◀ Back` to Home
+            text = await _click_button("Search Library")
+            assert "Search Music Library" in text
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "Music Library Browser (1 track(s))" in text
+
+            text = await _click_button("Rescan Library Folder")
+            assert "Library Rescan Dry-Run Preview" in text
+            text = await _click_button("Confirm & Sync Database")
+            assert "Library Rescan &amp; Sync Complete" in text
+
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "Automated Music Ingestion Bot" in text
+
+            # 2. From Home screen, navigate Status, SSO, Help, and Admin Panel via inline buttons & `◀ Back`
+            text = await _click_button("Status")
+            assert "System &amp; Session Status" in text
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "Automated Music Ingestion Bot" in text
+
+            text = await _click_button("Authentik SSO")
+            assert "Authentik OIDC Single Sign-On" in text
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "Automated Music Ingestion Bot" in text
+
+            text = await _click_button("Help")
+            assert "Music Ingestion Gateway Guide" in text
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "Automated Music Ingestion Bot" in text
+
+            # Navigate Admin Panel -> User Management -> Add User -> Back -> User Profile -> Back -> Home
+            text = await _click_button("Admin Panel")
+            assert "Administrator Control Panel" in text
+            text = await _click_button("User Management")
+            assert "User Management" in text
+            text = await _click_button("Add / Authorize User")
+            assert "Authorize or Promote User by Telegram ID" in text
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "User Management" in text
+            text = await _click_button("@owner_u")
+            assert "Managing User: @owner_u" in text
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "User Management" in text
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "Administrator Control Panel" in text
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "Automated Music Ingestion Bot" in text
+
+            # 3. Simulate older local `telegram-bot-api` server rejecting `CopyTextButton` (`copy_text`)
+            screen_state["reject_copy_text"] = True
+            text = await _click_button("Songs")
+            assert "Music Library Browser" in text
+            text = await _click_button("Rie Takahashi - Stay Alive")
+            assert "Song Details &amp; Actions" in text
+            fallback_markup = screen_state["reply_markup"]
+            assert isinstance(fallback_markup, InlineKeyboardMarkup)
+            assert all(
+                getattr(btn, "copy_text", None) is None
+                for row in fallback_markup.inline_keyboard
+                for btn in row
+            )
+            assert strip_copy_text_buttons(fallback_markup) is None
+
+            # Verify `safe_answer` also strips `CopyTextButton` on `SendMessage` when rejected
+            active_msg = Message(
+                message_id=int(str(screen_state["message_id"])),
+                date=datetime.now(UTC),
+                chat=tg_chat,
+                from_user=tg_user,
+                text="test",
+            ).as_(bot)
+            await safe_answer(
+                active_msg,
+                "Guest card",
+                reply_markup=build_guest_onboarding_keyboard(None, telegram_id=999),
+            )
+            assert "Guest card" in str(screen_state["text"])
+        finally:
+            await bot.session.close()
+
+    asyncio.run(_scenario())
+
+
+def test_song_provenance_history_user_activity_and_job_pause_review_controls(tmp_path: Path) -> None:
+    """Verify ordered song menu, provenance/history, audio forwarding, user activity, and job controls."""
+    db = SqliteDatabaseManager(tmp_path / "provenance_sim.db")
+    repo = SqliteCatalogRepository(db)
+    gov = GovernanceService(repo, owner_telegram_ids=(1001,))
+    lib_dir = tmp_path / "library"
+    scratch_dir = tmp_path / "scratch"
+    organizer = LibraryOrganizer(lib_dir)
+
+    candidates = [
+        MetadataCandidate(
+            metadata=TrackMetadata(
+                title="Stay Alive",
+                artist="Rie Takahashi",
+                album="Stay Alive",
+                year=2016,
+                track_number=1,
+                duration_seconds=266,
+                recording_mbid="rec-stay-alive",
+                release_mbid="rel-stay-alive",
+            ),
+            confidence=1.0,
+        )
+    ]
+    pipeline = IngestionPipeline(
+        extractor=SevenZipArchiveExtractor(scratch_root=scratch_dir),
+        fingerprinter=StubFingerprinter("fp-stay-alive"),
+        metadata_provider=StubMetadataProvider(candidates),
+        lyrics_provider=StubLyricsProvider(),
+        organizer=organizer,
+        catalog_repository=repo,
+    )
+    worker = IngestionQueueWorker(
+        pipeline=pipeline,
+        catalog_repository=repo,
+        governance_repository=repo,
+    )
+    settings = AppSettings(
+        telegram_api_id=12345,
+        telegram_api_hash="0123456789abcdef",
+        telegram_bot_token="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+        storage_scratch_dir=scratch_dir,
+        storage_library_dir=lib_dir,
+        database_path=tmp_path / "provenance_sim.db",
+    )
+
+    # 1. Verify Song Action Keyboard ordering (Retrieval & History in rows 0-1, Editing in rows 2-4)
+    song_kb = build_song_action_keyboard("trk-1234567890")
+    assert [btn.text for btn in song_kb.inline_keyboard[0]] == [
+        "📥 Get Song File",
+        "💿 Get Full Album",
+    ]
+    assert [btn.text for btn in song_kb.inline_keyboard[1]] == [
+        "📤 Export Data",
+        "📜 Song History",
+    ]
+    assert [btn.text for btn in song_kb.inline_keyboard[2]] == [
+        "✏️ Edit Name / Metadata",
+        "🖼️ Edit Cover",
+    ]
+    assert [btn.text for btn in song_kb.inline_keyboard[3]] == [
+        "📝 Edit Lyrics",
+        "🔎 Auto Re-Search",
+    ]
+    assert song_kb.inline_keyboard[4][0].text == "📥 Import Data"
+    assert "Copy Track ID" in song_kb.inline_keyboard[4][1].text
+
+    async def _scenario() -> None:
+        await db.initialize()
+        owner_account = await gov.ensure_user(
+            telegram_id=1001,
+            username="owner_u",
+            display_name="Owner User",
+        )
+
+        # Enqueue and ingest a track via worker so job + track provenance are linked
+        src_audio = tmp_path / "01 - Stay Alive.flac"
+        src_audio.write_bytes(b"fLaC-stay-alive")
+        job, _ = await worker.enqueue_job(
+            user=owner_account,
+            source_path=src_audio,
+            original_filename="01 - Stay Alive.flac",
+        )
+        res = await worker.execute_job(job.job_id)
+        assert res is not None and res.job.state == JobState.COMPLETED
+
+        tracks = await repo.list_library_tracks()
+        assert len(tracks) == 1
+        seeded_track = tracks[0]
+        assert seeded_track.uploaded_by == 1001
+        assert seeded_track.modification_count == 0
+
+        # Wire real aiogram Bot and Dispatcher
+        bot = Bot(token=settings.telegram_bot_token)
+        rbac_mw = RbacMiddleware(governance_service=gov, oidc_enabled=False)
+        dp = Dispatcher()
+        dp.message.outer_middleware(rbac_mw)
+        dp.callback_query.outer_middleware(rbac_mw)
+        dp["pipeline"] = pipeline
+        dp["settings"] = settings
+        dp["catalog_repository"] = repo
+        dp["governance_repository"] = repo
+        dp["governance_service"] = gov
+        dp["queue_worker"] = worker
+        dp.include_router(build_root_router())
+
+        tg_user = User(id=1001, is_bot=False, first_name="Owner", username="owner_u")
+        tg_chat = Chat(id=1001, type="private")
+
+        dispatched_methods: list[TelegramMethod[object]] = []
+        screen_state: dict[str, object] = {
+            "message_id": 200,
+            "text": "",
+            "reply_markup": None,
+        }
+        next_update_id = 1
+
+        async def _fake_make_request(
+            _bot: Bot,
+            method: TelegramMethod[object],
+            timeout: int | None = None,
+        ) -> object:
+            _ = timeout
+            dispatched_methods.append(method)
+            if isinstance(method, SendMessage):
+                msg_id = int(str(screen_state["message_id"])) + 1
+                screen_state["message_id"] = msg_id
+                screen_state["text"] = method.text
+                screen_state["reply_markup"] = method.reply_markup
+                return Message(
+                    message_id=msg_id,
+                    date=datetime.now(UTC),
+                    chat=tg_chat,
+                    from_user=tg_user,
+                    text=method.text,
+                    reply_markup=(
+                        method.reply_markup if isinstance(method.reply_markup, InlineKeyboardMarkup) else None
+                    ),
+                )
+            if isinstance(method, EditMessageText):
+                screen_state["text"] = method.text
+                screen_state["reply_markup"] = method.reply_markup
+                return Message(
+                    message_id=int(str(screen_state["message_id"])),
+                    date=datetime.now(UTC),
+                    chat=tg_chat,
+                    from_user=tg_user,
+                    text=method.text,
+                    reply_markup=method.reply_markup,
+                )
+            if isinstance(method, SendAudio):
+                msg_id = int(str(screen_state["message_id"])) + 1
+                screen_state["message_id"] = msg_id
+                return Message(
+                    message_id=msg_id,
+                    date=datetime.now(UTC),
+                    chat=tg_chat,
+                    from_user=tg_user,
+                    audio=Audio(
+                        file_id="cached-tg-file-id-999",
+                        file_unique_id="uniq-999",
+                        duration=266,
+                    ),
+                )
+            if isinstance(method, ForwardMessage):
+                msg_id = int(str(screen_state["message_id"])) + 1
+                screen_state["message_id"] = msg_id
+                return Message(
+                    message_id=msg_id,
+                    date=datetime.now(UTC),
+                    chat=tg_chat,
+                    from_user=tg_user,
+                    text="forwarded",
+                )
+            if isinstance(method, (AnswerCallbackQuery, SendChatAction, DeleteMessage)):
+                return True
+            return True
+
+        bot.session.__dict__["make_request"] = _fake_make_request
+
+        async def _send_user_text(text: str) -> str:
+            nonlocal next_update_id
+            msg_id = int(str(screen_state["message_id"])) + 1
+            screen_state["message_id"] = msg_id
+            user_msg = Message(
+                message_id=msg_id,
+                date=datetime.now(UTC),
+                chat=tg_chat,
+                from_user=tg_user,
+                text=text,
+            )
+            upd = Update(update_id=next_update_id, message=user_msg)
+            next_update_id += 1
+            await dp.feed_update(bot, upd)
+            return str(screen_state["text"])
+
+        async def _click_button(label_substring: str, *, expect_edit: bool = True) -> str:
+            nonlocal next_update_id
+            markup = screen_state["reply_markup"]
+            assert isinstance(markup, InlineKeyboardMarkup)
+            matched_callback: str | None = None
+            for row in markup.inline_keyboard:
+                for btn in row:
+                    if label_substring in btn.text and btn.callback_data:
+                        matched_callback = btn.callback_data
+                        break
+                if matched_callback is not None:
+                    break
+            assert matched_callback is not None, f"Button {label_substring!r} not found"
+
+            before_count = len(dispatched_methods)
+            active_msg = Message(
+                message_id=int(str(screen_state["message_id"])),
+                date=datetime.now(UTC),
+                chat=tg_chat,
+                from_user=tg_user,
+                text=str(screen_state["text"]),
+                reply_markup=markup,
+            )
+            cb_query = CallbackQuery(
+                id=f"cb-{next_update_id}",
+                from_user=tg_user,
+                chat_instance="ci-2",
+                message=active_msg,
+                data=matched_callback,
+            )
+            upd = Update(update_id=next_update_id, callback_query=cb_query)
+            next_update_id += 1
+            await dp.feed_update(bot, upd)
+
+            recent = dispatched_methods[before_count:]
+            assert any(isinstance(m, AnswerCallbackQuery) for m in recent)
+            if expect_edit:
+                assert any(isinstance(m, EditMessageText) for m in recent)
+            return str(screen_state["text"])
+
+        try:
+            # 2. Open `/songs` -> view song -> verify provenance & Never (0 edits)
+            await _send_user_text("/songs")
+            text = await _click_button("Rie Takahashi - Stay Alive")
+            assert "Added By: <code>@owner_u (1001)</code>" in text
+            assert "Modified: <code>Never (0 edits)</code>" in text
+
+            # First `📥 Get Song File` uploads via `SendAudio` and caches file/message IDs
+            before_dl = len(dispatched_methods)
+            await _click_button("Get Song File", expect_edit=False)
+            assert any(isinstance(m, SendAudio) for m in dispatched_methods[before_dl:])
+
+            # Second `📥 Get Song File` forwards the cached message via `ForwardMessage`!
+            before_fwd = len(dispatched_methods)
+            await _click_button("Get Song File", expect_edit=False)
+            assert any(isinstance(m, ForwardMessage) for m in dispatched_methods[before_fwd:])
+
+            # Edit title -> dry-run preview -> Confirm & Apply -> modification_count becomes 1
+            await _click_button("Edit Name / Metadata")
+            await _click_button("Edit Title")
+            text = await _send_user_text("Stay Alive (TV Size)")
+            assert "Dry-Run Preview" in text
+            text = await _click_button("Confirm & Apply Changes")
+            assert "Modified: <code>1 time(s)</code>" in text
+            assert "Last by <code>@owner_u (1001)</code>" in text
+
+            # Open `📜 Song History` -> shows chronological edit history -> `◀ Back` returns to Song Details
+            text = await _click_button("Song History")
+            assert "Song Provenance &amp; Edit History" in text
+            assert "Total Modifications: <code>1</code>" in text
+            assert "SONG_UPDATED_INTERACTIVE" in text
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "Song Details &amp; Actions" in text
+
+            # 3. Open `/admin` -> User Management -> `@owner_u` -> verify Uploads & Changes
+            await _send_user_text("/admin")
+            await _click_button("User Management")
+            text = await _click_button("@owner_u")
+            assert "Total Uploads: 1 albums (1 tracks)" in text
+            assert "Recorded Actions / Edits:" in text
+
+            text = await _click_button("User Uploads")
+            assert "Uploaded Songs — @owner_u (1)" in text
+            assert "Rie Takahashi — Stay Alive (TV Size)" in text
+            assert "1 edit(s)" in text
+            # Tapping a song inside User Uploads opens Song Details, and `◀ Back` returns to User Uploads!
+            text = await _click_button("Rie Takahashi - Stay Alive (TV Size)")
+            assert "Song Details &amp; Actions" in text
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "Uploaded Songs — @owner_u (1)" in text
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "Managing User: @owner_u" in text
+
+            text = await _click_button("User Changes & History")
+            assert "Chronological Activity &amp; Changes — @owner_u" in text
+            assert "SONG_UPDATED_INTERACTIVE" in text
+            assert "INGEST_SUCCESS" in text
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "Managing User: @owner_u" in text
+
+            # 3b. Interactive Help topics & context-aware `◀ Back` when launching a module from Help
+            text = await _send_user_text("/help")
+            assert "Music Ingestion Gateway Guide" in text
+            text = await _click_button("Ingestion & Pipeline")
+            assert "Help Guide — Audio &amp; Archive Ingestion" in text
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "Music Ingestion Gateway Guide" in text
+
+            text = await _click_button("Queue & Review")
+            assert "Help Guide — Queue &amp; Manual Review" in text
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "Music Ingestion Gateway Guide" in text
+
+            text = await _click_button("Songs & Editor")
+            assert "Help Guide — Songs Library &amp; Editor" in text
+            # Launch Songs Browser from inside `help:songs`, then press `◀ Back` -> returns to `help:songs`!
+            text = await _click_button("Open Songs Browser")
+            assert "Music Library Browser" in text
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "Help Guide — Songs Library &amp; Editor" in text
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "Music Ingestion Gateway Guide" in text
+
+            # 4. Enqueue a pending job -> test Queue Overview, `📥 Get Queued File`, Pause/Unlock,
+            # context-aware `◀ Back` (`admin:queue` vs `queue:mine`), and `✏️ Manual Tag & Editor`
+            pipeline._fingerprinter = StubFingerprinter("fp-wishing")
+            pipeline._metadata = StubMetadataProvider(
+                [
+                    MetadataCandidate(
+                        metadata=TrackMetadata(
+                            title="Wishing",
+                            artist="Inori Minase",
+                            album="Stay Alive",
+                            year=2016,
+                            track_number=2,
+                            duration_seconds=360,
+                            recording_mbid="rec-wishing",
+                            release_mbid="rel-stay-alive",
+                        ),
+                        confidence=1.0,
+                    )
+                ]
+            )
+            pending_audio = tmp_path / "02 - Wishing.flac"
+            pending_audio.write_bytes(b"fLaC-wishing")
+            pending_job, _ = await worker.enqueue_job(
+                user=owner_account,
+                source_path=pending_audio,
+                original_filename="02 - Wishing.flac",
+                job_id="pending-job-wishing-001",
+            )
+
+            # Open Queue from `/admin` -> `admin:queue` -> click item -> `◀ Back` returns to `admin:queue`
+            await _send_user_text("/admin")
+            text = await _click_button("View Queue")
+            assert "Ingestion Queue" in text
+            text = await _click_button("02 - Wishing.flac")
+            assert "Ingestion Job Inspector" in text
+            text = await _click_button(BTN_BACK_LABEL)
+            assert "Ingestion Queue" in text
+
+            # Paste the Job ID directly in idle chat -> opens interactive `Ingestion Job Inspector`!
+            await _send_user_text("/cancel")
+            text = await _send_user_text(pending_job.job_id)
+            assert "Ingestion Job Inspector" in text
+            assert pending_job.job_id in text
+
+            # Click `📥 Get Queued File` -> delivers the queued audio file via `SendAudio`
+            before_q_dl = len(dispatched_methods)
+            await _click_button("Get Queued File", expect_edit=False)
+            assert any(isinstance(m, SendAudio) for m in dispatched_methods[before_q_dl:])
+
+            # Click `⏸️ Pause / Hold` -> job state becomes `PAUSED` and worker skips auto-execution
+            text = await _click_button("Pause / Hold")
+            assert "Ingestion Paused (Held for Review)" in text
+            skipped_res = await worker.execute_job(pending_job.job_id)
+            assert skipped_res is None
+
+            # Click `▶️ Unlock & Resume` -> job returns to `QUEUED`
+            text = await _click_button("Unlock & Resume")
+            assert "Ingestion Queued" in text
+
+            # Click `🔎 Manual Review & Tag` -> forces pipeline to stop at `AWAITING_CONFIRMATION`
+            text = await _click_button("Manual Review")
+            assert "Confirmation Required" in text
+
+            # Click `✏️ Manual Tag & Editor` -> opens full-pipeline Dry-Run & Tag Editor for the queued job
+            text = await _click_button("Manual Tag & Editor")
+            assert "Queued Job Tag Editor &amp; Dry-Run Preview" in text
+
+            # Edit Title via `🏷️ Edit Title`
+            text = await _click_button("Edit Title")
+            assert "Enter New Title" in text
+            text = await _send_user_text("Wishing (Remastered)")
+            assert "Queued Job Tag Editor &amp; Dry-Run Preview" in text
+            assert "Wishing (Remastered)" in text
+
+            # Edit Lyrics via `📝 Edit Lyrics`
+            text = await _click_button("Edit Lyrics")
+            assert "Set Lyrics for Queued Job" in text
+            text = await _send_user_text("[00:02.00] Wishing synced line")
+            assert "Queued Job Tag Editor &amp; Dry-Run Preview" in text
+            assert "Synced LRC" in text
+
+            # Confirm & Ingest Track via `✅ Confirm & Ingest Track`
+            text = await _click_button("Confirm & Ingest Track")
+            assert "Track Ingested" in text
+            all_tracks = await repo.list_library_tracks()
+            assert any(t.title == "Wishing (Remastered)" for t in all_tracks)
+        finally:
+            await bot.session.close()
 
     asyncio.run(_scenario())

@@ -40,14 +40,15 @@ musicDownloader/
 │   │   ├── database.py          # WAL connection & DDL manager
 │   │   ├── models.py            # SQLite table & index DDL statements (users, access_requests, jobs, tracks, audit_logs)
 │   │   └── repository.py        # SqliteCatalogRepository implementing CatalogRepositoryPort & GovernanceRepositoryPort
-│   └── bot/                     # TELEGRAM INTERFACE ADAPTER (aiogram 3.x)
-│       ├── api_server.py        # Local Bot API session builder & container->host path translator
-│       ├── notifier.py          # TelegramAdminLogNotifier implementing AdminLogNotifierPort
-│       ├── oidc_server.py       # OAuth2 `/api/v1/auth/callback` & Authentik webhook coordinator
-│       ├── states.py            # FSM states (IngestionStates)
-│       ├── middlewares/         # RbacMiddleware (role enforcement, 15m OIDC sync, guest upload discard)
-│       ├── keyboards/           # InlineKeyboardMarkup builders for verification, onboarding & /admin
-│       └── routers/             # /start, /help, /status, /admin, file ingress, and callback routers
+│    └── bot/                     # TELEGRAM INTERFACE ADAPTER (aiogram 3.x)
+        ├── api_server.py        # Local Bot API session builder & container->host path translator
+        ├── notifier.py          # TelegramAdminLogNotifier implementing AdminLogNotifierPort
+        ├── oidc_server.py       # OAuth2 `/api/v1/auth/callback` & Authentik webhook coordinator
+        ├── states.py            # FSM states (IngestionStates, SongManagementStates)
+        ├── ui.py                # Shared 3-tier HTML screen formatter, safe in-place editor & callback lifecycle helpers
+        ├── middlewares/         # RbacMiddleware (role enforcement, 15m OIDC sync, guest upload discard)
+        ├── keyboards/           # InlineKeyboardBuilder, CallbackData & CopyTextButton builders
+        └── routers/             # /start, /help, /status, /admin, /songs, file ingress, and callback routers
 └── tests/
     ├── test_architecture.py     # AST enforcement of hexagonal boundaries & explicit imports
     ├── unit/                    # Fast isolated unit tests (settings, models, pipeline, RBAC, OIDC, queue, bot)
@@ -86,7 +87,7 @@ uv run pytest
    ```
 
 ### 3.3 Full Containerized Execution, GHCR Pull & Local `act` CI Testing
-- **Pull pre-built image from GHCR (set `MUSIC_BOT_IMAGE=ghcr.io/<owner>/<repo>:latest` in `.env`):**
+- **Pull pre-built image from GHCR (set `MUSIC_BOT_IMAGE=ghcr.io/wip-sama/musicinjestor:latest` in `.env`):**
   ```bash
   docker compose pull && docker compose up -d
   ```
@@ -169,8 +170,27 @@ Before concluding any task that modifies code:
   - Added `<artist>/<album>/<filename>` tail-key matching (`_extract_tail_library_key`) during filesystem rescan so migrating `library.db` between a host path and a Docker container mount (`/mnt/music/library`) automatically updates `storage_path` without losing track IDs or Chromaprint fingerprints.
   - Added layered YAML configuration loading (`config.yaml` / `CONFIG_FILE` < `.env` < environment variables) and `UMASK` / `PUID` / `PGID` support in `src/config/settings.py`, plus `config.example.yaml` and `docker-compose.example.yaml` for external bind-mounted music folders (`HOST_MUSIC_DIR`).
 - [x] **M11: GitHub Actions CI/CD, GHCR Container Registry Publishing & Local `act` Runner Support**
-  - Added `.github/workflows/ci.yml` with `quality-and-test` (`ruff check`, `ruff format --check`, `ty check`, `pytest`) and `docker-build-publish` (publishing tagged images to `ghcr.io/<owner>/<repo>` on branch/tag pushes and running local Docker build+test verification when invoked via `act`).
-  - Added `.actrc` targeting `catthehacker/ubuntu:act-latest` and updated `docker-compose.yml`, `docker-compose.example.yaml`, and `.env.example` with `MUSIC_BOT_IMAGE` so deployments can either pull pre-built GHCR images or build locally.
+  - Added `.github/workflows/ci.yml` with `quality-and-test` (`ruff check`, `ruff format --check`, `ty check`, `pytest`) and `docker-build-publish` (publishing tagged images to `ghcr.io/wip-sama/musicinjestor` on branch/tag pushes with automatic lowercasing and running local Docker build+test verification when invoked via `act`).
+  - Added `.actrc` targeting `catthehacker/ubuntu:act-latest` and updated `docker-compose.yml`, `docker-compose.example.yaml`, and `.env.example` with `MUSIC_BOT_IMAGE=ghcr.io/wip-sama/musicinjestor:latest` so deployments can either pull pre-built GHCR images or build locally.
+- [x] **M12: Telegram UI/UX Architecture Modernization (Single Living Screen, 3-Tier HTML Typography & `InlineKeyboardBuilder` Ergonomics)**
+  - Added `src/bot/ui.py` (`format_screen`, `format_loading_card`, `ack_callback`, `safe_edit_text`, `safe_answer`, `strip_copy_text_buttons`, `send_chat_action_safe`) and refactored all routers (`commands`, `files`, `verification`, `admin`, `songs`) and `src/core/audit.py`.
+  - Eliminated vertical chat spam in callback handlers (`verify:manual`, `admin:add_user`, `queue:mine`, `songs:search_prompt`, `menu:*`) by mutating messages in-place via `safe_edit_text` (with `TelegramBadRequest: message is not modified` suppression, `edit_caption` fallback, `InaccessibleMessage` support via `bot.edit_message_text`, and automatic `CopyTextButton` fallback for older local Bot API builds).
+  - Handled real `aiogram` 3.x synchronous `TelegramMethod`-returning methods (`Message.edit_text`, `CallbackQuery.answer`, `Bot.send_chat_action`) via `callable(...)` + `inspect.isawaitable(...)` instead of `inspect.iscoroutinefunction(...)`, backed by end-to-end `aiogram.Dispatcher` behavioral tests (`test_real_aiogram_dispatcher_living_screen_navigation_and_fallbacks`).
+  - Enforced the 3-tier Telegram HTML hierarchy (`<b>Header</b>`, native `<blockquote>` / `<blockquote expandable>` context blocks, and `<code>` / `<i>` breadcrumb/timestamp footers) and removed legacy CLI command lists from chat text.
+  - Converted all keyboard builders to `InlineKeyboardBuilder` / `ReplyKeyboardBuilder` with typed `CallbackData` schemas, native `CopyTextButton` (`copy_text=CopyTextButton(...)`) for IDs/tokens, consistent `✅ [Active]` / `⬜ [Disabled]` toggle states, and 2-tier escape navigation (`◀ Back` on Level 1; `◀ Back` + `🏠 Menu` on Level >= 2, including filtered search results returning to `songs:list`).
+  - Added immediate callback acknowledgment (`ack_callback`) and >500ms latency feedback (`format_loading_card` + `send_chat_action_safe`) before long-running ingestion, rescan, OIDC sync, and metadata/lyrics lookup operations.
+- [x] **M13: Ordered Song Menu, Provenance & Edit History, Chronological User Activity, Interactive Job Pause/Unlock/Review & Audio Forwarding**
+  - Reordered `build_song_action_keyboard` into dedicated Retrieval/History rows (`📥 Get Song File`, `💿 Get Full Album`, `📤 Export Data`, `📜 Song History`) above Edit/Mutation rows (`✏️ Edit Name / Metadata`, `🖼️ Edit Cover`, `📝 Edit Lyrics`, `🔎 Auto Re-Search`, `📥 Import Data`, `📋 Copy Track ID`).
+  - Added full song provenance & modification tracking (`updated_at`, `modified_by`, `modification_count`, `telegram_file_id`, `source_chat_id`, `source_message_id` with SQLite auto-migration and `uploaded_by` backfill from `ingestion_jobs`), displaying who added each song, when, how many times it was modified, when last modified, and by whom, plus an interactive `📜 Song History` screen (`songs:history:<track_id>`).
+  - Extended User Management (`admin:user:<id>`) with chronological `📤 User Uploads` (`admin:user_uploads:<id>`) and `📝 User Changes & History` (`admin:user_changes:<id>`) views and accurate upload/change counts.
+  - Added `JobState.PAUSED` and interactive queued-job controls (`⏸️ Pause / Hold`, `▶️ Unlock & Resume`, `🔎 Manual Review`, `❌ Cancel Job`) in `IngestionQueueWorker` and `admin_router`, plus actionable Job ID / Track ID lookup via `/job <id>` or pasting an ID directly in chat.
+  - Implemented smart song delivery (`_deliver_track_audio`) supporting message forwarding (`bot.forward_message`), cached `telegram_file_id` reuse, and disk `FSInputFile` fallback with automatic cache invalidation on retag/cover/lyrics edits.
+- [x] **M14: Interactive Help Topics (`help:<topic>`), Structured Queue Item Layout & File Retrieval (`queue:get_file`), Full-Pipeline Queued Job Tag Editor (`verify:edit`), and Per-Message Context-Aware `◀ Back` Navigation**
+  - Replaced direct module links in `ℹ️ Help` (`/help` / `menu:help`) with dedicated in-place Help topic screens (`help:ingestion`, `help:songs`, `help:queue`, `help:sso`, `help:status`, `help:admin`) explaining how each workflow operates, with optional `🚀 Open ...` launchers and `◀ Back` returning to Help.
+  - Structured the Queue Overview (`render_queue_overview_screen` + `build_paused_jobs_keyboard`) with 1 row per queue item (`🔍 Resolve`, `⏸️ Held`, `⏳ #1`, `⚙️ Active`) and organized singular Queue Item controls (`build_queued_job_keyboard`) into logical rows: Row 1 (`📥 Get Queued File` | `🔎 Manual Review & Tag`), Row 2 (`⏸️ Pause / Hold` or `▶️ Unlock & Resume` | `❌ Cancel Job`), Row 3 (`📋 Copy Job ID`), Row 4 (`◀ Back` | `🏠 Menu`).
+  - Added `queue:get_file:<job_id>` (`_deliver_queued_job_file`) so users and moderators can download/listen to the queued audio or archive before or during manual review.
+  - Added `IngestionPipeline.prepare_for_review` and `IngestionPipeline.complete_custom_ingestion` plus the full-pipeline Manual Tag & Dry-Run Editor for queued jobs (`verify:edit:<job_id>`, `verify:field:<job_id>:<field>`, `verify:cover:<job_id>`, `verify:lyrics:<job_id>`, `verify:auto_enrich:<job_id>`, `verify:apply_edit:<job_id>`).
+  - Implemented per-message navigation stack tracking (`resolve_back_callback` and `reset_fsm_state` in `src/bot/ui.py`) so `◀ Back` dynamically returns to the actual parent screen when a view is reachable from multiple entry points (e.g., `songs:view` from `admin:user_uploads` vs `songs:list`; `queue:view` from `admin:queue` vs `queue:mine`; modules opened from `help:<topic>` vs `menu:home`).
 
 ### Planned Backlog (Future Enhancements)
 - [ ] **Low-Priority Backlog: Admin Folder Structure Viewer & Mass Migration**

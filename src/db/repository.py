@@ -303,6 +303,16 @@ class SqliteCatalogRepository:
         fingerprint_json = json.dumps(asdict(job.fingerprint)) if job.fingerprint is not None else None
 
         async with self._db.connect() as conn:
+            resolved_user_id = job.user_id
+            if resolved_user_id is None:
+                cur_u = await conn.execute(
+                    "SELECT user_id FROM ingestion_jobs WHERE job_id = ? LIMIT 1",
+                    (job.job_id,),
+                )
+                row_u = await cur_u.fetchone()
+                if row_u is not None and row_u[0] is not None:
+                    resolved_user_id = int(str(row_u[0]))
+
             await conn.execute(
                 """
                 INSERT OR REPLACE INTO ingestion_jobs (
@@ -316,7 +326,7 @@ class SqliteCatalogRepository:
                 (
                     job.job_id,
                     job.job_id,
-                    job.user_id,
+                    resolved_user_id,
                     str(job.state),
                     str(job.state),
                     str(job.source_type),
@@ -340,7 +350,10 @@ class SqliteCatalogRepository:
             await conn.commit()
 
     async def get_job(self, job_id: str) -> IngestionJob | None:
-        """Load an `IngestionJob` by `job_id` from `ingestion_jobs`."""
+        """Load an `IngestionJob` by `job_id` (or prefix) from `ingestion_jobs`."""
+        clean_id = job_id.strip()
+        if not clean_id:
+            return None
         async with self._db.connect() as conn:
             cursor = await conn.execute(
                 """
@@ -352,9 +365,11 @@ class SqliteCatalogRepository:
                        confidence_score, matched_release_mbid,
                        started_at, completed_at
                 FROM ingestion_jobs
-                WHERE job_id = ?
+                WHERE job_id = ? OR job_id LIKE ?
+                ORDER BY CASE WHEN job_id = ? THEN 0 ELSE 1 END, created_at DESC
+                LIMIT 1
                 """,
-                (job_id,),
+                (clean_id, f"{clean_id}%", clean_id),
             )
             row = await cursor.fetchone()
             if row is None:
@@ -505,8 +520,9 @@ class SqliteCatalogRepository:
                 SELECT COUNT(DISTINCT album), COUNT(*)
                 FROM library_tracks
                 WHERE uploaded_by = ?
+                   OR job_id IN (SELECT job_id FROM ingestion_jobs WHERE user_id = ?)
                 """,
-                (telegram_id,),
+                (telegram_id, telegram_id),
             )
             row = await cursor.fetchone()
             if row is None:
@@ -641,25 +657,75 @@ class SqliteCatalogRepository:
                 (limit,),
             )
             rows = await cursor.fetchall()
+        return [_row_to_audit_log(tuple(row)) for row in rows]
 
-        entries: list[AuditLogEntry] = []
-        for row in rows:
-            raw_details = str(row[4]) if row[4] is not None else "{}"
-            try:
-                details = json.loads(raw_details)
-            except Exception:
-                details = {}
-            entries.append(
-                AuditLogEntry(
-                    id=int(str(row[0])),
-                    actor_id=int(str(row[1])),
-                    action=str(row[2]),
-                    target_entity=str(row[3]) if row[3] is not None else None,
-                    details=details if isinstance(details, dict) else {},
-                    created_at=_parse_iso_datetime(row[5]) or datetime.now(UTC),
-                )
+    async def list_user_audit_logs(self, actor_id: int, limit: int = 50) -> list[AuditLogEntry]:
+        """Retrieve audit log records performed by `actor_id` ordered chronologically newest-first."""
+        async with self._db.connect() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT id, actor_id, action, target_entity, details_json, created_at
+                FROM audit_logs
+                WHERE actor_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (actor_id, limit),
             )
-        return entries
+            rows = await cursor.fetchall()
+        return [_row_to_audit_log(tuple(row)) for row in rows]
+
+    async def list_entity_audit_logs(self, target_entity: str, limit: int = 50) -> list[AuditLogEntry]:
+        """Retrieve audit log records targeting `target_entity` ordered chronologically newest-first."""
+        clean_t = target_entity.strip()
+        if not clean_t:
+            return []
+        short_prefix = clean_t[:12]
+        async with self._db.connect() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT id, actor_id, action, target_entity, details_json, created_at
+                FROM audit_logs
+                WHERE target_entity = ?
+                   OR target_entity = ?
+                   OR target_entity = ?
+                   OR target_entity LIKE ?
+                   OR target_entity LIKE ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (
+                    clean_t,
+                    f"track:{clean_t}",
+                    f"job:{clean_t}",
+                    f"{short_prefix}%",
+                    f"track:{short_prefix}%",
+                    limit,
+                ),
+            )
+            rows = await cursor.fetchall()
+        return [_row_to_audit_log(tuple(row)) for row in rows]
+
+    async def list_user_uploaded_tracks(
+        self,
+        telegram_id: int,
+        limit: int = 50,
+    ) -> list[LibraryTrackRecord]:
+        """List library tracks uploaded by `telegram_id` ordered chronologically newest-first."""
+        async with self._db.connect() as conn:
+            cursor = await conn.execute(
+                f"""
+                SELECT {_LIBRARY_TRACK_COLUMNS}
+                FROM library_tracks
+                WHERE uploaded_by = ?
+                   OR job_id IN (SELECT job_id FROM ingestion_jobs WHERE user_id = ?)
+                ORDER BY ingested_at DESC
+                LIMIT ?
+                """,
+                (telegram_id, telegram_id, limit),
+            )
+            rows = await cursor.fetchall()
+        return [_row_to_library_track(tuple(r)) for r in rows]
 
     async def list_queued_jobs(self, user_id: int | None = None) -> list[IngestionJob]:
         """Return jobs in QUEUED state ordered FIFO by `created_at`."""
@@ -698,9 +764,47 @@ class SqliteCatalogRepository:
             rows = await cursor.fetchall()
         return [_row_to_job(tuple(r)) for r in rows]
 
+    async def list_paused_jobs(self, user_id: int | None = None) -> list[IngestionJob]:
+        """Return jobs in PAUSED state ordered FIFO by `created_at`."""
+        async with self._db.connect() as conn:
+            if user_id is not None:
+                cursor = await conn.execute(
+                    """
+                    SELECT job_id, source_path, state, candidates_json,
+                           selected_metadata_json, fingerprint_json,
+                           final_path, error_message, created_at,
+                           user_id, source_type, original_filename,
+                           file_size_bytes, scratch_dir, sha256_hash,
+                           confidence_score, matched_release_mbid,
+                           started_at, completed_at
+                    FROM ingestion_jobs
+                    WHERE state = 'PAUSED' AND user_id = ?
+                    ORDER BY created_at ASC
+                    """,
+                    (user_id,),
+                )
+            else:
+                cursor = await conn.execute(
+                    """
+                    SELECT job_id, source_path, state, candidates_json,
+                           selected_metadata_json, fingerprint_json,
+                           final_path, error_message, created_at,
+                           user_id, source_type, original_filename,
+                           file_size_bytes, scratch_dir, sha256_hash,
+                           confidence_score, matched_release_mbid,
+                           started_at, completed_at
+                    FROM ingestion_jobs
+                    WHERE state = 'PAUSED'
+                    ORDER BY created_at ASC
+                    """
+                )
+            rows = await cursor.fetchall()
+        return [_row_to_job(tuple(r)) for r in rows]
+
     async def list_active_jobs(self) -> list[IngestionJob]:
-        """Return jobs currently actively processing or awaiting disambiguation."""
+        """Return jobs currently actively processing, paused, or awaiting disambiguation."""
         active_states = (
+            JobState.PAUSED.value,
             JobState.PROCESSING.value,
             JobState.EXTRACTING.value,
             JobState.FINGERPRINTING.value,
@@ -731,14 +835,14 @@ class SqliteCatalogRepository:
         return [_row_to_job(tuple(r)) for r in rows]
 
     async def cancel_queued_jobs_for_user(self, user_id: int) -> int:
-        """Cancel all QUEUED jobs belonging to `user_id` and return the count cancelled."""
+        """Cancel all QUEUED or PAUSED jobs belonging to `user_id` and return the count cancelled."""
         now_iso = datetime.now(UTC).isoformat()
         async with self._db.connect() as conn:
             cursor = await conn.execute(
                 """
                 UPDATE ingestion_jobs
                 SET state = 'CANCELLED', status = 'CANCELLED', completed_at = ?
-                WHERE user_id = ? AND state = 'QUEUED'
+                WHERE user_id = ? AND state IN ('QUEUED', 'PAUSED')
                 """,
                 (now_iso, user_id),
             )
@@ -749,16 +853,14 @@ class SqliteCatalogRepository:
         """Retrieve an ingested library track record by its primary key ID (or prefix)."""
         async with self._db.connect() as conn:
             cursor = await conn.execute(
-                """
-                SELECT id, job_id, uploaded_by, storage_path, fingerprint,
-                       duration_seconds, artist, album, title, year,
-                       track_number, has_synced_lyrics, ingested_at
+                f"""
+                SELECT {_LIBRARY_TRACK_COLUMNS}
                 FROM library_tracks
-                WHERE id = ? OR id LIKE ?
-                ORDER BY ingested_at DESC
+                WHERE id = ? OR id LIKE ? OR job_id = ? OR job_id LIKE ?
+                ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END, ingested_at DESC
                 LIMIT 1
                 """,
-                (track_id, f"{track_id}%"),
+                (track_id, f"{track_id}%", track_id, f"{track_id}%", track_id),
             )
             row = await cursor.fetchone()
             if row is None:
@@ -769,10 +871,8 @@ class SqliteCatalogRepository:
         """List recently ingested library tracks ordered newest-first."""
         async with self._db.connect() as conn:
             cursor = await conn.execute(
-                """
-                SELECT id, job_id, uploaded_by, storage_path, fingerprint,
-                       duration_seconds, artist, album, title, year,
-                       track_number, has_synced_lyrics, ingested_at
+                f"""
+                SELECT {_LIBRARY_TRACK_COLUMNS}
                 FROM library_tracks
                 ORDER BY ingested_at DESC
                 LIMIT ?
@@ -787,23 +887,21 @@ class SqliteCatalogRepository:
         query: str,
         limit: int = 20,
     ) -> list[LibraryTrackRecord]:
-        """Search library tracks by title, artist, or album substring (case-insensitive)."""
+        """Search library tracks by title, artist, album, or ID/job_id substring (case-insensitive)."""
         clean_q = query.strip()
         if not clean_q:
             return await self.list_library_tracks(limit=limit)
         pattern = f"%{clean_q}%"
         async with self._db.connect() as conn:
             cursor = await conn.execute(
-                """
-                SELECT id, job_id, uploaded_by, storage_path, fingerprint,
-                       duration_seconds, artist, album, title, year,
-                       track_number, has_synced_lyrics, ingested_at
+                f"""
+                SELECT {_LIBRARY_TRACK_COLUMNS}
                 FROM library_tracks
-                WHERE title LIKE ? OR artist LIKE ? OR album LIKE ? OR id LIKE ?
+                WHERE title LIKE ? OR artist LIKE ? OR album LIKE ? OR id LIKE ? OR job_id LIKE ?
                 ORDER BY artist ASC, album ASC, COALESCE(track_number, 1) ASC
                 LIMIT ?
                 """,
-                (pattern, pattern, pattern, f"{clean_q}%", limit),
+                (pattern, pattern, pattern, f"{clean_q}%", f"{clean_q}%", limit),
             )
             rows = await cursor.fetchall()
         return [_row_to_library_track(tuple(r)) for r in rows]
@@ -816,10 +914,8 @@ class SqliteCatalogRepository:
         """Return all library tracks matching `artist` and `album` ordered by track number."""
         async with self._db.connect() as conn:
             cursor = await conn.execute(
-                """
-                SELECT id, job_id, uploaded_by, storage_path, fingerprint,
-                       duration_seconds, artist, album, title, year,
-                       track_number, has_synced_lyrics, ingested_at
+                f"""
+                SELECT {_LIBRARY_TRACK_COLUMNS}
                 FROM library_tracks
                 WHERE lower(artist) = lower(?) AND lower(album) = lower(?)
                 ORDER BY COALESCE(track_number, 1) ASC, title ASC
@@ -934,6 +1030,7 @@ class SqliteCatalogRepository:
         artist: str | None = None,
         album: str | None = None,
         year: int | None = None,
+        modified_by: int | None = None,
     ) -> LibraryTrackRecord | None:
         """Update stored metadata fields on a library track after an approved tag correction."""
         return await self.update_library_track_full(
@@ -942,6 +1039,7 @@ class SqliteCatalogRepository:
             artist=artist,
             album=album,
             year=year,
+            modified_by=modified_by,
         )
 
     async def update_library_track_full(
@@ -957,8 +1055,10 @@ class SqliteCatalogRepository:
         has_synced_lyrics: bool | None = None,
         recording_mbid: str | None = None,
         release_mbid: str | None = None,
+        modified_by: int | None = None,
+        increment_modification: bool = True,
     ) -> LibraryTrackRecord | None:
-        """Update metadata, storage path, lyrics flag, and MBIDs for an ingested track."""
+        """Update metadata, storage path, lyrics flag, MBIDs, and modification audit fields for a track."""
         existing = await self.get_library_track(track_id)
         if existing is None:
             return None
@@ -972,13 +1072,24 @@ class SqliteCatalogRepository:
         new_lyrics_flag = (
             1 if (has_synced_lyrics if has_synced_lyrics is not None else existing.has_synced_lyrics) else 0
         )
+        now_iso = (
+            datetime.now(UTC).isoformat()
+            if increment_modification
+            else (existing.updated_at.isoformat() if existing.updated_at else None)
+        )
+        new_mod_by = modified_by if modified_by is not None else existing.modified_by
+        new_mod_count = (
+            existing.modification_count + 1 if increment_modification else existing.modification_count
+        )
 
         async with self._db.connect() as conn:
             await conn.execute(
                 """
                 UPDATE library_tracks
                 SET title = ?, artist = ?, album = ?, year = ?,
-                    track_number = ?, storage_path = ?, has_synced_lyrics = ?
+                    track_number = ?, storage_path = ?, has_synced_lyrics = ?,
+                    updated_at = ?, modified_by = ?, modification_count = ?,
+                    telegram_file_id = NULL, source_chat_id = NULL, source_message_id = NULL
                 WHERE id = ?
                 """,
                 (
@@ -989,6 +1100,9 @@ class SqliteCatalogRepository:
                     new_track_num,
                     new_path,
                     new_lyrics_flag,
+                    now_iso,
+                    new_mod_by,
+                    new_mod_count,
                     existing.id,
                 ),
             )
@@ -1026,6 +1140,36 @@ class SqliteCatalogRepository:
             await conn.commit()
         return await self.get_library_track(existing.id)
 
+    async def cache_track_telegram_file(
+        self,
+        track_id: str,
+        *,
+        telegram_file_id: str | None = None,
+        source_chat_id: int | None = None,
+        source_message_id: int | None = None,
+    ) -> None:
+        """Persist Telegram delivery cache identifiers (`file_id`, `chat_id`, `message_id`) for a track."""
+        existing = await self.get_library_track(track_id)
+        if existing is None:
+            return
+        async with self._db.connect() as conn:
+            await conn.execute(
+                """
+                UPDATE library_tracks
+                SET telegram_file_id = COALESCE(?, telegram_file_id),
+                    source_chat_id = COALESCE(?, source_chat_id),
+                    source_message_id = COALESCE(?, source_message_id)
+                WHERE id = ?
+                """,
+                (
+                    telegram_file_id,
+                    source_chat_id,
+                    source_message_id,
+                    existing.id,
+                ),
+            )
+            await conn.commit()
+
     async def upsert_scanned_library_track(
         self,
         record: LibraryTrackRecord,
@@ -1033,15 +1177,36 @@ class SqliteCatalogRepository:
         """Insert or update a library track discovered or reconciled during a filesystem rescan."""
         now_iso = record.ingested_at.isoformat()
         job_id = record.job_id or f"rescan-{record.id[:12]}"
+        resolved_uploader = record.uploaded_by
         async with self._db.connect() as conn:
+            if resolved_uploader == 0:
+                job_cur = await conn.execute(
+                    """
+                    SELECT user_id FROM ingestion_jobs
+                    WHERE (job_id = ? OR final_path = ?)
+                      AND user_id IS NOT NULL AND user_id > 0
+                    LIMIT 1
+                    """,
+                    (job_id, str(record.storage_path)),
+                )
+                job_row = await job_cur.fetchone()
+                if job_row is not None and job_row[0] is not None:
+                    resolved_uploader = int(str(job_row[0]))
+
             await conn.execute(
                 """
                 INSERT INTO library_tracks (
                     id, job_id, uploaded_by, storage_path, fingerprint,
                     duration_seconds, artist, album, title, year,
-                    track_number, has_synced_lyrics, ingested_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    track_number, has_synced_lyrics, ingested_at,
+                    updated_at, modified_by, modification_count,
+                    telegram_file_id, source_chat_id, source_message_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
+                    uploaded_by = CASE
+                        WHEN library_tracks.uploaded_by > 0 THEN library_tracks.uploaded_by
+                        ELSE excluded.uploaded_by
+                    END,
                     storage_path = excluded.storage_path,
                     fingerprint = excluded.fingerprint,
                     duration_seconds = excluded.duration_seconds,
@@ -1055,7 +1220,7 @@ class SqliteCatalogRepository:
                 (
                     record.id,
                     job_id,
-                    record.uploaded_by,
+                    resolved_uploader,
                     str(record.storage_path),
                     record.fingerprint,
                     record.duration_seconds,
@@ -1066,6 +1231,12 @@ class SqliteCatalogRepository:
                     record.track_number,
                     1 if record.has_synced_lyrics else 0,
                     now_iso,
+                    record.updated_at.isoformat() if record.updated_at else None,
+                    record.modified_by,
+                    record.modification_count,
+                    record.telegram_file_id,
+                    record.source_chat_id,
+                    record.source_message_id,
                 ),
             )
             await conn.execute(
@@ -1130,6 +1301,32 @@ class SqliteCatalogRepository:
             return int((cur_lib.rowcount or 0) + (cur_cat.rowcount or 0))
 
 
+_LIBRARY_TRACK_COLUMNS = (
+    "id, job_id, uploaded_by, storage_path, fingerprint, "
+    "duration_seconds, artist, album, title, year, "
+    "track_number, has_synced_lyrics, ingested_at, "
+    "updated_at, modified_by, modification_count, "
+    "telegram_file_id, source_chat_id, source_message_id"
+)
+
+
+def _row_to_audit_log(row: tuple[object, ...]) -> AuditLogEntry:
+    """Map an `audit_logs` table row into an `AuditLogEntry`."""
+    raw_details = str(row[4]) if row[4] is not None else "{}"
+    try:
+        details = json.loads(raw_details)
+    except Exception:
+        details = {}
+    return AuditLogEntry(
+        id=int(str(row[0])),
+        actor_id=int(str(row[1])),
+        action=str(row[2]),
+        target_entity=str(row[3]) if row[3] is not None else None,
+        details=details if isinstance(details, dict) else {},
+        created_at=_parse_iso_datetime(row[5]) or datetime.now(UTC),
+    )
+
+
 def _row_to_library_track(row: tuple[object, ...]) -> LibraryTrackRecord:
     """Map a `library_tracks` table row into a `LibraryTrackRecord`."""
     return LibraryTrackRecord(
@@ -1146,6 +1343,12 @@ def _row_to_library_track(row: tuple[object, ...]) -> LibraryTrackRecord:
         track_number=int(str(row[10])) if row[10] is not None else None,
         has_synced_lyrics=bool(int(str(row[11]))) if row[11] is not None else False,
         ingested_at=_parse_iso_datetime(row[12]) or datetime.now(UTC),
+        updated_at=_parse_iso_datetime(row[13]) if len(row) > 13 else None,
+        modified_by=int(str(row[14])) if len(row) > 14 and row[14] is not None else None,
+        modification_count=int(str(row[15])) if len(row) > 15 and row[15] is not None else 0,
+        telegram_file_id=str(row[16]) if len(row) > 16 and row[16] is not None else None,
+        source_chat_id=int(str(row[17])) if len(row) > 17 and row[17] is not None else None,
+        source_message_id=int(str(row[18])) if len(row) > 18 and row[18] is not None else None,
     )
 
 

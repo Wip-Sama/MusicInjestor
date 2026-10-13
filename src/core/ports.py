@@ -113,8 +113,28 @@ class GovernanceRepositoryPort(Protocol):
         """Retrieve the most recent audit log records ordered newest-first."""
         ...
 
+    async def list_user_audit_logs(self, actor_id: int, limit: int = 50) -> list[AuditLogEntry]:
+        """Retrieve audit log records performed by `actor_id` ordered chronologically newest-first."""
+        ...
+
+    async def list_entity_audit_logs(self, target_entity: str, limit: int = 50) -> list[AuditLogEntry]:
+        """Retrieve audit log records targeting `target_entity` ordered chronologically newest-first."""
+        ...
+
+    async def list_user_uploaded_tracks(
+        self,
+        telegram_id: int,
+        limit: int = 50,
+    ) -> list[LibraryTrackRecord]:
+        """List library tracks uploaded by `telegram_id` ordered chronologically newest-first."""
+        ...
+
     async def list_queued_jobs(self, user_id: int | None = None) -> list[IngestionJob]:
         """Return jobs in QUEUED state ordered FIFO by `created_at`."""
+        ...
+
+    async def list_paused_jobs(self, user_id: int | None = None) -> list[IngestionJob]:
+        """Return jobs in PAUSED state ordered FIFO by `created_at`."""
         ...
 
     async def list_active_jobs(self) -> list[IngestionJob]:
@@ -180,6 +200,7 @@ class GovernanceRepositoryPort(Protocol):
         artist: str | None = None,
         album: str | None = None,
         year: int | None = None,
+        modified_by: int | None = None,
     ) -> LibraryTrackRecord | None:
         """Update the persisted title, artist, album, and year for an ingested track."""
         ...
@@ -197,8 +218,21 @@ class GovernanceRepositoryPort(Protocol):
         has_synced_lyrics: bool | None = None,
         recording_mbid: str | None = None,
         release_mbid: str | None = None,
+        modified_by: int | None = None,
+        increment_modification: bool = True,
     ) -> LibraryTrackRecord | None:
-        """Update metadata, storage path, lyrics flag, and MBIDs for an ingested track."""
+        """Update metadata, storage path, lyrics flag, MBIDs, and modification audit fields for a track."""
+        ...
+
+    async def cache_track_telegram_file(
+        self,
+        track_id: str,
+        *,
+        telegram_file_id: str | None = None,
+        source_chat_id: int | None = None,
+        source_message_id: int | None = None,
+    ) -> None:
+        """Persist Telegram delivery cache identifiers (`file_id`, `chat_id`, `message_id`) for a track."""
         ...
 
     async def upsert_scanned_library_track(

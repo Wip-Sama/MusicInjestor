@@ -4,10 +4,13 @@ from aiogram.fsm.state import State, StatesGroup
 
 
 class IngestionStates(StatesGroup):
-    """FSM states during interactive track/album metadata disambiguation."""
+    """FSM states during interactive track/album metadata disambiguation and full-pipeline job tagging."""
 
     awaiting_confirmation = State()
     awaiting_manual_query = State()
+    awaiting_job_metadata_input = State()
+    awaiting_job_lyrics_input = State()
+    awaiting_job_cover_input = State()
 
 
 class AdminStates(StatesGroup):

@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import hmac
+import html
 import logging
 
 from aiogram import Bot
@@ -16,10 +17,12 @@ logger = logging.getLogger(__name__)
 
 def format_oidc_pairing_message(outcome: OidcSyncOutcome) -> str:
     """Format the Telegram confirmation message sent upon successful Authentik OIDC pairing."""
-    username = outcome.user.authentik_username or outcome.user.display_name
+    username = html.escape(outcome.user.authentik_username or outcome.user.display_name)
     return (
-        f"✅ Account successfully paired with Authentik as <b>{username}</b> "
-        f"(Role: {outcome.new_role.value})."
+        "<b>✅ Authentik SSO Paired</b>\n"
+        f"<blockquote>Account successfully paired with Authentik as <code>{username}</code> "
+        f"(Role: <code>{outcome.new_role.value}</code>).</blockquote>\n"
+        f"<i>Telegram ID:</i> <code>{outcome.user.telegram_id}</code>"
     )
 
 

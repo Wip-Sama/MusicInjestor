@@ -469,6 +469,7 @@ class GovernanceService:
             artist=request.proposed_artist,
             album=request.proposed_album,
             year=request.proposed_year,
+            modified_by=actor.telegram_id,
         )
         if updated_track is None:
             msg = f"Library track '{request.track_id}' not found"

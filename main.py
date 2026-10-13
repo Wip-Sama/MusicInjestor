@@ -35,6 +35,7 @@ BOT_COMMANDS: tuple[BotCommand, ...] = (
     BotCommand(command="start", description="Open main menu, status & SSO pairing"),
     BotCommand(command="songs", description="Browse, search, download, edit & export songs"),
     BotCommand(command="rescan", description="Scan library folder & sync database"),
+    BotCommand(command="job", description="Inspect, pause, unlock or review a job by ID"),
     BotCommand(command="cancel", description="Exit any active input or confirmation prompt"),
     BotCommand(command="admin", description="Open Administrator Control Panel (ADMIN+)"),
     BotCommand(command="adduser", description="Authorize user by Telegram ID (ADMIN+)"),
@@ -194,6 +195,7 @@ async def run_app(settings: AppSettings | None = None) -> None:
     dispatcher.callback_query.outer_middleware(rbac_middleware)
     dispatcher["pipeline"] = pipeline
     dispatcher["settings"] = resolved_settings
+    dispatcher["catalog_repository"] = repository
     dispatcher["governance_repository"] = repository
     dispatcher["governance_service"] = governance_service
     dispatcher["oidc_service"] = oidc_service

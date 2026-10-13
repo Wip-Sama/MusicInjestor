@@ -8,6 +8,7 @@ from aiogram import BaseMiddleware
 from aiogram.types import CallbackQuery, Message, TelegramObject, User
 
 from src.bot.keyboards.admin import build_guest_onboarding_keyboard
+from src.bot.ui import safe_answer
 from src.core.audit import format_guest_access_denied_card
 from src.core.models import Permission, UserAccount
 from src.core.oidc import AuthentikOidcService
@@ -70,7 +71,11 @@ class RbacMiddleware(BaseMiddleware):
         if user.is_blocked:
             logger.info("Blocked user %s attempted interaction; rejecting.", user.telegram_id)
             if isinstance(event, Message):
-                await event.answer("🚫 <b>Access Denied</b>\nYour account has been blocked.")
+                await event.answer(
+                    "<b>🚫 Access Denied</b>\n"
+                    "<blockquote>Your account has been blocked by an administrator.</blockquote>\n"
+                    f"<i>Telegram ID:</i> <code>{user.telegram_id}</code>"
+                )
             elif isinstance(event, CallbackQuery):
                 await event.answer("🚫 Your account has been blocked.", show_alert=True)
             return None
@@ -85,7 +90,11 @@ class RbacMiddleware(BaseMiddleware):
 
             if user.is_blocked:
                 if isinstance(event, Message):
-                    await event.answer("🚫 <b>Access Denied</b>\nYour account has been deactivated.")
+                    await event.answer(
+                        "<b>🚫 Access Denied</b>\n"
+                        "<blockquote>Your account has been deactivated.</blockquote>\n"
+                        f"<i>Telegram ID:</i> <code>{user.telegram_id}</code>"
+                    )
                 return None
 
             if not has_permission(user, Permission.SUBMIT_INGESTION):
@@ -95,9 +104,13 @@ class RbacMiddleware(BaseMiddleware):
                 )
                 if isinstance(event, Message):
                     oidc_url = self.build_oidc_url_for_user(user.telegram_id)
-                    await event.answer(
+                    await safe_answer(
+                        event,
                         format_guest_access_denied_card(user.telegram_id),
-                        reply_markup=build_guest_onboarding_keyboard(oidc_url),
+                        reply_markup=build_guest_onboarding_keyboard(
+                            oidc_url,
+                            telegram_id=user.telegram_id,
+                        ),
                     )
                 return None
 

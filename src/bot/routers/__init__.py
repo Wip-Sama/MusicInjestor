@@ -12,11 +12,16 @@ from src.bot.routers.verification import verification_router
 def build_root_router() -> Router:
     """Assemble and return the top-level aiogram Router with all sub-routers attached."""
     root = Router(name="root")
-    root.include_router(commands_router)
-    root.include_router(admin_router)
-    root.include_router(songs_router)
-    root.include_router(files_router)
-    root.include_router(verification_router)
+    for sub_router in (
+        commands_router,
+        admin_router,
+        songs_router,
+        files_router,
+        verification_router,
+    ):
+        if sub_router.parent_router is not None:
+            sub_router._parent_router = None
+        root.include_router(sub_router)
     return root
 
 

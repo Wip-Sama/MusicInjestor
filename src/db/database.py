@@ -8,6 +8,7 @@ import aiosqlite
 from src.db.models import (
     INDEX_DDL_STATEMENTS,
     INGESTION_JOBS_MIGRATION_COLUMNS,
+    LIBRARY_TRACKS_MIGRATION_COLUMNS,
     TABLE_DDL_STATEMENTS,
 )
 
@@ -32,6 +33,35 @@ async def _migrate_ingestion_jobs_table(conn: aiosqlite.Connection) -> None:
         logger.info("Migrated legacy ingestion_jobs table; added columns: %s", ", ".join(added_columns))
 
 
+async def _migrate_library_tracks_table(conn: aiosqlite.Connection) -> None:
+    """Add missing provenance/modification/cache columns to `library_tracks` and backfill `uploaded_by`."""
+    cursor = await conn.execute("PRAGMA table_info(library_tracks);")
+    rows = await cursor.fetchall()
+    existing_columns = {str(row[1]) for row in rows}
+
+    added_columns: list[str] = []
+    for col_name, col_ddl in LIBRARY_TRACKS_MIGRATION_COLUMNS:
+        if col_name not in existing_columns:
+            await conn.execute(f"ALTER TABLE library_tracks ADD COLUMN {col_name} {col_ddl};")
+            added_columns.append(col_name)
+
+    await conn.execute(
+        """
+        UPDATE library_tracks
+        SET uploaded_by = COALESCE(
+            (SELECT j.user_id FROM ingestion_jobs j
+             WHERE (j.job_id = library_tracks.job_id OR j.final_path = library_tracks.storage_path)
+               AND j.user_id IS NOT NULL AND j.user_id > 0
+             LIMIT 1),
+            0
+        )
+        WHERE uploaded_by = 0
+        """
+    )
+    if added_columns:
+        logger.info("Migrated library_tracks table; added columns: %s", ", ".join(added_columns))
+
+
 class SqliteDatabaseManager:
     """Manages SQLite connections in WAL mode and initializes/migrates schema tables."""
 
@@ -53,6 +83,7 @@ class SqliteDatabaseManager:
             for statement in TABLE_DDL_STATEMENTS:
                 await conn.execute(statement)
             await _migrate_ingestion_jobs_table(conn)
+            await _migrate_library_tracks_table(conn)
             for statement in INDEX_DDL_STATEMENTS:
                 await conn.execute(statement)
             await conn.commit()

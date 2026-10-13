@@ -1,11 +1,13 @@
 """Pure domain formatters for Admin Log Channel events, queue status cards, and admin panels."""
 
+import html
 from datetime import UTC, datetime
 from pathlib import Path
 
 from src.core.models import (
     AccessRequestRecord,
     IngestionJob,
+    JobState,
     TrackMetadata,
     UserAccount,
     UserRole,
@@ -22,9 +24,10 @@ def _format_utc_timestamp(dt: datetime | None = None, include_seconds: bool = Tr
 def format_guest_access_denied_card(telegram_id: int) -> str:
     """Format the Guest Onboarding & Access Denied message (Specification Section 3.2)."""
     return (
-        "🔒 <b>Access Denied</b>\n"
-        "This is a private music ingestion gateway.\n\n"
-        f"Your Telegram ID: <code>{telegram_id}</code>"
+        "<b>🔒 Access Denied</b>\n"
+        "<blockquote>This is a private music ingestion gateway. "
+        "Authenticate via Authentik SSO or submit an access request below.</blockquote>\n"
+        f"<i>Telegram ID:</i> <code>{telegram_id}</code>"
     )
 
 
@@ -32,10 +35,12 @@ def format_access_request_card(user: UserAccount, request: AccessRequestRecord) 
     """Format the Admin Log Channel card for a new manual access request (Section 3.2)."""
     ts = _format_utc_timestamp(request.created_at, include_seconds=False)
     return (
-        "🔔 <b>New Access Request</b>\n"
-        f"• User: {user.mention_handle} (ID: <code>{user.telegram_id}</code>)\n"
-        f"• Name: {user.display_name}\n"
-        f"• Timestamp: {ts}"
+        "<b>🔔 New Access Request</b>\n"
+        "<blockquote>"
+        f"• User: {html.escape(user.mention_handle)} (ID: <code>{user.telegram_id}</code>)\n"
+        f"• Name: <code>{html.escape(user.display_name)}</code>"
+        "</blockquote>\n"
+        f"<i>Timestamp: {ts}</i>"
     )
 
 
@@ -50,13 +55,16 @@ def format_role_updated_event(
     """Format Event A (`USER AUDIT: ROLE_UPDATED`) for the Admin Log Channel (Section 5.1)."""
     ts = _format_utc_timestamp(timestamp)
     return (
-        "🛡 <b>USER AUDIT: ROLE_UPDATED</b>\n"
-        f"• Target User: {target_user.mention_handle} (ID: <code>{target_user.telegram_id}</code>)\n"
-        f"• Actor: {actor.mention_handle} (ID: <code>{actor.telegram_id}</code>)\n"
-        f"• Previous Role: {previous_role.value}\n"
-        f"• New Role: {new_role.value}\n"
-        f"• Reason: {reason}\n"
-        f"• Timestamp: {ts}"
+        "<b>🛡 USER AUDIT: ROLE_UPDATED</b>\n"
+        "<blockquote expandable>"
+        f"• Target User: {html.escape(target_user.mention_handle)} "
+        f"(ID: <code>{target_user.telegram_id}</code>)\n"
+        f"• Actor: {html.escape(actor.mention_handle)} (ID: <code>{actor.telegram_id}</code>)\n"
+        f"• Previous Role: <code>{previous_role.value}</code>\n"
+        f"• New Role: <code>{new_role.value}</code>\n"
+        f"• Reason: {html.escape(reason)}"
+        "</blockquote>\n"
+        f"<i>Timestamp: {ts}</i>"
     )
 
 
@@ -72,13 +80,16 @@ def format_oidc_sync_event(
     role_suffix = " (Access Revoked)" if new_role == UserRole.GUEST or target_user.is_blocked else ""
     subject = target_user.authentik_sub or "unlinked"
     return (
-        "🔄 <b>OIDC AUDIT: ROLE_SYNCHRONIZED</b>\n"
-        f"• Target User: {target_user.mention_handle} (ID: <code>{target_user.telegram_id}</code>)\n"
-        f"• Authentik Subject: <code>{subject}</code>\n"
-        f"• Group Changes Detected: {group_changes}\n"
-        f"• New Assigned Role: {new_role.value}{role_suffix}\n"
-        f"• Active Queued Jobs Cancelled: {cancelled_jobs_count}\n"
-        f"• Timestamp: {ts}"
+        "<b>🔄 OIDC AUDIT: ROLE_SYNCHRONIZED</b>\n"
+        "<blockquote expandable>"
+        f"• Target User: {html.escape(target_user.mention_handle)} "
+        f"(ID: <code>{target_user.telegram_id}</code>)\n"
+        f"• Authentik Subject: <code>{html.escape(subject)}</code>\n"
+        f"• Group Changes Detected: {html.escape(group_changes)}\n"
+        f"• New Assigned Role: <code>{new_role.value}</code>{role_suffix}\n"
+        f"• Active Queued Jobs Cancelled: <code>{cancelled_jobs_count}</code>"
+        "</blockquote>\n"
+        f"<i>Timestamp: {ts}</i>"
     )
 
 
@@ -93,17 +104,19 @@ def format_ingest_success_event(
 ) -> str:
     """Format Event C (`INGEST AUDIT: SUCCESS`) for the Admin Log Channel (Section 5.1)."""
     year_str = f" ({metadata.year})" if metadata.year else ""
-    album_label = f"{metadata.effective_album_artist} - {metadata.album}{year_str}"
-    target_dir = str(job.final_path.parent) if job.final_path is not None else "unknown"
+    album_label = html.escape(f"{metadata.effective_album_artist} - {metadata.album}{year_str}")
+    target_dir = html.escape(str(job.final_path.parent) if job.final_path is not None else "unknown")
     return (
-        "✅ <b>INGEST AUDIT: SUCCESS</b>\n"
-        f"• Job ID: <code>{job.job_id}</code>\n"
-        f"• Uploader: {uploader.mention_handle} (ID: <code>{uploader.telegram_id}</code>)\n"
+        "<b>✅ INGEST AUDIT: SUCCESS</b>\n"
+        "<blockquote expandable>"
+        f"• Uploader: {html.escape(uploader.mention_handle)} (ID: <code>{uploader.telegram_id}</code>)\n"
         f"• Album: {album_label}\n"
-        f"• Tracks Written: {tracks_written} files ({audio_format})\n"
+        f"• Tracks Written: <code>{tracks_written}</code> files (<code>{html.escape(audio_format)}</code>)\n"
         f"• Target Path: <code>{target_dir}</code>\n"
-        f"• Lyrics: {lyrics_embedded}/{tracks_written} embedded (LRCLIB synced)\n"
-        f"• Processing Duration: {duration_seconds:.1f} seconds"
+        f"• Lyrics: <code>{lyrics_embedded}/{tracks_written}</code> embedded (LRCLIB synced)"
+        "</blockquote>\n"
+        f"<i>Job ID:</i> <code>{html.escape(job.job_id)}</code> • "
+        f"<i>Processing Duration: {duration_seconds:.1f} seconds</i>"
     )
 
 
@@ -116,13 +129,15 @@ def format_duplicate_rejected_event(
 ) -> str:
     """Format Event D (`INGEST AUDIT: DUPLICATE_REJECTED`) for the Admin Log Channel (Section 5.1)."""
     return (
-        "⚠️ <b>INGEST AUDIT: DUPLICATE_REJECTED</b>\n"
-        f"• Job ID: <code>{job.job_id}</code>\n"
-        f"• Uploader: {uploader.mention_handle} (ID: <code>{uploader.telegram_id}</code>)\n"
-        f"• Detected Track: {detected_track}\n"
-        f"• Conflict Path: <code>{conflict_path}</code>\n"
-        f"• Match Source: {match_source}\n"
+        "<b>⚠️ INGEST AUDIT: DUPLICATE_REJECTED</b>\n"
+        "<blockquote expandable>"
+        f"• Uploader: {html.escape(uploader.mention_handle)} (ID: <code>{uploader.telegram_id}</code>)\n"
+        f"• Detected Track: {html.escape(detected_track)}\n"
+        f"• Conflict Path: <code>{html.escape(str(conflict_path))}</code>\n"
+        f"• Match Source: {html.escape(match_source)}\n"
         "• Action Taken: Temporary files purged from scratch space"
+        "</blockquote>\n"
+        f"<i>Job ID:</i> <code>{html.escape(job.job_id)}</code>"
     )
 
 
@@ -140,20 +155,79 @@ def format_queued_job_card(
     position: int,
     active_job_filename: str | None = None,
 ) -> str:
-    """Format the in-chat queue waiting feedback message (Specification Section 4.2)."""
-    filename = job.original_filename or job.source_path.name
+    """Format the in-chat queue waiting or paused feedback message (Specification Section 4.2)."""
+    filename = html.escape(job.original_filename or job.source_path.name)
     size_label = _format_file_size_mb(job.file_size_bytes)
+    if job.state == JobState.PAUSED:
+        return (
+            "<b>⏸️ Ingestion Paused (Held for Review)</b>\n"
+            "<blockquote>"
+            f"📦 Payload: <code>{filename}</code> ({size_label})\n"
+            "📊 Position in Queue: <code>PAUSED</code> (Held)\n"
+            "⚙️ Status: Held for manual review — tap <b>Manual Review</b> to inspect candidates "
+            "or <b>Unlock</b> to resume."
+            "</blockquote>\n"
+            f"<i>Job ID:</i> <code>{html.escape(job.job_id)}</code>"
+        )
     status_line = (
-        f"Waiting for active job ({active_job_filename}) to finish..."
+        f"Waiting for active job ({html.escape(active_job_filename)}) to finish..."
         if active_job_filename
         else "Queued for next available worker slot..."
     )
     return (
-        "⏳ <b>Ingestion Queued</b>\n"
-        "────────────────────────\n"
+        "<b>⏳ Ingestion Queued</b>\n"
+        "<blockquote>"
         f"📦 Payload: <code>{filename}</code> ({size_label})\n"
         f"📊 Position in Queue: #{position}\n"
         f"⚙️ Status: {status_line}"
+        "</blockquote>\n"
+        f"<i>Job ID:</i> <code>{html.escape(job.job_id)}</code>"
+    )
+
+
+def format_job_inspector_card(
+    job: IngestionJob,
+    uploader_label: str | None = None,
+    position: int = 0,
+) -> str:
+    """Format an interactive Job Inspector & Control card for a specific `job_id`."""
+    filename = html.escape(job.original_filename or job.source_path.name)
+    size_label = _format_file_size_mb(job.file_size_bytes)
+    created_ts = _format_utc_timestamp(job.created_at, include_seconds=False)
+    lines = [
+        f"• State: <code>{html.escape(job.state.value)}</code>",
+        f"• Payload: <code>{filename}</code> ({size_label})",
+        f"• Source Type: <code>{html.escape(job.source_type.value)}</code>",
+    ]
+    if uploader_label:
+        lines.append(f"• Uploader: {html.escape(uploader_label)}")
+    if position > 0 and job.state == JobState.QUEUED:
+        lines.append(f"• Queue Position: <code>#{position}</code>")
+    if job.selected_metadata is not None:
+        meta = job.selected_metadata
+        lines.append(f"• Selected Match: <b>{html.escape(meta.artist)} — {html.escape(meta.title)}</b>")
+        lines.append(f"• Album: {html.escape(meta.album)}")
+    elif job.candidates:
+        top = job.candidates[0]
+        lines.append(
+            f"• Top Candidate: {html.escape(top.metadata.artist)} — {html.escape(top.metadata.title)} "
+            f"(<code>{round(top.confidence * 100)}%</code>)"
+        )
+    if job.final_path is not None:
+        lines.append(f"• Final Path: <code>{html.escape(str(job.final_path))}</code>")
+    if job.error_message:
+        lines.append(f"• Details / Error: <code>{html.escape(job.error_message)}</code>")
+    lines.append(f"• Created At: <code>{created_ts}</code>")
+    if job.completed_at is not None:
+        lines.append(
+            f"• Completed At: <code>{_format_utc_timestamp(job.completed_at, include_seconds=False)}</code>"
+        )
+
+    body = "\n".join(lines)
+    return (
+        "<b>🔎 Ingestion Job Inspector</b>\n"
+        f"<blockquote>{body}</blockquote>\n"
+        f"<i>Job ID:</i> <code>{html.escape(job.job_id)}</code> • <i>🧭 Home › Queue › Job Inspector</i>"
     )
 
 
@@ -170,15 +244,16 @@ def format_ingesting_progress_card(
     filled = round(clamped / 10)
     bar = "█" * filled + "░" * (10 - filled)
     base = (
-        f"⚙️ <b>Ingesting: {filename}</b>\n"
-        "────────────────────────\n"
-        f"[{bar}] {clamped}%\n"
+        f"<b>⚙️ Ingesting: {filename}</b>\n"
+        "<blockquote>"
+        f"<code>[{bar}] {clamped}%</code>\n"
         f"• Extraction: {extraction_status}\n"
         f"• AcoustID: {acoustid_status}\n"
         f"• Lyrics: {lyrics_status}"
+        "</blockquote>"
     )
     if ambiguity_prompt:
-        base += "\n\n⚠️ <b>Release Ambiguity:</b>\nWhich version is this upload?"
+        base += "\n<i>⚠️ Release Ambiguity: Which version is this upload?</i>"
     return base
 
 
@@ -195,13 +270,17 @@ def format_admin_dashboard_card(
     """Format the Administrator Control Panel screen (`/admin`, Specification Section 7.1)."""
     mode_label = "Serial" if concurrency_limit == 1 else "Parallel"
     return (
-        "🎛 <b>Administrator Control Panel</b>\n"
-        f"Node: {node_name} | Ingestion Core Engine\n"
-        f"Health: 🟢 OK | Memory: {memory_used_mb} MB / {memory_total_mb} MB\n"
-        f"Concurrency Limit: {concurrency_limit} ({mode_label})\n"
-        "────────────────────────\n"
-        f"👥 Users: {active_users_count} Active | {pending_requests_count} Pending\n"
-        f"⏳ Queue: {active_jobs_count} Active | {queued_jobs_count} Queued"
+        "<b>🎛 Administrator Control Panel</b>\n"
+        "<blockquote>"
+        f"Node: <code>{html.escape(node_name)}</code> | Ingestion Core Engine\n"
+        f"Health: 🟢 OK | Memory: <code>{memory_used_mb} MB / {memory_total_mb} MB</code>\n"
+        f"Concurrency Limit: <code>{concurrency_limit} ({mode_label})</code>\n"
+        f"👥 Users: <code>{active_users_count}</code> Active | "
+        f"<code>{pending_requests_count}</code> Pending\n"
+        f"⏳ Queue: <code>{active_jobs_count}</code> Active | "
+        f"<code>{queued_jobs_count}</code> Queued"
+        "</blockquote>\n"
+        "<i>🧭 Home › Admin Panel</i>"
     )
 
 
@@ -209,16 +288,25 @@ def format_user_detail_card(
     user: UserAccount,
     albums_count: int,
     tracks_count: int,
+    changes_count: int | None = None,
 ) -> str:
     """Format the User Detail Management Sub-Screen (Specification Section 7.1)."""
     oidc_status = (
-        f"Linked ({user.authentik_username or user.authentik_sub})" if user.is_oidc_linked else "Not Linked"
+        f"Linked (<code>{html.escape(user.authentik_username or user.authentik_sub or '')}</code>)"
+        if user.is_oidc_linked
+        else "Not Linked"
     )
     blocked_badge = " (🚫 BLOCKED)" if user.is_blocked else ""
+    changes_line = (
+        f"\n• Recorded Actions / Edits: <code>{changes_count}</code>" if changes_count is not None else ""
+    )
     return (
-        f"👤 <b>Managing User: {user.mention_handle}</b>\n"
-        f"ID: <code>{user.telegram_id}</code>\n"
-        f"Current Role: {user.role.value}{blocked_badge}\n"
-        f"Authentik Status: {oidc_status}\n"
-        f"Total Uploads: {albums_count} albums ({tracks_count} tracks)"
+        f"<b>👤 Managing User: {html.escape(user.mention_handle)}</b>\n"
+        "<blockquote>"
+        f"• Current Role: <code>{user.role.value}</code>{blocked_badge}\n"
+        f"• Authentik Status: {oidc_status}\n"
+        f"• Total Uploads: {albums_count} albums ({tracks_count} tracks)"
+        f"{changes_line}"
+        "</blockquote>\n"
+        f"<i>User ID:</i> <code>{user.telegram_id}</code> • <i>🧭 Home › Admin › Users › Detail</i>"
     )
