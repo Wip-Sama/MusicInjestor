@@ -28,6 +28,7 @@ class InMemoryCatalogRepository:
         self,
         fingerprint: str,
         recording_mbid: str | None = None,
+        metadata: TrackMetadata | None = None,
     ) -> DuplicateCheckResult:
         await asyncio.sleep(0)
         if fingerprint in self.tracks_by_fp:

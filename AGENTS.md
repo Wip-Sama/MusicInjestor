@@ -192,6 +192,20 @@ Before concluding any task that modifies code:
   - Added `IngestionPipeline.prepare_for_review` and `IngestionPipeline.complete_custom_ingestion` plus the full-pipeline Manual Tag & Dry-Run Editor for queued jobs (`verify:edit:<job_id>`, `verify:field:<job_id>:<field>`, `verify:cover:<job_id>`, `verify:lyrics:<job_id>`, `verify:auto_enrich:<job_id>`, `verify:apply_edit:<job_id>`).
   - Implemented per-message navigation stack tracking (`resolve_back_callback` and `reset_fsm_state` in `src/bot/ui.py`) so `◀ Back` dynamically returns to the actual parent screen when a view is reachable from multiple entry points (e.g., `songs:view` from `admin:user_uploads` vs `songs:list`; `queue:view` from `admin:queue` vs `queue:mine`; modules opened from `help:<topic>` vs `menu:home`).
 
+- [x] **M15: Non-Blocking Remote Startup, Resilient Directory Scanning, Chunked Streaming Hashing & Batch SQLite Reconciliation**
+  - Eliminated synchronous startup blocking in `main.py` where initial library reconciliation ran before bot initialization; the bot now starts polling and listening to Telegram commands immediately (<1 second), while library reconciliation runs safely in a concurrent background task.
+  - Replaced unconstrained `Path.rglob("*")` traversal in `src/core/organizer.py` with `os.walk(..., followlinks=False)` with directory `OSError` resilience, preventing infinite recursion on circular symlinks and blocking on special files.
+  - Replaced full-file `audio_path.read_bytes()` with streaming 64KB chunked hashing (`_compute_file_sha256_fingerprint_sync`) and error fallbacks, eliminating container OOM (Out Of Memory) kills on large remote library mounts.
+  - Optimized file matching by evaluating mount-point migration tail-keys (`_extract_tail_library_key`) first and only computing hashes when unresolved records exist; added per-file exception handlers so corrupted files never abort the scan.
+  - Implemented batch track persistence (`upsert_scanned_library_tracks_batch` in `src/core/ports.py` and `src/db/repository.py`), committing records in 200-item chunks within single transactions instead of individual connection handshakes.
+
+- [x] **M16: Robust Metadata Similarity Deduplication & Background Reconciliation Lockdown Mode**
+  - Implemented multi-factor metadata similarity deduplication in `SqliteCatalogRepository.check_duplicate` (`src/db/repository.py`), comparing incoming tracks against indexed library tracks by normalized primary singer (`normalize_primary_artist`), title variants (`extract_title_search_variants` stripping leading disc/track numbers and artist prefixes), year-stripped album titles (`_best_album_similarity`), and audio duration tolerances (within 18s).
+  - Fixed duplicate ingestion when identical songs exist under differing folder paths, casings, or tag schemes (e.g. `/Rkomi/Taxi Driver (2021)/02 - La coda del diavolo.flac` vs `/Rkomi/Rkomi - TAXI DRIVER/02 Rkomi - LA CODA DEL DIAVOLO.flac`), preventing duplicate tracks from being added twice.
+  - Integrated metadata similarity checks across `IngestionPipeline` (`src/core/pipeline.py`) at Stage 3 (local tags), post-enrichment (MusicBrainz candidate match), final completion prior to file organization, and extra track batches.
+  - Added background reconciliation state tracking (`is_reconciling` and `reconciliation_status` on `LibraryOrganizer` in `src/core/organizer.py`) and implemented a safe lockdown mode freezing song mutations, cover/lyrics updates, manual tag edits, and concurrent `/rescan` triggers while background filesystem synchronization is running.
+  - Updated `/status` System Diagnostics (`src/bot/routers/commands.py`) to report live library synchronization state (`🟡 In Progress` vs `🟢 Ready`).
+
 ### Planned Backlog (Future Enhancements)
 - [ ] **Low-Priority Backlog: Admin Folder Structure Viewer & Mass Migration**
   - Allow upper roles (`ADMIN` / `OWNER`) to browse the `storage/library` folder hierarchy in Telegram and run dry-run previewed mass path/tag migrations across the catalog.

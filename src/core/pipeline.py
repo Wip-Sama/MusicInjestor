@@ -376,10 +376,11 @@ class IngestionPipeline:
         )
         job.fingerprint = fingerprint
 
-        dup_check = await self._deduplicator.check_track(fingerprint)
+        dup_check = await self._deduplicator.check_track(fingerprint, metadata=local_meta)
         if dup_check.is_duplicate:
             job.state = JobState.DUPLICATE_REJECTED
             job.completed_at = datetime.now(UTC)
+            job.final_path = dup_check.existing_path
             await self._catalog.save_job(job)
             await self._extractor.cleanup_job_scratch(resolved_job_id)
             return IngestionResult(
@@ -410,6 +411,24 @@ class IngestionPipeline:
             job.confidence_score = candidates[0].confidence
             job.matched_release_mbid = candidates[0].metadata.release_mbid
             job.selected_metadata = candidates[0].metadata
+            enriched_dup = await self._deduplicator.check_track(
+                fingerprint,
+                recording_mbid=candidates[0].metadata.recording_mbid,
+                metadata=candidates[0].metadata,
+            )
+            if enriched_dup.is_duplicate:
+                job.state = JobState.DUPLICATE_REJECTED
+                job.completed_at = datetime.now(UTC)
+                job.final_path = enriched_dup.existing_path
+                await self._catalog.save_job(job)
+                await self._extractor.cleanup_job_scratch(resolved_job_id)
+                return IngestionResult(
+                    job=job,
+                    requires_user_confirmation=False,
+                    duplicate=enriched_dup,
+                    tracks_ingested=0,
+                    lyrics_embedded_count=0,
+                )
         else:
             job.selected_metadata = local_meta
 
@@ -649,6 +668,26 @@ class IngestionPipeline:
 
         job.selected_metadata = primary_meta
         job.matched_release_mbid = primary_meta.release_mbid or job.matched_release_mbid
+
+        final_dup = await self._deduplicator.check_track(
+            job.fingerprint,
+            recording_mbid=primary_meta.recording_mbid,
+            metadata=primary_meta,
+        )
+        if final_dup.is_duplicate:
+            job.state = JobState.DUPLICATE_REJECTED
+            job.completed_at = datetime.now(UTC)
+            job.final_path = final_dup.existing_path
+            await self._catalog.save_job(job)
+            await self._extractor.cleanup_job_scratch(job.job_id)
+            return IngestionResult(
+                job=job,
+                requires_user_confirmation=False,
+                duplicate=final_dup,
+                tracks_ingested=0,
+                lyrics_embedded_count=0,
+            )
+
         job.state = JobState.FETCHING_LYRICS
         await self._notify_stage(job, stage_callback)
         lyrics = custom_lyrics if custom_lyrics is not None else await self._lyrics.fetch_lyrics(primary_meta)
@@ -693,7 +732,11 @@ class IngestionPipeline:
                     fingerprint=extra_fp.fingerprint,
                     acoustid_mbid=extra_meta.recording_mbid,
                 )
-            extra_dup = await self._deduplicator.check_track(extra_fp)
+            extra_dup = await self._deduplicator.check_track(
+                extra_fp,
+                recording_mbid=extra_meta.recording_mbid,
+                metadata=extra_meta,
+            )
             if extra_dup.is_duplicate:
                 continue
 

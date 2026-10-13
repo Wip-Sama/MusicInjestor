@@ -568,6 +568,13 @@ async def handle_verification_callback(
         return
 
     if action == "apply_edit":
+        if organizer.is_reconciling:
+            await ack_callback(
+                callback,
+                "🔒 Library reconciliation is running in the background. Finalizing is temporarily paused.",
+                show_alert=True,
+            )
+            return
         if target_job is None:
             await ack_callback(callback, "Job not found.", show_alert=True)
             return

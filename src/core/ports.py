@@ -1,5 +1,6 @@
 """Hexagonal Architecture Ports (Protocols) decoupling `src/core` from infrastructure and UI."""
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -29,8 +30,9 @@ class CatalogRepositoryPort(Protocol):
         self,
         fingerprint: str,
         recording_mbid: str | None = None,
+        metadata: TrackMetadata | None = None,
     ) -> DuplicateCheckResult:
-        """Check whether a fingerprint or MusicBrainz recording ID already exists in the library."""
+        """Check whether a fingerprint, MBID, or track metadata already exists in the library."""
         ...
 
     async def register_ingested_track(
@@ -240,6 +242,14 @@ class GovernanceRepositoryPort(Protocol):
         record: LibraryTrackRecord,
     ) -> LibraryTrackRecord:
         """Insert or update a library track discovered or reconciled during a filesystem rescan."""
+        ...
+
+    async def upsert_scanned_library_tracks_batch(
+        self,
+        records: Sequence[LibraryTrackRecord],
+        batch_size: int = 200,
+    ) -> None:
+        """Batch insert or update library tracks discovered during a filesystem rescan."""
         ...
 
     async def delete_library_track(self, track_id: str) -> bool:

@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import logging
+import os
 import re
 import shutil
 import uuid
@@ -347,6 +348,23 @@ class LibraryOrganizer:
         self._cover_art_base_url = cover_art_base_url.rstrip("/")
         self._transport = transport
         self._enable_network = enable_network
+        self._is_reconciling: bool = False
+        self._reconciliation_status: str = "idle"
+
+    @property
+    def is_reconciling(self) -> bool:
+        """Return True if a library filesystem scan or reconciliation is active."""
+        return self._is_reconciling
+
+    @property
+    def reconciliation_status(self) -> str:
+        """Return a human-readable description of current reconciliation progress."""
+        return self._reconciliation_status
+
+    @property
+    def library_root(self) -> Path:
+        """Return the root path of the library."""
+        return self._library_root
 
     def build_target_audio_path(self, metadata: TrackMetadata, extension: str) -> Path:
         """Construct `/music/{Album Artist}/{Album} ({Year})/{Track:02d} - {Title}.{ext}`."""
@@ -578,10 +596,15 @@ class LibraryOrganizer:
         repository: GovernanceRepositoryPort,
     ) -> LibraryRescanReport:
         """Persist `added_tracks`, `updated_tracks`, and `removed_tracks` from `report` into SQLite."""
-        for added in report.added_tracks:
-            await repository.upsert_scanned_library_track(added)
-        for updated in report.updated_tracks:
-            await repository.upsert_scanned_library_track(updated)
+        batch_fn = getattr(repository, "upsert_scanned_library_tracks_batch", None)
+        all_upserts = list(report.added_tracks) + list(report.updated_tracks)
+        if callable(batch_fn):
+            if all_upserts:
+                await batch_fn(all_upserts)
+        else:
+            for rec in all_upserts:
+                await repository.upsert_scanned_library_track(rec)
+
         for removed in report.removed_tracks:
             await repository.delete_library_track(removed.id)
         return report
@@ -591,11 +614,31 @@ class LibraryOrganizer:
         repository: GovernanceRepositoryPort,
     ) -> LibraryRescanReport:
         """Scan `self._library_root` and reconcile all added, modified, moved, or deleted files in SQLite."""
-        existing = await repository.list_library_tracks(limit=10000)
-        report = await self.scan_library_filesystem(existing)
-        if report.has_changes:
-            await self.apply_rescan_report(report, repository)
-        return report
+        if self._is_reconciling:
+            logger.warning("Reconciliation requested while another reconciliation is already in progress.")
+            return LibraryRescanReport()
+
+        self._is_reconciling = True
+        self._reconciliation_status = "Scanning audio files on disk..."
+        try:
+            existing = await repository.list_library_tracks(limit=50000)
+            report = await self.scan_library_filesystem(existing)
+            if report.has_changes:
+                self._reconciliation_status = (
+                    f"Applying changes (+{len(report.added_tracks)}, "
+                    f"~{len(report.updated_tracks)}, -{len(report.removed_tracks)})..."
+                )
+                logger.info(
+                    "Persisting rescan changes to database (+%d added, ~%d updated, -%d removed)...",
+                    len(report.added_tracks),
+                    len(report.updated_tracks),
+                    len(report.removed_tracks),
+                )
+                await self.apply_rescan_report(report, repository)
+            self._reconciliation_status = "idle"
+            return report
+        finally:
+            self._is_reconciling = False
 
 
 def _read_sidecar_or_embedded_lyrics_sync(audio_path: Path) -> LyricsData | None:
@@ -713,9 +756,18 @@ def _cleanup_old_track_location_sync(old_audio_path: Path, library_root: Path) -
 
 
 def _compute_file_sha256_fingerprint_sync(audio_path: Path) -> str:
-    """Compute a deterministic `sha256:<hex>` fingerprint for an audio file on disk."""
-    digest = hashlib.sha256(audio_path.read_bytes()).hexdigest()
-    return f"sha256:{digest}"
+    """Compute a deterministic `sha256:<hex>` fingerprint safely in 64KB chunks."""
+    hasher = hashlib.sha256()
+    try:
+        with audio_path.open("rb") as f:
+            while chunk := f.read(65536):
+                hasher.update(chunk)
+        return f"sha256:{hasher.hexdigest()}"
+    except Exception as exc:
+        logger.debug("Failed to hash %s: %s", audio_path.name, exc)
+        stat = audio_path.stat() if audio_path.exists() else None
+        size = stat.st_size if stat else 0
+        return f"sha256:err-{audio_path.name}-{size}"
 
 
 def _normalize_path_key(path: Path) -> str:
@@ -740,8 +792,22 @@ def _scan_library_filesystem_sync(
     if not library_root.exists():
         return LibraryRescanReport(removed_tracks=tuple(existing_records))
 
-    discovered_files = sorted(
-        p for p in library_root.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS
+    discovered_files: list[Path] = []
+    try:
+        for root, dirs, files in os.walk(library_root, followlinks=False):
+            dirs.sort()
+            for filename in sorted(files):
+                ext = Path(filename).suffix.lower()
+                if ext in SUPPORTED_AUDIO_EXTENSIONS:
+                    discovered_files.append(Path(root) / filename)
+    except OSError as exc:
+        logger.warning("Error walking library root %s: %s", library_root, exc)
+
+    total_discovered = len(discovered_files)
+    logger.info(
+        "Discovered %d audio files in library root %s. Reconciling with database...",
+        total_discovered,
+        library_root,
     )
 
     by_path: dict[str, LibraryTrackRecord] = {
@@ -754,15 +820,22 @@ def _scan_library_filesystem_sync(
     updated: list[LibraryTrackRecord] = []
     unchanged_count = 0
 
-    for audio_file in discovered_files:
+    for idx, audio_file in enumerate(discovered_files):
+        if total_discovered > 50 and ((idx + 1) % 250 == 0 or (idx + 1) == total_discovered):
+            logger.info("Scanned %d/%d library files...", idx + 1, total_discovered)
+
         key = _normalize_path_key(audio_file)
         existing = by_path.get(key)
         if existing is not None:
             matched_ids.add(existing.id)
-            inspected = _inspect_library_audio_file_sync(audio_file, existing)
-            if _has_record_changed(existing, inspected):
-                updated.append(inspected)
-            else:
+            try:
+                inspected = _inspect_library_audio_file_sync(audio_file, existing)
+                if _has_record_changed(existing, inspected):
+                    updated.append(inspected)
+                else:
+                    unchanged_count += 1
+            except Exception as exc:
+                logger.warning("Could not inspect existing file %s: %s", audio_file.name, exc)
                 unchanged_count += 1
         else:
             unmatched_files.append(audio_file)
@@ -774,38 +847,44 @@ def _scan_library_filesystem_sync(
     }
 
     for audio_file in unmatched_files:
-        sha_fp = _compute_file_sha256_fingerprint_sync(audio_file)
         tail_key = _extract_tail_library_key(audio_file)
         moved_rec = remaining_by_tail.pop(tail_key, None)
         if moved_rec is not None:
             remaining_by_fp.pop(moved_rec.fingerprint, None)
-        else:
+        elif remaining_by_fp:
+            sha_fp = _compute_file_sha256_fingerprint_sync(audio_file)
             moved_rec = remaining_by_fp.pop(sha_fp, None)
             if moved_rec is not None:
                 remaining_by_tail.pop(_extract_tail_library_key(moved_rec.storage_path), None)
 
-        if moved_rec is None:
+        if moved_rec is None and remaining_by_fp:
             # Also check if only 1 missing record has the exact same filename and duration
-            fallback_meta = _read_mutagen_metadata_sync(
-                audio_file,
-                parse_filename_metadata(audio_file.stem),
-            )
-            for cand_rec in list(remaining_by_fp.values()):
-                if (
-                    cand_rec.title.lower() == fallback_meta.title.lower()
-                    and cand_rec.artist.lower() == fallback_meta.artist.lower()
-                ):
-                    moved_rec = remaining_by_fp.pop(cand_rec.fingerprint, None)
-                    remaining_by_tail.pop(_extract_tail_library_key(cand_rec.storage_path), None)
-                    break
+            try:
+                fallback_meta = _read_mutagen_metadata_sync(
+                    audio_file,
+                    parse_filename_metadata(audio_file.stem),
+                )
+                for cand_rec in list(remaining_by_fp.values()):
+                    if (
+                        cand_rec.title.lower() == fallback_meta.title.lower()
+                        and cand_rec.artist.lower() == fallback_meta.artist.lower()
+                    ):
+                        moved_rec = remaining_by_fp.pop(cand_rec.fingerprint, None)
+                        remaining_by_tail.pop(_extract_tail_library_key(cand_rec.storage_path), None)
+                        break
+            except Exception:
+                pass
 
-        if moved_rec is not None:
-            matched_ids.add(moved_rec.id)
-            inspected = _inspect_library_audio_file_sync(audio_file, moved_rec)
-            updated.append(inspected)
-        else:
-            new_rec = _inspect_library_audio_file_sync(audio_file, None, precomputed_fp=sha_fp)
-            added.append(new_rec)
+        try:
+            if moved_rec is not None:
+                matched_ids.add(moved_rec.id)
+                inspected = _inspect_library_audio_file_sync(audio_file, moved_rec)
+                updated.append(inspected)
+            else:
+                new_rec = _inspect_library_audio_file_sync(audio_file, None)
+                added.append(new_rec)
+        except Exception as exc:
+            logger.warning("Could not process audio file %s during rescan: %s", audio_file.name, exc)
 
     removed = [rec for rec in existing_records if rec.id not in matched_ids]
     return LibraryRescanReport(

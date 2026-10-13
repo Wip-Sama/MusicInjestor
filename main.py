@@ -109,9 +109,24 @@ async def run_periodic_library_rescan_loop(
     repository: SqliteCatalogRepository,
     interval_seconds: int = 3600,
     stop_event: asyncio.Event | None = None,
+    run_on_startup: bool = True,
 ) -> None:
     """Periodically scan `storage/library` and reconcile filesystem changes with SQLite."""
     effective_stop = stop_event or asyncio.Event()
+    if run_on_startup and not effective_stop.is_set():
+        try:
+            logger.info("Starting background library reconciliation for %s...", organizer.library_root)
+            report = await organizer.reconcile_library_with_repository(repository)
+            logger.info(
+                "Library reconciliation complete: %d unchanged, +%d added, ~%d updated, -%d removed.",
+                report.unchanged_count,
+                len(report.added_tracks),
+                len(report.updated_tracks),
+                len(report.removed_tracks),
+            )
+        except Exception as exc:
+            logger.warning("Initial library reconciliation failed: %s", exc)
+
     while not effective_stop.is_set():
         try:
             await asyncio.wait_for(effective_stop.wait(), timeout=max(1, interval_seconds))
@@ -141,18 +156,12 @@ async def run_app(settings: AppSettings | None = None) -> None:
     repository = SqliteCatalogRepository(db_manager=db_manager)
     pipeline = create_ingestion_pipeline(resolved_settings, db_manager)
 
-    organizer = LibraryOrganizer(
-        library_root=resolved_settings.storage_library_dir,
-        enable_network=True,
-    )
-    startup_report = await organizer.reconcile_library_with_repository(repository)
-    logger.info(
-        "Startup library rescan complete: %d unchanged, +%d added, ~%d updated, -%d removed.",
-        startup_report.unchanged_count,
-        len(startup_report.added_tracks),
-        len(startup_report.updated_tracks),
-        len(startup_report.removed_tracks),
-    )
+    organizer = getattr(pipeline, "_organizer", None)
+    if not isinstance(organizer, LibraryOrganizer):
+        organizer = LibraryOrganizer(
+            library_root=resolved_settings.storage_library_dir,
+            enable_network=True,
+        )
 
     bot = build_bot_instance(resolved_settings)
     notifier = TelegramAdminLogNotifier(
@@ -201,6 +210,7 @@ async def run_app(settings: AppSettings | None = None) -> None:
     dispatcher["oidc_service"] = oidc_service
     dispatcher["queue_worker"] = queue_worker
     dispatcher["notifier"] = notifier
+    dispatcher["organizer"] = organizer
     dispatcher.include_router(build_root_router())
 
     oidc_http_server: OidcHttpServer | None = None

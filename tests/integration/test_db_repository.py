@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from main import run_periodic_library_rescan_loop
 from src.core.models import (
     AccessRequestStatus,
     AudioFingerprint,
@@ -12,12 +13,14 @@ from src.core.models import (
     AuditLogEntry,
     IngestionJob,
     JobState,
+    LibraryTrackRecord,
     MetadataCandidate,
     SourceType,
     TrackMetadata,
     UserAccount,
     UserRole,
 )
+from src.core.organizer import LibraryOrganizer
 from src.db.database import SqliteDatabaseManager
 from src.db.repository import SqliteCatalogRepository
 
@@ -247,5 +250,154 @@ def test_sqlite_legacy_ingestion_jobs_schema_migration(tmp_path: Path) -> None:
         assert loaded is not None
         assert loaded.job_id == "legacy_1"
         assert loaded.state == JobState.COMPLETED
+
+    asyncio.run(_scenario())
+
+
+@pytest.mark.integration
+def test_sqlite_upsert_scanned_library_tracks_batch_and_reconciliation(tmp_path: Path) -> None:
+    """Verify batch track upserts, LibraryOrganizer reconciliation, and background startup loop."""
+    db_path = tmp_path / "rescan.db"
+    manager = SqliteDatabaseManager(db_path)
+    repo = SqliteCatalogRepository(manager)
+    library_dir = tmp_path / "library"
+    library_dir.mkdir(parents=True, exist_ok=True)
+    organizer = LibraryOrganizer(library_root=library_dir)
+
+    async def _scenario() -> None:
+        await manager.initialize()
+
+        # 1. Test batch upsert
+        rec1 = LibraryTrackRecord(
+            id="track-batch-1",
+            job_id="job-batch-1",
+            uploaded_by=1001,
+            storage_path=library_dir / "Artist1" / "Album1 (2020)" / "01 - Track1.mp3",
+            fingerprint="fp-batch-1",
+            duration_seconds=180.0,
+            artist="Artist1",
+            album="Album1",
+            title="Track1",
+            year=2020,
+            track_number=1,
+            has_synced_lyrics=False,
+        )
+        rec2 = LibraryTrackRecord(
+            id="track-batch-2",
+            job_id="job-batch-2",
+            uploaded_by=1002,
+            storage_path=library_dir / "Artist2" / "Album2 (2021)" / "02 - Track2.mp3",
+            fingerprint="fp-batch-2",
+            duration_seconds=210.0,
+            artist="Artist2",
+            album="Album2",
+            title="Track2",
+            year=2021,
+            track_number=2,
+            has_synced_lyrics=True,
+        )
+        await repo.upsert_scanned_library_tracks_batch([rec1, rec2])
+
+        tracks = await repo.list_library_tracks(limit=10)
+        assert len(tracks) == 2
+        assert {t.id for t in tracks} == {"track-batch-1", "track-batch-2"}
+
+        # 2. Test empty batch does not fail
+        await repo.upsert_scanned_library_tracks_batch([])
+
+        # 3. Test background rescan loop with run_on_startup=True
+        stop_event = asyncio.Event()
+        stop_event.set()  # Stop immediately after startup phase
+        await run_periodic_library_rescan_loop(
+            organizer=organizer,
+            repository=repo,
+            interval_seconds=10,
+            stop_event=stop_event,
+            run_on_startup=True,
+        )
+
+    asyncio.run(_scenario())
+
+
+@pytest.mark.integration
+def test_sqlite_metadata_similarity_deduplication_and_lockdown(tmp_path: Path) -> None:
+    """Verify that metadata similarity detects duplicate songs across differing paths and tags."""
+    db_path = tmp_path / "similarity_test.db"
+    manager = SqliteDatabaseManager(db_path)
+    repo = SqliteCatalogRepository(manager)
+    organizer = LibraryOrganizer(tmp_path / "library")
+
+    async def _scenario() -> None:
+        await manager.initialize()
+
+        # 1. Existing scanned song in library with folder and filename variation
+        existing_path = Path(
+            "/mnt/music/library/Rkomi/Rkomi - TAXI DRIVER/02 Rkomi - LA CODA DEL DIAVOLO.flac"
+        )
+        rec = LibraryTrackRecord(
+            id="track-rkomi-01",
+            job_id="job-rkomi-01",
+            uploaded_by=1001,
+            storage_path=existing_path,
+            fingerprint="fp_rkomi_rip1",
+            duration_seconds=185.0,
+            artist="Rkomi",
+            album="Rkomi - TAXI DRIVER",
+            title="02 Rkomi - LA CODA DEL DIAVOLO",
+            year=2021,
+            track_number=2,
+            has_synced_lyrics=True,
+        )
+        await repo.upsert_scanned_library_tracks_batch([rec])
+
+        # 2. Incoming track with different rip fingerprint, cleaned title, and year tag
+        incoming_meta = TrackMetadata(
+            artist="Rkomi",
+            album="Taxi Driver (2021)",
+            title="02 - La coda del diavolo",
+            year=2021,
+            track_number=2,
+            duration_seconds=185,
+        )
+        dup_result = await repo.check_duplicate(
+            fingerprint="fp_different_rip_hash_2",
+            recording_mbid=None,
+            metadata=incoming_meta,
+        )
+        assert dup_result.is_duplicate is True
+        assert dup_result.match_reason == "similarity"
+        assert dup_result.existing_path == existing_path
+
+        # 3. Completely different song by the same artist is NOT a duplicate
+        different_song_meta = TrackMetadata(
+            artist="Rkomi",
+            album="Taxi Driver (2021)",
+            title="Partire da te",
+            year=2021,
+            track_number=1,
+            duration_seconds=225,
+        )
+        non_dup = await repo.check_duplicate(
+            fingerprint="fp_different_song_hash_3",
+            recording_mbid=None,
+            metadata=different_song_meta,
+        )
+        assert non_dup.is_duplicate is False
+
+        # 4. Verify organizer lockdown state prevents concurrent reconciliation
+        assert organizer.is_reconciling is False
+        assert organizer.reconciliation_status == "idle"
+
+        organizer._is_reconciling = True
+        organizer._reconciliation_status = "Scanning disk files..."
+        assert organizer.is_reconciling is True
+        assert organizer.reconciliation_status == "Scanning disk files..."
+
+        # Re-entrant call while reconciling is safely skipped
+        report = await organizer.reconcile_library_with_repository(repo)
+        assert report.has_changes is False
+        assert len(report.added_tracks) == 0
+
+        organizer._is_reconciling = False
 
     asyncio.run(_scenario())

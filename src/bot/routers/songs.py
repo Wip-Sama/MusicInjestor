@@ -650,6 +650,20 @@ async def handle_rescan_command(
 
     await send_chat_action_safe(message)
     organizer = _resolve_organizer(pipeline, settings)
+    if organizer.is_reconciling:
+        await message.answer(
+            format_screen(
+                title="🔒 Library Sync In Progress",
+                context_lines=[
+                    "A background library reconciliation is currently running on the server.",
+                    f"<b>Status:</b> {html.escape(organizer.reconciliation_status)}",
+                    "Please wait for background synchronization to finish before starting a new scan.",
+                ],
+                footer_lines=["<i>🧭 Home › Songs › Rescan</i>"],
+            )
+        )
+        return
+
     existing = await governance_repository.list_library_tracks(limit=10000)
     report = await organizer.scan_library_filesystem(existing)
     if not report.has_changes:
@@ -885,6 +899,24 @@ async def handle_songs_callback(
     action = parts[1]
     msg = callback.message
     organizer = _resolve_organizer(pipeline, settings)
+
+    mutation_actions = {
+        "rescan_dryrun",
+        "rescan_apply",
+        "edit_meta",
+        "field",
+        "edit_cover",
+        "edit_lyrics",
+        "auto_enrich",
+        "import",
+    }
+    if action in mutation_actions and organizer.is_reconciling:
+        await ack_callback(
+            callback,
+            "🔒 Library sync in progress. Track modifications and rescans are temporarily frozen.",
+            show_alert=True,
+        )
+        return
 
     # 1. List / Back to Songs Menu
     if action == "list":
@@ -1476,6 +1508,14 @@ async def handle_songs_callback(
 
     # 12. Confirm & Apply Dry-Run Proposal
     if action == "confirm_apply":
+        if organizer.is_reconciling:
+            await ack_callback(
+                callback,
+                "🔒 Library reconciliation is running in the background. Changes are temporarily frozen.",
+                show_alert=True,
+            )
+            return
+
         fsm_data = await state.get_data()
         raw_proposal = fsm_data.get("pending_song_proposal")
         if not isinstance(raw_proposal, dict):

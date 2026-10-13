@@ -22,6 +22,7 @@ _YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
 _LEADING_INT_RE = re.compile(r"^\s*(\d+)")
 _LUCENE_SPECIAL_RE = re.compile(r'([+\-&|!(){}\[\]^"~*?:\\/])')
 _ALNUM_NORMALIZE_RE = re.compile(r"[\W_]+", re.UNICODE)
+_YEAR_SUFFIX_RE = re.compile(r"\s*[\(\[]\s*(?:19|20)\d{2}\s*[\)\]]")
 
 _CV_SEGMENT_RE = re.compile(
     r"(?P<char>[^()（）,&/・、]+?)\s*[(\uff08]\s*"
@@ -250,6 +251,17 @@ def extract_title_search_variants(title: str) -> list[str]:
         if song_only:
             _add(song_only)
 
+    track_match = _LEADING_TRACK_RE.match(cleaned)
+    if track_match is not None:
+        stripped_track = track_match.group(3).strip()
+        if " - " in stripped_track:
+            parts = stripped_track.split(" - ", 1)
+            _add(parts[1])
+        _add(stripped_track)
+    elif " - " in cleaned:
+        parts = cleaned.split(" - ", 1)
+        _add(parts[1])
+
     _add(bilingual)
     _add(cleaned)
     return variants
@@ -404,6 +416,20 @@ def _best_album_similarity(source_album: str, candidate_album: str) -> float:
     )
     if len(shorter) >= 3 and shorter in longer:
         return max(direct_ratio, 0.90)
+
+    src_no_year = _YEAR_SUFFIX_RE.sub("", src_clean).strip()
+    cand_no_year = _YEAR_SUFFIX_RE.sub("", cand_clean).strip()
+    if src_no_year and cand_no_year:
+        no_year_ratio = SequenceMatcher(None, src_no_year, cand_no_year).ratio()
+        shorter_ny, longer_ny = (
+            (src_no_year, cand_no_year)
+            if len(src_no_year) <= len(cand_no_year)
+            else (cand_no_year, src_no_year)
+        )
+        if len(shorter_ny) >= 3 and shorter_ny in longer_ny:
+            return max(direct_ratio, no_year_ratio, 0.90)
+        direct_ratio = max(direct_ratio, no_year_ratio)
+
     return direct_ratio
 
 

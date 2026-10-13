@@ -2,10 +2,18 @@
 
 import json
 import uuid
+from collections.abc import Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
+from src.core.metadata import (
+    _best_album_similarity,
+    _best_artist_similarity,
+    _best_title_similarity,
+    normalize_primary_artist,
+    parse_filename_metadata,
+)
 from src.core.models import (
     AccessRequestRecord,
     AccessRequestStatus,
@@ -168,32 +176,34 @@ class SqliteCatalogRepository:
         self,
         fingerprint: str,
         recording_mbid: str | None = None,
+        metadata: TrackMetadata | None = None,
     ) -> DuplicateCheckResult:
-        """Query `catalog_tracks` and `library_tracks` for an existing fingerprint or recording MBID."""
+        """Query `catalog_tracks` and `library_tracks` for existing fingerprint, MBID, or similarity."""
         async with self._db.connect() as conn:
-            cursor = await conn.execute(
-                "SELECT library_path FROM catalog_tracks WHERE fingerprint = ? LIMIT 1",
-                (fingerprint,),
-            )
-            row = await cursor.fetchone()
-            if row is not None:
-                return DuplicateCheckResult(
-                    is_duplicate=True,
-                    existing_path=Path(str(row[0])),
-                    match_reason="fingerprint",
+            if fingerprint:
+                cursor = await conn.execute(
+                    "SELECT library_path FROM catalog_tracks WHERE fingerprint = ? LIMIT 1",
+                    (fingerprint,),
                 )
+                row = await cursor.fetchone()
+                if row is not None:
+                    return DuplicateCheckResult(
+                        is_duplicate=True,
+                        existing_path=Path(str(row[0])),
+                        match_reason="fingerprint",
+                    )
 
-            lib_cursor = await conn.execute(
-                "SELECT storage_path FROM library_tracks WHERE fingerprint = ? LIMIT 1",
-                (fingerprint,),
-            )
-            lib_row = await lib_cursor.fetchone()
-            if lib_row is not None:
-                return DuplicateCheckResult(
-                    is_duplicate=True,
-                    existing_path=Path(str(lib_row[0])),
-                    match_reason="fingerprint",
+                lib_cursor = await conn.execute(
+                    "SELECT storage_path FROM library_tracks WHERE fingerprint = ? LIMIT 1",
+                    (fingerprint,),
                 )
+                lib_row = await lib_cursor.fetchone()
+                if lib_row is not None:
+                    return DuplicateCheckResult(
+                        is_duplicate=True,
+                        existing_path=Path(str(lib_row[0])),
+                        match_reason="fingerprint",
+                    )
 
             if recording_mbid:
                 mbid_cursor = await conn.execute(
@@ -207,6 +217,118 @@ class SqliteCatalogRepository:
                         existing_path=Path(str(mbid_row[0])),
                         match_reason="recording_mbid",
                     )
+
+            if metadata is not None and (metadata.title or metadata.artist):
+                norm_artist = normalize_primary_artist(metadata.artist).strip()
+                norm_title = metadata.title.strip()
+                norm_album = metadata.album.strip() if metadata.album else ""
+                src_duration = (
+                    float(metadata.duration_seconds)
+                    if metadata.duration_seconds is not None and metadata.duration_seconds > 0
+                    else None
+                )
+
+                candidate_rows: list[Sequence[object]] = []
+                seen_paths: set[str] = set()
+
+                if norm_artist and norm_artist.lower() != "unknown artist":
+                    artist_cur = await conn.execute(
+                        """
+                        SELECT storage_path, artist, album, title, duration_seconds
+                        FROM library_tracks
+                        WHERE LOWER(artist) LIKE ? OR LOWER(storage_path) LIKE ?
+                        LIMIT 500
+                        """,
+                        (f"%{norm_artist.lower()}%", f"%{norm_artist.lower()}%"),
+                    )
+                    for r in await artist_cur.fetchall():
+                        path_str = str(r[0])
+                        if path_str not in seen_paths:
+                            seen_paths.add(path_str)
+                            candidate_rows.append(r)
+
+                parsed_title = parse_filename_metadata(norm_title).title
+                title_token = (
+                    parsed_title if parsed_title and parsed_title.lower() != "unknown title" else norm_title
+                )
+                if title_token and title_token.lower() != "unknown title" and len(title_token) >= 4:
+                    title_cur = await conn.execute(
+                        """
+                        SELECT storage_path, artist, album, title, duration_seconds
+                        FROM library_tracks
+                        WHERE LOWER(title) LIKE ?
+                        LIMIT 500
+                        """,
+                        (f"%{title_token.lower()}%",),
+                    )
+                    for r in await title_cur.fetchall():
+                        path_str = str(r[0])
+                        if path_str not in seen_paths:
+                            seen_paths.add(path_str)
+                            candidate_rows.append(r)
+
+                if not candidate_rows:
+                    count_cur = await conn.execute("SELECT COUNT(*) FROM library_tracks")
+                    count_row = await count_cur.fetchone()
+                    total_tracks = int(count_row[0]) if count_row is not None else 0
+                    if total_tracks <= 2500:
+                        all_cur = await conn.execute(
+                            """
+                            SELECT storage_path, artist, album, title, duration_seconds
+                            FROM library_tracks
+                            LIMIT 2500
+                            """
+                        )
+                        for r in await all_cur.fetchall():
+                            path_str = str(r[0])
+                            if path_str not in seen_paths:
+                                seen_paths.add(path_str)
+                                candidate_rows.append(r)
+
+                for row in candidate_rows:
+                    cand_path = Path(str(row[0]))
+                    cand_artist = str(row[1]) if row[1] is not None else ""
+                    cand_album = str(row[2]) if row[2] is not None else ""
+                    cand_title = str(row[3]) if row[3] is not None else ""
+                    cand_duration = (
+                        float(str(row[4])) if row[4] is not None and float(str(row[4])) > 0 else None
+                    )
+
+                    cand_artist_val = cand_artist
+                    if not cand_artist_val or cand_artist_val.lower() == "unknown artist":
+                        cand_artist_val = cand_path.parent.parent.name
+                    artist_sim = _best_artist_similarity(metadata.artist, cand_artist_val)
+
+                    title_sim = _best_title_similarity(metadata.title, cand_title)
+                    if cand_path.stem:
+                        stem_sim = _best_title_similarity(metadata.title, cand_path.stem)
+                        title_sim = max(title_sim, stem_sim)
+
+                    duration_mismatch = False
+                    if src_duration is not None and cand_duration is not None:
+                        diff = abs(src_duration - cand_duration)
+                        if diff > 18.0:
+                            duration_mismatch = True
+
+                    if duration_mismatch:
+                        continue
+
+                    album_sim = 0.0
+                    if norm_album and cand_album:
+                        album_sim = _best_album_similarity(norm_album, cand_album)
+
+                    is_dup = (
+                        (artist_sim >= 0.85 and title_sim >= 0.85)
+                        or (title_sim >= 0.95 and artist_sim >= 0.75)
+                        or (album_sim >= 0.85 and title_sim >= 0.85 and artist_sim >= 0.70)
+                    )
+
+                    if is_dup:
+                        return DuplicateCheckResult(
+                            is_duplicate=True,
+                            existing_path=cand_path,
+                            match_reason="similarity",
+                        )
 
         return DuplicateCheckResult(is_duplicate=False)
 
@@ -1170,107 +1292,120 @@ class SqliteCatalogRepository:
             )
             await conn.commit()
 
+    async def upsert_scanned_library_tracks_batch(
+        self,
+        records: Sequence[LibraryTrackRecord],
+        batch_size: int = 200,
+    ) -> None:
+        """Batch insert or update library tracks discovered or reconciled during a filesystem rescan."""
+        if not records:
+            return
+        async with self._db.connect() as conn:
+            for i in range(0, len(records), batch_size):
+                batch = records[i : i + batch_size]
+                for record in batch:
+                    now_iso = record.ingested_at.isoformat()
+                    job_id = record.job_id or f"rescan-{record.id[:12]}"
+                    resolved_uploader = record.uploaded_by
+                    if resolved_uploader == 0:
+                        job_cur = await conn.execute(
+                            """
+                            SELECT user_id FROM ingestion_jobs
+                            WHERE (job_id = ? OR final_path = ?)
+                              AND user_id IS NOT NULL AND user_id > 0
+                            LIMIT 1
+                            """,
+                            (job_id, str(record.storage_path)),
+                        )
+                        job_row = await job_cur.fetchone()
+                        if job_row is not None and job_row[0] is not None:
+                            resolved_uploader = int(str(job_row[0]))
+
+                    await conn.execute(
+                        """
+                        INSERT INTO library_tracks (
+                            id, job_id, uploaded_by, storage_path, fingerprint,
+                            duration_seconds, artist, album, title, year,
+                            track_number, has_synced_lyrics, ingested_at,
+                            updated_at, modified_by, modification_count,
+                            telegram_file_id, source_chat_id, source_message_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            uploaded_by = CASE
+                                WHEN library_tracks.uploaded_by > 0 THEN library_tracks.uploaded_by
+                                ELSE excluded.uploaded_by
+                            END,
+                            storage_path = excluded.storage_path,
+                            fingerprint = excluded.fingerprint,
+                            duration_seconds = excluded.duration_seconds,
+                            artist = excluded.artist,
+                            album = excluded.album,
+                            title = excluded.title,
+                            year = excluded.year,
+                            track_number = excluded.track_number,
+                            has_synced_lyrics = excluded.has_synced_lyrics
+                        """,
+                        (
+                            record.id,
+                            job_id,
+                            resolved_uploader,
+                            str(record.storage_path),
+                            record.fingerprint,
+                            record.duration_seconds,
+                            record.artist,
+                            record.album,
+                            record.title,
+                            record.year,
+                            record.track_number,
+                            1 if record.has_synced_lyrics else 0,
+                            now_iso,
+                            record.updated_at.isoformat() if record.updated_at else None,
+                            record.modified_by,
+                            record.modification_count,
+                            record.telegram_file_id,
+                            record.source_chat_id,
+                            record.source_message_id,
+                        ),
+                    )
+                    await conn.execute(
+                        """
+                        INSERT INTO catalog_tracks (
+                            job_id, title, artist, album, album_artist,
+                            year, track_number, disc_number, duration_seconds,
+                            fingerprint, library_path, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(fingerprint) DO UPDATE SET
+                            title = excluded.title,
+                            artist = excluded.artist,
+                            album = excluded.album,
+                            album_artist = excluded.album_artist,
+                            year = excluded.year,
+                            track_number = excluded.track_number,
+                            library_path = excluded.library_path
+                        """,
+                        (
+                            job_id,
+                            record.title,
+                            record.artist,
+                            record.album,
+                            record.artist,
+                            record.year,
+                            record.track_number or 1,
+                            1,
+                            int(round(record.duration_seconds)),
+                            record.fingerprint,
+                            str(record.storage_path),
+                            now_iso,
+                        ),
+                    )
+                await conn.commit()
+
     async def upsert_scanned_library_track(
         self,
         record: LibraryTrackRecord,
     ) -> LibraryTrackRecord:
         """Insert or update a library track discovered or reconciled during a filesystem rescan."""
-        now_iso = record.ingested_at.isoformat()
-        job_id = record.job_id or f"rescan-{record.id[:12]}"
-        resolved_uploader = record.uploaded_by
-        async with self._db.connect() as conn:
-            if resolved_uploader == 0:
-                job_cur = await conn.execute(
-                    """
-                    SELECT user_id FROM ingestion_jobs
-                    WHERE (job_id = ? OR final_path = ?)
-                      AND user_id IS NOT NULL AND user_id > 0
-                    LIMIT 1
-                    """,
-                    (job_id, str(record.storage_path)),
-                )
-                job_row = await job_cur.fetchone()
-                if job_row is not None and job_row[0] is not None:
-                    resolved_uploader = int(str(job_row[0]))
-
-            await conn.execute(
-                """
-                INSERT INTO library_tracks (
-                    id, job_id, uploaded_by, storage_path, fingerprint,
-                    duration_seconds, artist, album, title, year,
-                    track_number, has_synced_lyrics, ingested_at,
-                    updated_at, modified_by, modification_count,
-                    telegram_file_id, source_chat_id, source_message_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    uploaded_by = CASE
-                        WHEN library_tracks.uploaded_by > 0 THEN library_tracks.uploaded_by
-                        ELSE excluded.uploaded_by
-                    END,
-                    storage_path = excluded.storage_path,
-                    fingerprint = excluded.fingerprint,
-                    duration_seconds = excluded.duration_seconds,
-                    artist = excluded.artist,
-                    album = excluded.album,
-                    title = excluded.title,
-                    year = excluded.year,
-                    track_number = excluded.track_number,
-                    has_synced_lyrics = excluded.has_synced_lyrics
-                """,
-                (
-                    record.id,
-                    job_id,
-                    resolved_uploader,
-                    str(record.storage_path),
-                    record.fingerprint,
-                    record.duration_seconds,
-                    record.artist,
-                    record.album,
-                    record.title,
-                    record.year,
-                    record.track_number,
-                    1 if record.has_synced_lyrics else 0,
-                    now_iso,
-                    record.updated_at.isoformat() if record.updated_at else None,
-                    record.modified_by,
-                    record.modification_count,
-                    record.telegram_file_id,
-                    record.source_chat_id,
-                    record.source_message_id,
-                ),
-            )
-            await conn.execute(
-                """
-                INSERT INTO catalog_tracks (
-                    job_id, title, artist, album, album_artist,
-                    year, track_number, disc_number, duration_seconds,
-                    fingerprint, library_path, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(fingerprint) DO UPDATE SET
-                    title = excluded.title,
-                    artist = excluded.artist,
-                    album = excluded.album,
-                    album_artist = excluded.album_artist,
-                    year = excluded.year,
-                    track_number = excluded.track_number,
-                    library_path = excluded.library_path
-                """,
-                (
-                    job_id,
-                    record.title,
-                    record.artist,
-                    record.album,
-                    record.artist,
-                    record.year,
-                    record.track_number or 1,
-                    1,
-                    int(round(record.duration_seconds)),
-                    record.fingerprint,
-                    str(record.storage_path),
-                    now_iso,
-                ),
-            )
-            await conn.commit()
+        await self.upsert_scanned_library_tracks_batch([record])
         return (await self.get_library_track(record.id)) or record
 
     async def delete_library_track(self, track_id: str) -> bool:

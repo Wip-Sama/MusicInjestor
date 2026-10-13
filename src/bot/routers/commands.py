@@ -42,6 +42,7 @@ from src.core.audit import (
 from src.core.exceptions import PermissionDeniedError
 from src.core.models import JobState, Permission, UserAccount, UserRole
 from src.core.oidc import AuthentikOidcService
+from src.core.organizer import LibraryOrganizer
 from src.core.pipeline import IngestionPipeline
 from src.core.ports import CatalogRepositoryPort, GovernanceRepositoryPort
 from src.core.queue import IngestionQueueWorker
@@ -213,6 +214,7 @@ async def _render_status_card(
     current_user: UserAccount | None,
     governance_repository: GovernanceRepositoryPort | None,
     queue_worker: IngestionQueueWorker | None,
+    organizer: LibraryOrganizer | None = None,
 ) -> str:
     """Format the 3-tier HTML System & Session Status screen."""
     if current_user is None or governance_repository is None:
@@ -227,6 +229,11 @@ async def _render_status_card(
     concurrency = queue_worker.concurrency_limit if queue_worker is not None else 1
     oidc_ident = html.escape(current_user.authentik_username or current_user.authentik_sub or "")
     oidc_label = f"Linked (<code>{oidc_ident}</code>)" if current_user.is_oidc_linked else "Not Linked"
+    sync_status = (
+        f"🟡 In Progress ({html.escape(organizer.reconciliation_status)})"
+        if organizer is not None and organizer.is_reconciling
+        else "🟢 Ready"
+    )
     return format_screen(
         title="🟢 System &amp; Session Status",
         context_lines=[
@@ -235,6 +242,7 @@ async def _render_status_card(
             f"• Queue Concurrency: <code>{concurrency}</code>",
             f"• Global Queue: <code>{len(active_jobs)}</code> Active | "
             f"<code>{len(queued_jobs)}</code> Queued",
+            f"• Library Sync: {sync_status}",
         ],
         footer_lines=[
             f"<i>Your Telegram ID:</i> <code>{current_user.telegram_id}</code> • <i>🧭 Home › Status</i>"
@@ -497,6 +505,7 @@ async def handle_status(
     current_user: UserAccount | None = None,
     governance_repository: GovernanceRepositoryPort | None = None,
     queue_worker: IngestionQueueWorker | None = None,
+    organizer: LibraryOrganizer | None = None,
     state: FSMContext | None = None,
 ) -> None:
     """Report current operational, RBAC, OIDC, and queue status of the ingestion service."""
@@ -509,7 +518,7 @@ async def handle_status(
         reset_to_home=True,
     )
 
-    text = await _render_status_card(current_user, governance_repository, queue_worker)
+    text = await _render_status_card(current_user, governance_repository, queue_worker, organizer=organizer)
     if current_user is None or governance_repository is None:
         await message.answer(text, reply_markup=build_back_to_home_keyboard())
         return
@@ -566,6 +575,7 @@ async def handle_menu_navigation_callback(
     current_user: UserAccount | None = None,
     governance_repository: GovernanceRepositoryPort | None = None,
     queue_worker: IngestionQueueWorker | None = None,
+    organizer: LibraryOrganizer | None = None,
     oidc_service: AuthentikOidcService | None = None,
     settings: AppSettings | None = None,
     state: FSMContext | None = None,
@@ -596,7 +606,12 @@ async def handle_menu_navigation_callback(
             "menu:status",
             default_back="menu:home",
         )
-        text = await _render_status_card(current_user, governance_repository, queue_worker)
+        text = await _render_status_card(
+            current_user,
+            governance_repository,
+            queue_worker,
+            organizer=organizer,
+        )
         await safe_edit_text(
             callback.message,
             text,
