@@ -331,6 +331,13 @@ Before concluding any task that modifies code:
       4. `❌ Discard Changes` (`songs:discard_changes`) safely resetting FSM state and preserving the original track intact.
     - Added comprehensive unit test suites in `tests/unit/test_bot_auto_lyrics_and_selective_review.py` and extended `tests/unit/test_webapp_server.py`, passing all 115 unit and integration tests.
 
+- [x] **M28: Multi-Stage Container Packaging, Mini App Static Assets Baking & CI Build Verification**
+  - Diagnosed Telegram Mini App placeholder fallback (`Frontend build in progress or static directory not found`): `Dockerfile` previously only copied Python sources and omitted `webapp/`, leaving `/app/webapp/dist` absent in production images pulled from GHCR.
+  - Implemented multi-stage Docker build in `Dockerfile` using `node:22-bookworm-slim` (`webapp-builder` stage) running `npm ci` and `npm run build`, copying the compiled bundle into `/app/webapp/dist` of the final Python 3.14 runtime image.
+  - Updated `.dockerignore` to ignore `webapp/node_modules/` and `webapp/dist/`, ensuring host artifacts do not bleed into the container build context.
+  - Added `WEB_APP_DEV_MODE: false` and `WEB_APP_STATIC_DIR: /app/webapp/dist` environment defaults and optional local volume mounting comments in `docker-compose.yml` and `docker-compose.example.yaml`.
+  - Added Node.js setup and `npm run build` verification steps to GitHub Actions CI (`.github/workflows/ci.yml`) and verified end-to-end container image creation (`docker run --rm music-ingest-bot:test ls -la /app/webapp/dist`).
+
 ### Planned Backlog (Future Enhancements)
 - [x] **Phase 4: Telegram Mini App Web Ingestion Hub & Live Queue Board** (Completed in M21)
 - [x] **Phase 5: Telegram Mini App Governance, Deep-Linking & Offline Resilience** (Completed in M22)

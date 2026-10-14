@@ -44,6 +44,8 @@ services:
       UMASK: ${UMASK:-0022}
       WEB_LISTEN_HOST: ${WEB_LISTEN_HOST:-0.0.0.0}
       WEB_LISTEN_PORT: ${WEB_LISTEN_PORT:-8080}
+      WEB_APP_DEV_MODE: ${WEB_APP_DEV_MODE:-false}
+      WEB_APP_STATIC_DIR: ${WEB_APP_STATIC_DIR:-/app/webapp/dist}
     ports:
       - "${WEB_LISTEN_PORT:-${OIDC_LISTEN_PORT:-8080}}:${WEB_LISTEN_PORT:-8080}"
     volumes:
@@ -53,6 +55,8 @@ services:
       - ${HOST_MUSIC_DIR:-./storage/library}:/mnt/music/library
       # Persistent bot state (SQLite WAL library.db and temporary archive extraction scratch)
       - ./storage:/app/storage
+      # Optional: bind-mount local webapp/dist for instant frontend updates without rebuilding container:
+      # - ./webapp/dist:/app/webapp/dist:ro
       # Uncomment below if using a local config.yaml file on the host:
       # - ./config.yaml:/app/config.yaml:ro
 

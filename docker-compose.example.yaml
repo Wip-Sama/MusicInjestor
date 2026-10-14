@@ -60,6 +60,8 @@ services:
       UMASK: ${UMASK:-0022}
       WEB_LISTEN_HOST: ${WEB_LISTEN_HOST:-0.0.0.0}
       WEB_LISTEN_PORT: ${WEB_LISTEN_PORT:-8080}
+      WEB_APP_DEV_MODE: ${WEB_APP_DEV_MODE:-false}
+      WEB_APP_STATIC_DIR: ${WEB_APP_STATIC_DIR:-/app/webapp/dist}
     ports:
       - "${WEB_LISTEN_PORT:-${OIDC_LISTEN_PORT:-8080}}:${WEB_LISTEN_PORT:-8080}"
     volumes:
@@ -71,4 +73,6 @@ services:
       - ./storage:/app/storage
       # 4. YAML configuration file (`cp config.example.yaml config.yaml` before starting)
       - ./config.yaml:/app/config.yaml:ro
+      # 5. Optional: bind-mount local webapp/dist for instant frontend updates without rebuilding container:
+      # - ./webapp/dist:/app/webapp/dist:ro
 

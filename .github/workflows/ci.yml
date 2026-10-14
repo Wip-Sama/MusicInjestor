@@ -61,6 +61,18 @@ jobs:
       - name: Run unit, architectural, and integration test suite
         run: uv run pytest
 
+      - name: Install Node.js for Mini App build verification
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: webapp/package-lock.json
+
+      - name: Verify WebApp build
+        run: |
+          npm --prefix webapp ci
+          npm --prefix webapp run build
+
   docker-build-publish:
     name: Build & Publish Docker Image (GHCR)
     runs-on: ubuntu-latest

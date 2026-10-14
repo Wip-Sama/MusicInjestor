@@ -12,4 +12,6 @@ storage/
 docs/
 *.md
 !README.md
+webapp/node_modules/
+webapp/dist/
 
