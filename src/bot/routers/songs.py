@@ -6,6 +6,7 @@ import json
 import logging
 import math
 from pathlib import Path
+from typing import Any
 
 import httpx
 from aiogram import F, Router
@@ -25,12 +26,15 @@ from src.bot.keyboards.songs import (
     SORT_LABELS,
     SongsPageCallback,
     SongsSortCallback,
+    SongsToggleFieldCallback,
     build_dry_run_confirmation_keyboard,
     build_input_cancel_keyboard,
+    build_lyrics_input_keyboard,
     build_metadata_field_keyboard,
     build_rescan_confirmation_keyboard,
     build_research_mode_keyboard,
     build_search_prompt_keyboard,
+    build_selective_changes_keyboard,
     build_song_action_keyboard,
     build_song_history_keyboard,
     build_songs_search_menu_keyboard,
@@ -62,7 +66,6 @@ from src.core.models import (
     Permission,
     TrackMetadata,
     UserAccount,
-    UserRole,
 )
 from src.core.organizer import LibraryOrganizer
 from src.core.pipeline import IngestionPipeline
@@ -144,10 +147,10 @@ def _resolve_organizer(
 def _resolve_metadata_service(
     pipeline: IngestionPipeline | None,
     settings: AppSettings | None,
-) -> MusicBrainzMetadataService:
-    """Obtain the active `MusicBrainzMetadataService` from `pipeline` or construct one."""
-    meta_attr = getattr(pipeline, "_metadata_provider", None)
-    if isinstance(meta_attr, MusicBrainzMetadataService):
+) -> Any:
+    """Obtain the active `MetadataProviderPort` from `pipeline` or construct one."""
+    meta_attr = getattr(pipeline, "_metadata", None) or getattr(pipeline, "_metadata_provider", None)
+    if meta_attr is not None and callable(getattr(meta_attr, "find_candidates", None)):
         return meta_attr
     if settings is not None:
         return MusicBrainzMetadataService(
@@ -164,10 +167,10 @@ def _resolve_metadata_service(
 def _resolve_lyrics_client(
     pipeline: IngestionPipeline | None,
     settings: AppSettings | None,
-) -> LrclibLyricsClient:
-    """Obtain the active `LrclibLyricsClient` from `pipeline` or construct one."""
-    lyrics_attr = getattr(pipeline, "_lyrics_provider", None)
-    if isinstance(lyrics_attr, LrclibLyricsClient):
+) -> Any:
+    """Obtain the active `LyricsProviderPort` from `pipeline` or construct one."""
+    lyrics_attr = getattr(pipeline, "_lyrics", None) or getattr(pipeline, "_lyrics_provider", None)
+    if lyrics_attr is not None and callable(getattr(lyrics_attr, "fetch_lyrics", None)):
         return lyrics_attr
     base_url = settings.lrclib_base_url if settings is not None else "https://lrclib.net/api"
     return LrclibLyricsClient(base_url=base_url)
@@ -184,9 +187,16 @@ def _can_access_songs(user: UserAccount | None) -> bool:
     """Return True if `user` is permitted to browse and manage library songs."""
     if user is None:
         return True
-    if user.is_blocked or user.role == UserRole.GUEST:
+    if user.is_blocked:
         return False
-    return has_permission(user, Permission.SUBMIT_INGESTION)
+    return has_permission(user, Permission.VIEW_CATALOG)
+
+
+def _can_edit_songs(user: UserAccount | None) -> bool:
+    """Return True if `user` is permitted to edit tags, cover, or lyrics."""
+    if user is None or user.is_blocked:
+        return False
+    return has_permission(user, Permission.REQUEST_TAG_CORRECTION)
 
 
 async def _resolve_song_provenance_labels(
@@ -427,6 +437,9 @@ def format_song_edit_dry_run_card(
 ) -> str:
     """Render a 3-tier HTML Dry-Run Preview Report comparing current song state against `proposal`."""
     action_type = str(proposal.get("action_type") or "metadata").upper()
+    enabled_fields_raw = proposal.get("enabled_fields")
+    enabled_set = set(enabled_fields_raw) if isinstance(enabled_fields_raw, list) else None
+
     new_title = str(proposal.get("new_title") or record.title)
     new_artist = str(proposal.get("new_artist") or record.artist)
     new_album = str(proposal.get("new_album") or record.album)
@@ -437,13 +450,19 @@ def format_song_edit_dry_run_card(
         int(str(raw_trk)) if raw_trk is not None and str(raw_trk).isdigit() else (record.track_number or 1)
     )
 
+    eff_title = new_title if enabled_set is None or "title" in enabled_set else record.title
+    eff_artist = new_artist if enabled_set is None or "artist" in enabled_set else record.artist
+    eff_album = new_album if enabled_set is None or "album" in enabled_set else record.album
+    eff_year = new_year if enabled_set is None or "year" in enabled_set else record.year
+    eff_trk = new_trk if enabled_set is None or "track_number" in enabled_set else (record.track_number or 1)
+
     target_meta = TrackMetadata(
-        title=new_title,
-        artist=new_artist,
-        album=new_album,
-        album_artist=new_artist,
-        year=new_year,
-        track_number=new_trk,
+        title=eff_title,
+        artist=eff_artist,
+        album=eff_album,
+        album_artist=eff_artist,
+        year=eff_year,
+        track_number=eff_trk,
         duration_seconds=int(round(record.duration_seconds)),
     )
     suffix = record.storage_path.suffix or ".flac"
@@ -453,18 +472,20 @@ def format_song_edit_dry_run_card(
         "Please review what is going to change before applying:",
     ]
 
-    def _diff_line(label: str, old_val: object, new_val: object) -> str:
+    def _diff_line(field_key: str, label: str, old_val: object, new_val: object) -> str:
         old_s = html.escape(str(old_val if old_val is not None else "None"))
         new_s = html.escape(str(new_val if new_val is not None else "None"))
         if old_s != new_s:
+            if enabled_set is not None and field_key not in enabled_set:
+                return f"• {label}: <s>{new_s}</s> ➡️ <code>{old_s}</code> <i>(kept original)</i>"
             return f"• {label}: <s>{old_s}</s> ➡️ <code>{new_s}</code>"
         return f"• {label}: <code>{old_s}</code> <i>(unchanged)</i>"
 
-    context_lines.append(_diff_line("Title", record.title, new_title))
-    context_lines.append(_diff_line("Artist", record.artist, new_artist))
-    context_lines.append(_diff_line("Album", record.album, new_album))
-    context_lines.append(_diff_line("Year", record.year, new_year))
-    context_lines.append(_diff_line("Track #", record.track_number or 1, new_trk))
+    context_lines.append(_diff_line("title", "Title", record.title, new_title))
+    context_lines.append(_diff_line("artist", "Artist", record.artist, new_artist))
+    context_lines.append(_diff_line("album", "Album", record.album, new_album))
+    context_lines.append(_diff_line("year", "Year", record.year, new_year))
+    context_lines.append(_diff_line("track_number", "Track #", record.track_number or 1, new_trk))
 
     old_path_str = str(record.storage_path)
     new_path_str = str(new_path)
@@ -482,17 +503,25 @@ def format_song_edit_dry_run_card(
         line_count = len(new_lyrics.strip().splitlines())
         is_synced = "[" in new_lyrics and "]" in new_lyrics
         kind = "Synced LRC" if is_synced else "Plain Text"
-        context_lines.append(
-            f"• Lyrics: ➡️ Update (<code>{kind}, {line_count} lines</code> — "
-            "embedded in audio + <code>.lrc</code> sidecar)"
-        )
+        if enabled_set is not None and "lyrics" not in enabled_set:
+            context_lines.append(
+                f"• Lyrics: <code>{kind}, {line_count} lines</code> ➡️ <i>(kept original, discarded)</i>"
+            )
+        else:
+            context_lines.append(
+                f"• Lyrics: ➡️ Update (<code>{kind}, {line_count} lines</code> — "
+                "embedded in audio + <code>.lrc</code> sidecar)"
+            )
 
     cover_size = proposal.get("new_cover_size")
     if cover_size is not None:
         kb = max(1, int(str(cover_size)) // 1024)
-        context_lines.append(
-            f"• Cover Art: ➡️ Update <code>cover.jpg</code> &amp; embedded picture (<code>{kb} KB</code>)"
-        )
+        if enabled_set is not None and "cover" not in enabled_set:
+            context_lines.append(f"• Cover Art: <code>{kb} KB</code> ➡️ <i>(kept original, discarded)</i>")
+        else:
+            context_lines.append(
+                f"• Cover Art: ➡️ Update <code>cover.jpg</code> &amp; embedded picture (<code>{kb} KB</code>)"
+            )
 
     return format_screen(
         title=f"🧪 Dry-Run Preview ({html.escape(action_type)})",
@@ -874,6 +903,7 @@ async def handle_songs_search_text(
     current_user: UserAccount | None = None,
     governance_repository: GovernanceRepositoryPort | None = None,
     catalog_repository: CatalogRepositoryPort | None = None,
+    settings: AppSettings | None = None,
 ) -> None:
     """Filter library songs (or inspect a pasted Job ID / Track ID) in `awaiting_search_query` state."""
     text = (message.text or "").strip()
@@ -904,6 +934,7 @@ async def handle_songs_search_text(
                 governance_repository,
                 catalog_repository,
             )
+            web_url = settings.web_app_url.strip() if settings and settings.web_app_url else None
             await message.answer(
                 format_song_detail_card(
                     direct_track,
@@ -912,7 +943,12 @@ async def handle_songs_search_text(
                     uploader_label=up_lbl,
                     modifier_label=mod_lbl,
                 ),
-                reply_markup=build_song_action_keyboard(direct_track.id, back_callback=back_cb),
+                reply_markup=build_song_action_keyboard(
+                    direct_track.id,
+                    can_edit=_can_edit_songs(current_user),
+                    back_callback=back_cb,
+                    web_app_url=web_url,
+                ),
             )
             return
 
@@ -1200,6 +1236,7 @@ async def handle_songs_callback(
     action = parts[1]
     msg = callback.message
     organizer = _resolve_organizer(pipeline, settings)
+    web_url = settings.web_app_url.strip() if settings and settings.web_app_url else None
 
     mutation_actions = {
         "rescan_dryrun",
@@ -1519,7 +1556,12 @@ async def handle_songs_callback(
         await safe_edit_text(
             msg,
             card,
-            reply_markup=build_song_action_keyboard(record.id, back_callback=back_cb),
+            reply_markup=build_song_action_keyboard(
+                record.id,
+                can_edit=_can_edit_songs(current_user),
+                back_callback=back_cb,
+                web_app_url=web_url,
+            ),
         )
         return
 
@@ -1633,6 +1675,17 @@ async def handle_songs_callback(
                 )
             for trk in available_tracks:
                 await _deliver_track_audio(msg, trk, governance_repository)
+        return
+
+    # Mutating actions guard: require REQUEST_TAG_CORRECTION (denies LISTENER and unprivileged users)
+    if action in {"edit_meta", "edit_cover", "edit_lyrics", "research", "import"} and not _can_edit_songs(
+        current_user
+    ):
+        await ack_callback(
+            callback,
+            "🚫 Editing is restricted to uploaders and moderators.",
+            show_alert=True,
+        )
         return
 
     # 7. Open Metadata Field Picker
@@ -1763,7 +1816,86 @@ async def handle_songs_callback(
                     "<i>🧭 Home › Songs › Edit Lyrics</i>"
                 ],
             ),
-            reply_markup=build_input_cancel_keyboard(record.id),
+            reply_markup=build_lyrics_input_keyboard(record.id),
+        )
+        return
+
+    # 9b. Auto-Search Lyrics Only (LRCLIB)
+    if action == "research_lyrics":
+        await ack_callback(callback, "Searching LRCLIB...")
+        await send_chat_action_safe(callback)
+        await safe_edit_text(
+            msg,
+            format_loading_card(
+                "Querying LRCLIB Lyrics",
+                f"Looking up lyrics for <code>{html.escape(record.title)}</code>...",
+                "🧭 Home › Songs › Auto Lyrics",
+            ),
+        )
+        lyrics_client = _resolve_lyrics_client(pipeline, settings)
+        search_meta = TrackMetadata(
+            title=record.title,
+            artist=record.artist,
+            album=record.album,
+            year=record.year,
+            track_number=record.track_number or 1,
+            duration_seconds=int(round(record.duration_seconds)),
+        )
+        fetched_lyrics = None
+        try:
+            fetched_lyrics = await lyrics_client.fetch_lyrics(search_meta)
+        except Exception as exc:
+            logger.debug("Failed to auto-search lyrics for %s: %s", record.id, exc)
+
+        lyrics_text = (
+            (fetched_lyrics.synced_lyrics or fetched_lyrics.plain_lyrics)
+            if fetched_lyrics is not None
+            else None
+        )
+        if not lyrics_text or not lyrics_text.strip():
+            await safe_edit_text(
+                msg,
+                format_screen(
+                    title=f"⚠️ No Lyrics Found ({html.escape(record.artist)} - {html.escape(record.title)})",
+                    context_lines=[
+                        "No matching lyrics were found on LRCLIB for this song.",
+                        "You can paste lyrics manually or send a <code>.lrc</code>/<code>.txt</code> file.",
+                    ],
+                    footer_lines=[
+                        f"<i>Track ID:</i> <code>{html.escape(record.id[:12])}</code> • "
+                        "<i>🧭 Home › Songs › Edit Lyrics</i>"
+                    ],
+                ),
+                reply_markup=build_lyrics_input_keyboard(record.id),
+            )
+            return
+
+        proposal: dict[str, object] = {
+            "track_id": record.id,
+            "action_type": "research_lyrics",
+            "new_title": record.title,
+            "new_artist": record.artist,
+            "new_album": record.album,
+            "new_year": record.year,
+            "new_track_number": record.track_number or 1,
+            "new_lyrics": lyrics_text,
+            "proposed_changes": {"lyrics": lyrics_text},
+            "enabled_fields": ["lyrics"],
+        }
+        await state.update_data(
+            active_song_id=record.id,
+            pending_song_proposal=proposal,
+        )
+        await state.set_state(SongManagementStates.awaiting_dry_run_confirmation)
+        await safe_edit_text(
+            msg,
+            format_song_edit_dry_run_card(record, proposal, organizer),
+            reply_markup=build_dry_run_confirmation_keyboard(
+                record.id,
+                retry_action="research_lyrics",
+                has_lyrics_change=True,
+                has_meta_change=False,
+            ),
         )
         return
 
@@ -1776,8 +1908,8 @@ async def handle_songs_callback(
             format_screen(
                 title=f"🔎 Re-Search Song Data ({html.escape(record.artist)} - {html.escape(record.title)})",
                 context_lines=[
-                    "Choose whether to automatically re-query MusicBrainz + Genius + Last.fm + LRCLIB "
-                    "or enter a custom search query / MusicBrainz URL / MBID."
+                    "Choose whether to automatically re-query MusicBrainz + Genius + Last.fm + LRCLIB, "
+                    "re-search lyrics only, or enter a custom search query / MusicBrainz URL / MBID."
                 ],
                 footer_lines=[
                     f"<i>Track ID:</i> <code>{html.escape(record.id[:12])}</code> • "
@@ -1849,6 +1981,22 @@ async def handle_songs_callback(
             if fetched_lyrics is not None
             else None
         )
+        changes: dict[str, object] = {}
+        if best.title != record.title:
+            changes["title"] = best.title
+        if best.artist != record.artist:
+            changes["artist"] = best.artist
+        if best.album != record.album:
+            changes["album"] = best.album
+        if best.year != record.year:
+            changes["year"] = best.year
+        if (best.track_number or 1) != (record.track_number or 1):
+            changes["track_number"] = best.track_number or 1
+        if lyrics_text is not None:
+            changes["lyrics"] = lyrics_text
+
+        has_lyrics = "lyrics" in changes
+        has_meta = any(k != "lyrics" for k in changes)
         proposal: dict[str, object] = {
             "track_id": record.id,
             "action_type": "research",
@@ -1860,6 +2008,8 @@ async def handle_songs_callback(
             "new_recording_mbid": best.recording_mbid,
             "new_release_mbid": best.release_mbid,
             "new_lyrics": lyrics_text,
+            "proposed_changes": changes,
+            "enabled_fields": list(changes.keys()) if changes else ["title"],
         }
         await state.update_data(
             active_song_id=record.id,
@@ -1869,7 +2019,12 @@ async def handle_songs_callback(
         await safe_edit_text(
             msg,
             format_song_edit_dry_run_card(record, proposal, organizer),
-            reply_markup=build_dry_run_confirmation_keyboard(record.id, retry_action="research"),
+            reply_markup=build_dry_run_confirmation_keyboard(
+                record.id,
+                retry_action="research",
+                has_lyrics_change=has_lyrics,
+                has_meta_change=has_meta,
+            ),
         )
         return
 
@@ -1920,8 +2075,136 @@ async def handle_songs_callback(
         )
         return
 
-    # 12. Confirm & Apply Dry-Run Proposal
-    if action == "confirm_apply":
+    # 12. Discard, Select, Review or Confirm & Apply Dry-Run Proposal
+    if action == "discard_changes":
+        await ack_callback(callback, "Changes discarded.")
+        await state.update_data(pending_song_proposal=None)
+        await _reset_to_search_state(state, active_song_id=record.id)
+        has_lrc = record.storage_path.with_suffix(".lrc").is_file()
+        has_cover = (record.storage_path.parent / "cover.jpg").is_file()
+        up_lbl, mod_lbl = await _resolve_song_provenance_labels(
+            record,
+            governance_repository,
+            catalog_repository,
+        )
+        back_cb = await resolve_back_callback(
+            state,
+            msg,
+            f"songs:view:{record.id[:12]}",
+            default_back="songs:list",
+        )
+        await safe_edit_text(
+            msg,
+            format_song_detail_card(
+                record,
+                has_lrc_file=has_lrc,
+                has_cover_file=has_cover,
+                uploader_label=up_lbl,
+                modifier_label=mod_lbl,
+            ),
+            reply_markup=build_song_action_keyboard(
+                record.id,
+                can_edit=_can_edit_songs(current_user),
+                back_callback=back_cb,
+                web_app_url=web_url,
+            ),
+        )
+        return
+
+    if action == "select_changes":
+        await ack_callback(callback)
+        fsm_data = await state.get_data()
+        raw_proposal = fsm_data.get("pending_song_proposal")
+        if not isinstance(raw_proposal, dict):
+            await ack_callback(callback, "No active proposal.", show_alert=True)
+            return
+        changes = raw_proposal.get("proposed_changes")
+        if not isinstance(changes, dict) or not changes:
+            changes = {}
+            if str(raw_proposal.get("new_title") or "") != record.title:
+                changes["title"] = str(raw_proposal.get("new_title"))
+            if str(raw_proposal.get("new_artist") or "") != record.artist:
+                changes["artist"] = str(raw_proposal.get("new_artist"))
+            year_val = raw_proposal.get("new_year")
+            if year_val is not None and str(year_val).isdigit() and int(str(year_val)) != record.year:
+                changes["year"] = year_val
+            trk_val = raw_proposal.get("new_track_number")
+            if (
+                trk_val is not None
+                and str(trk_val).isdigit()
+                and int(str(trk_val)) != (record.track_number or 1)
+            ):
+                changes["track_number"] = trk_val
+            if raw_proposal.get("new_lyrics") is not None:
+                changes["lyrics"] = raw_proposal.get("new_lyrics")
+            raw_proposal["proposed_changes"] = changes
+
+        enabled_list = raw_proposal.get("enabled_fields")
+        enabled_set = set(enabled_list) if isinstance(enabled_list, list) else set(changes.keys())
+        raw_proposal["enabled_fields"] = list(enabled_set)
+        await state.update_data(pending_song_proposal=raw_proposal)
+
+        available_fields: list[tuple[str, str]] = []
+        for k, v in changes.items():
+            if k == "title":
+                available_fields.append(("title", f"Title: {v}"))
+            elif k == "artist":
+                available_fields.append(("artist", f"Artist: {v}"))
+            elif k == "album":
+                available_fields.append(("album", f"Album: {v}"))
+            elif k == "year":
+                available_fields.append(("year", f"Year: {v}"))
+            elif k == "track_number":
+                available_fields.append(("track_number", f"Track #: {v}"))
+            elif k == "lyrics":
+                available_fields.append(("lyrics", "Lyrics: LRCLIB Sidecar & Tags"))
+
+        await safe_edit_text(
+            msg,
+            format_screen(
+                title=f"🎛️ Select Changes — {html.escape(record.title)}",
+                context_lines=[
+                    "Choose which changes to apply. Unchecked fields will remain at their original values.",
+                ],
+                footer_lines=[
+                    f"<i>Track ID:</i> <code>{html.escape(record.id[:12])}</code> • "
+                    "<i>Tap any item to toggle</i>"
+                ],
+            ),
+            reply_markup=build_selective_changes_keyboard(record.id, enabled_set, available_fields),
+        )
+        return
+
+    if action == "review_proposal":
+        await ack_callback(callback)
+        fsm_data = await state.get_data()
+        raw_proposal = fsm_data.get("pending_song_proposal")
+        if not isinstance(raw_proposal, dict):
+            await ack_callback(callback, "No active proposal.", show_alert=True)
+            return
+        changes = raw_proposal.get("proposed_changes", {})
+        has_lyrics = "lyrics" in changes if isinstance(changes, dict) else False
+        has_meta = any(k != "lyrics" for k in changes) if isinstance(changes, dict) else True
+        await safe_edit_text(
+            msg,
+            format_song_edit_dry_run_card(record, raw_proposal, organizer),
+            reply_markup=build_dry_run_confirmation_keyboard(
+                record.id,
+                retry_action=str(raw_proposal.get("action_type") or "edit_meta"),
+                has_lyrics_change=has_lyrics,
+                has_meta_change=has_meta,
+            ),
+        )
+        return
+
+    # Confirm & Apply Dry-Run Proposal (All, Selected, Metadata Only, or Lyrics Only)
+    if action in {
+        "confirm_apply",
+        "confirm_apply_all",
+        "confirm_apply_selected",
+        "apply_meta_only",
+        "apply_lyrics_only",
+    }:
         if organizer.is_reconciling:
             await ack_callback(
                 callback,
@@ -1935,6 +2218,35 @@ async def handle_songs_callback(
         if not isinstance(raw_proposal, dict):
             await ack_callback(callback, "No pending changes to apply.", show_alert=True)
             return
+
+        if action == "apply_meta_only":
+            raw_proposal["new_lyrics"] = None
+        elif action == "apply_lyrics_only":
+            raw_proposal["new_title"] = record.title
+            raw_proposal["new_artist"] = record.artist
+            raw_proposal["new_album"] = record.album
+            raw_proposal["new_year"] = record.year
+            raw_proposal["new_track_number"] = record.track_number or 1
+            raw_proposal["new_recording_mbid"] = None
+            raw_proposal["new_release_mbid"] = None
+        elif action == "confirm_apply_selected":
+            enabled_list = raw_proposal.get("enabled_fields")
+            if isinstance(enabled_list, list):
+                enabled_set = set(enabled_list)
+                if "title" not in enabled_set:
+                    raw_proposal["new_title"] = record.title
+                if "artist" not in enabled_set:
+                    raw_proposal["new_artist"] = record.artist
+                if "album" not in enabled_set:
+                    raw_proposal["new_album"] = record.album
+                if "year" not in enabled_set:
+                    raw_proposal["new_year"] = record.year
+                if "track_number" not in enabled_set:
+                    raw_proposal["new_track_number"] = record.track_number or 1
+                if "lyrics" not in enabled_set:
+                    raw_proposal["new_lyrics"] = None
+                if "cover" not in enabled_set:
+                    raw_proposal["new_cover_hex"] = None
 
         await ack_callback(callback, "Changes applied!")
         await send_chat_action_safe(callback)
@@ -2054,11 +2366,79 @@ async def handle_songs_callback(
                 uploader_label=up_lbl,
                 modifier_label=mod_lbl,
             ),
-            reply_markup=build_song_action_keyboard(effective_rec.id, back_callback=back_cb),
+            reply_markup=build_song_action_keyboard(
+                effective_rec.id,
+                can_edit=_can_edit_songs(current_user),
+                back_callback=back_cb,
+                web_app_url=web_url,
+            ),
         )
         return
 
     await ack_callback(callback)
+
+
+@songs_router.callback_query(SongsToggleFieldCallback.filter())
+async def handle_song_field_toggle(
+    callback: CallbackQuery,
+    callback_data: SongsToggleFieldCallback,
+    state: FSMContext,
+    governance_repository: GovernanceRepositoryPort | None = None,
+) -> None:
+    """Toggle a field on/off in the selective changes review screen."""
+    if governance_repository is None or callback.message is None:
+        await ack_callback(callback)
+        return
+    data = await state.get_data()
+    raw_proposal = data.get("pending_song_proposal")
+    if not isinstance(raw_proposal, dict):
+        await ack_callback(callback, "Proposal expired.", show_alert=True)
+        return
+
+    field = callback_data.field
+    enabled_list = raw_proposal.get("enabled_fields")
+    enabled_set = set(enabled_list) if isinstance(enabled_list, list) else set()
+    if field in enabled_set:
+        enabled_set.remove(field)
+    else:
+        enabled_set.add(field)
+    raw_proposal["enabled_fields"] = list(enabled_set)
+    await state.update_data(pending_song_proposal=raw_proposal)
+
+    changes = raw_proposal.get("proposed_changes", {})
+    if not isinstance(changes, dict):
+        changes = {}
+    available_fields: list[tuple[str, str]] = []
+    for k, v in changes.items():
+        if k == "title":
+            available_fields.append(("title", f"Title: {v}"))
+        elif k == "artist":
+            available_fields.append(("artist", f"Artist: {v}"))
+        elif k == "album":
+            available_fields.append(("album", f"Album: {v}"))
+        elif k == "year":
+            available_fields.append(("year", f"Year: {v}"))
+        elif k == "track_number":
+            available_fields.append(("track_number", f"Track #: {v}"))
+        elif k == "lyrics":
+            available_fields.append(("lyrics", "Lyrics: LRCLIB Sidecar & Tags"))
+
+    status_text = "Apply" if field in enabled_set else "Keep original"
+    await ack_callback(callback, f"{field.title()}: {status_text}")
+    await safe_edit_text(
+        callback.message,
+        format_screen(
+            title="🎛️ Select Changes to Apply",
+            context_lines=[
+                "Choose which changes to apply. Unchecked fields will remain at their original values.",
+            ],
+            footer_lines=[
+                f"<i>Track ID:</i> <code>{html.escape(callback_data.track_id)}</code> • "
+                "<i>Tap any item to toggle</i>"
+            ],
+        ),
+        reply_markup=build_selective_changes_keyboard(callback_data.track_id, enabled_set, available_fields),
+    )
 
 
 @songs_router.message(
@@ -2311,6 +2691,23 @@ async def handle_custom_research_input(
         (fetched_lyrics.synced_lyrics or fetched_lyrics.plain_lyrics) if fetched_lyrics is not None else None
     )
 
+    changes: dict[str, object] = {}
+    if best.title != record.title:
+        changes["title"] = best.title
+    if best.artist != record.artist:
+        changes["artist"] = best.artist
+    if best.album != record.album:
+        changes["album"] = best.album
+    if best.year != record.year:
+        changes["year"] = best.year
+    if (best.track_number or 1) != (record.track_number or 1):
+        changes["track_number"] = best.track_number or 1
+    if lyrics_text is not None:
+        changes["lyrics"] = lyrics_text
+
+    has_lyrics = "lyrics" in changes
+    has_meta = any(k != "lyrics" for k in changes)
+
     proposal: dict[str, object] = {
         "track_id": record.id,
         "action_type": "research",
@@ -2322,13 +2719,20 @@ async def handle_custom_research_input(
         "new_recording_mbid": best.recording_mbid,
         "new_release_mbid": best.release_mbid,
         "new_lyrics": lyrics_text,
+        "proposed_changes": changes,
+        "enabled_fields": list(changes.keys()) if changes else ["title"],
     }
     await state.update_data(pending_song_proposal=proposal)
     await state.set_state(SongManagementStates.awaiting_dry_run_confirmation)
     organizer = _resolve_organizer(pipeline, settings)
     await message.answer(
         format_song_edit_dry_run_card(record, proposal, organizer),
-        reply_markup=build_dry_run_confirmation_keyboard(record.id, retry_action="research"),
+        reply_markup=build_dry_run_confirmation_keyboard(
+            record.id,
+            retry_action="research",
+            has_lyrics_change=has_lyrics,
+            has_meta_change=has_meta,
+        ),
     )
 
 

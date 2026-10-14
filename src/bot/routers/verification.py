@@ -1,5 +1,6 @@
 """Callback query and FSM handlers for metadata confirmation, manual search, and full-pipeline job tagging."""
 
+import contextlib
 import html
 import logging
 from pathlib import Path
@@ -14,10 +15,11 @@ from src.bot.keyboards.admin import RESERVED_MENU_BUTTONS, build_back_to_home_ke
 from src.bot.keyboards.verification import (
     build_job_edit_keyboard,
     build_job_input_cancel_keyboard,
+    build_job_lyrics_prompt_keyboard,
     build_manual_search_keyboard,
     build_verification_keyboard,
 )
-from src.bot.routers.files import format_ingestion_summary
+from src.bot.routers.files import format_ingestion_summary, render_job_stage_progress
 from src.bot.routers.songs import (
     _is_non_command_text,
     _is_non_media_input_message,
@@ -308,13 +310,41 @@ async def handle_verification_callback(
             ),
         )
 
+        async def _update_bot_stage(staged_job: IngestionJob) -> None:
+            with contextlib.suppress(Exception):
+                await safe_edit_text(msg, render_job_stage_progress(staged_job))
+
         try:
             result = await pipeline.confirm_candidate(
                 job_id=job_id,
                 candidate_index=candidate_index,
+                stage_callback=_update_bot_stage,
             )
         except (KeyError, IndexError) as exc:
             await ack_callback(callback, f"Could not confirm release: {exc}", show_alert=True)
+            return
+        except Exception as exc:
+            logger.error("Failed to finalize job %s: %s", job_id, exc, exc_info=True)
+            back_cb = await resolve_back_callback(
+                state,
+                msg,
+                f"queue:review:{job_id}",
+                default_back="menu:home",
+            )
+            await reset_fsm_state(state)
+            await safe_edit_text(
+                msg,
+                format_screen(
+                    title="⚠️ Ingestion Finalization Failed",
+                    context_lines=[
+                        "An error occurred while finalizing track ingestion:\n"
+                        f"<code>{html.escape(str(exc))}</code>",
+                        "The job has been marked as failed.",
+                    ],
+                    footer_lines=[f"<i>Job ID:</i> <code>{html.escape(job_id)}</code>"],
+                ),
+                reply_markup=build_back_to_home_keyboard(back_callback=back_cb),
+            )
             return
 
         if queue_worker is not None:
@@ -505,7 +535,73 @@ async def handle_verification_callback(
                     "<i>🧭 Home › Queue › Tag Editor › Lyrics</i>"
                 ],
             ),
-            reply_markup=build_job_input_cancel_keyboard(job_id),
+            reply_markup=build_job_lyrics_prompt_keyboard(job_id),
+        )
+        return
+
+    if action == "auto_lyrics":
+        if target_job is None:
+            await ack_callback(callback, "Job not found.", show_alert=True)
+            return
+        await ack_callback(callback, "Searching LRCLIB...")
+        await send_chat_action_safe(callback)
+        fsm_data = await _read_fsm_dict(state)
+        proposal = _ensure_job_proposal(target_job, fsm_data.get("job_edit_proposal"))
+        escaped_title = html.escape(str(proposal.get("new_title") or ""))
+        await safe_edit_text(
+            msg,
+            format_loading_card(
+                "Querying LRCLIB Lyrics",
+                f"Looking up lyrics for <code>{escaped_title}</code>...",
+                f"Job ID: {html.escape(job_id)}",
+            ),
+        )
+        lyrics_client = _resolve_lyrics_client(pipeline, settings)
+        search_meta = TrackMetadata(
+            title=str(proposal.get("new_title") or ""),
+            artist=str(proposal.get("new_artist") or ""),
+            album=str(proposal.get("new_album") or ""),
+            year=(
+                int(str(proposal["new_year"]))
+                if proposal.get("new_year") is not None and str(proposal.get("new_year")).isdigit()
+                else None
+            ),
+            track_number=int(str(proposal.get("new_track_number") or 1)),
+        )
+        fetched_lyrics = None
+        try:
+            fetched_lyrics = await lyrics_client.fetch_lyrics(search_meta)
+        except Exception as exc:
+            logger.debug("Failed to auto-search lyrics for job %s: %s", job_id, exc)
+
+        lyrics_text = (
+            (fetched_lyrics.synced_lyrics or fetched_lyrics.plain_lyrics)
+            if fetched_lyrics is not None
+            else None
+        )
+        if lyrics_text and lyrics_text.strip():
+            proposal["new_lyrics"] = lyrics_text
+            if state is not None:
+                await state.set_state(IngestionStates.awaiting_job_metadata_input)
+                await state.update_data(job_id=job_id, job_edit_field="multi", job_edit_proposal=proposal)
+            await safe_edit_text(
+                msg,
+                format_job_edit_dry_run_card(target_job, proposal, organizer),
+                reply_markup=build_job_edit_keyboard(job_id),
+            )
+            return
+
+        await safe_edit_text(
+            msg,
+            format_screen(
+                title="⚠️ No Lyrics Found",
+                context_lines=[
+                    f"No matching lyrics were found on LRCLIB for <code>{escaped_title}</code>.",
+                    "You can paste lyrics manually or upload a <code>.lrc</code>/<code>.txt</code> file.",
+                ],
+                footer_lines=[f"<i>Job ID:</i> <code>{html.escape(job_id)}</code>"],
+            ),
+            reply_markup=build_job_lyrics_prompt_keyboard(job_id),
         )
         return
 
@@ -625,13 +721,43 @@ async def handle_verification_callback(
             cover_bytes = bytes.fromhex(cover_hex)
         cover_mime = str(proposal.get("new_cover_mime") or "image/jpeg")
 
-        result = await pipeline.complete_custom_ingestion(
-            job_id=job_id,
-            metadata=custom_meta,
-            custom_lyrics=lyrics_obj,
-            custom_cover_bytes=cover_bytes,
-            custom_cover_mime=cover_mime,
-        )
+        async def _update_custom_stage(staged_job: IngestionJob) -> None:
+            with contextlib.suppress(Exception):
+                await safe_edit_text(msg, render_job_stage_progress(staged_job))
+
+        try:
+            result = await pipeline.complete_custom_ingestion(
+                job_id=job_id,
+                metadata=custom_meta,
+                custom_lyrics=lyrics_obj,
+                custom_cover_bytes=cover_bytes,
+                custom_cover_mime=cover_mime,
+                stage_callback=_update_custom_stage,
+            )
+        except Exception as exc:
+            logger.error("Failed to finalize custom job %s: %s", job_id, exc, exc_info=True)
+            back_cb = await resolve_back_callback(
+                state,
+                msg,
+                f"queue:review:{job_id}",
+                default_back="menu:home",
+            )
+            await reset_fsm_state(state)
+            await safe_edit_text(
+                msg,
+                format_screen(
+                    title="⚠️ Ingestion Finalization Failed",
+                    context_lines=[
+                        "An error occurred while finalizing custom track ingestion:\n"
+                        f"<code>{html.escape(str(exc))}</code>",
+                        "The job has been marked as failed.",
+                    ],
+                    footer_lines=[f"<i>Job ID:</i> <code>{html.escape(job_id)}</code>"],
+                ),
+                reply_markup=build_back_to_home_keyboard(back_callback=back_cb),
+            )
+            return
+
         if queue_worker is not None:
             await queue_worker.record_confirmed_completion(result)
         back_cb = await resolve_back_callback(

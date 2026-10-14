@@ -28,10 +28,19 @@ ROLE_PERMISSIONS: dict[UserRole, frozenset[Permission]] = {
             Permission.SUBMIT_ACCESS_REQUEST,
         }
     ),
+    UserRole.LISTENER: frozenset(
+        {
+            Permission.BASIC_COMMANDS,
+            Permission.LINK_OIDC,
+            Permission.SUBMIT_ACCESS_REQUEST,
+            Permission.VIEW_CATALOG,
+        }
+    ),
     UserRole.UPLOADER: frozenset(
         {
             Permission.BASIC_COMMANDS,
             Permission.LINK_OIDC,
+            Permission.VIEW_CATALOG,
             Permission.SUBMIT_INGESTION,
             Permission.VIEW_OWN_JOBS,
             Permission.RESOLVE_OWN_DISAMBIGUATION,
@@ -42,6 +51,7 @@ ROLE_PERMISSIONS: dict[UserRole, frozenset[Permission]] = {
         {
             Permission.BASIC_COMMANDS,
             Permission.LINK_OIDC,
+            Permission.VIEW_CATALOG,
             Permission.SUBMIT_INGESTION,
             Permission.VIEW_OWN_JOBS,
             Permission.RESOLVE_OWN_DISAMBIGUATION,
@@ -55,6 +65,7 @@ ROLE_PERMISSIONS: dict[UserRole, frozenset[Permission]] = {
         {
             Permission.BASIC_COMMANDS,
             Permission.LINK_OIDC,
+            Permission.VIEW_CATALOG,
             Permission.SUBMIT_INGESTION,
             Permission.VIEW_OWN_JOBS,
             Permission.RESOLVE_OWN_DISAMBIGUATION,
@@ -71,6 +82,7 @@ ROLE_PERMISSIONS: dict[UserRole, frozenset[Permission]] = {
         {
             Permission.BASIC_COMMANDS,
             Permission.LINK_OIDC,
+            Permission.VIEW_CATALOG,
             Permission.SUBMIT_INGESTION,
             Permission.VIEW_OWN_JOBS,
             Permission.RESOLVE_OWN_DISAMBIGUATION,
@@ -114,13 +126,16 @@ def evaluate_oidc_role(groups: tuple[str, ...] | list[str]) -> UserRole:
         return UserRole.MODERATOR
     if "music-uploaders" in group_set:
         return UserRole.UPLOADER
+    if "music-listeners" in group_set or "music-viewers" in group_set:
+        return UserRole.LISTENER
     return UserRole.GUEST
 
 
 def next_promotion_role(current: UserRole) -> UserRole | None:
     """Return the next higher tier for manual admin promotion buttons."""
     promotions: dict[UserRole, UserRole] = {
-        UserRole.GUEST: UserRole.UPLOADER,
+        UserRole.GUEST: UserRole.LISTENER,
+        UserRole.LISTENER: UserRole.UPLOADER,
         UserRole.UPLOADER: UserRole.MODERATOR,
         UserRole.MODERATOR: UserRole.ADMIN,
     }
@@ -132,7 +147,8 @@ def next_demotion_role(current: UserRole) -> UserRole | None:
     demotions: dict[UserRole, UserRole] = {
         UserRole.ADMIN: UserRole.MODERATOR,
         UserRole.MODERATOR: UserRole.UPLOADER,
-        UserRole.UPLOADER: UserRole.GUEST,
+        UserRole.UPLOADER: UserRole.LISTENER,
+        UserRole.LISTENER: UserRole.GUEST,
     }
     return demotions.get(current)
 

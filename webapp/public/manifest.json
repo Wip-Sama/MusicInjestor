@@ -1,0 +1,17 @@
+{
+  "short_name": "MusicStudio",
+  "name": "Telegram Music Studio & Player",
+  "icons": [
+    {
+      "src": "favicon.svg",
+      "type": "image/svg+xml",
+      "sizes": "192x192 512x512"
+    }
+  ],
+  "start_url": "/",
+  "background_color": "#1c1c1e",
+  "theme_color": "#1c1c1e",
+  "display": "standalone",
+  "orientation": "portrait"
+}
+

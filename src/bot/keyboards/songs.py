@@ -1,7 +1,7 @@
 """Inline keyboard builders for the `/songs` interactive library browser, editor, and rescan menu."""
 
 from aiogram.filters.callback_data import CallbackData
-from aiogram.types import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from src.bot.keyboards.admin import MenuCallback, append_escape_row
@@ -25,6 +25,14 @@ class SongsFieldCallback(CallbackData, prefix="songs"):
     """Callback schema for selecting a metadata field to edit (`songs:field:<track_id>:<field>`)."""
 
     action: str = "field"
+    track_id: str
+    field: str
+
+
+class SongsToggleFieldCallback(CallbackData, prefix="songstog"):
+    """Callback schema for toggling a field during selective changes review."""
+
+    action: str = "t"
     track_id: str
     field: str
 
@@ -202,11 +210,20 @@ def build_search_prompt_keyboard() -> InlineKeyboardMarkup:
 def build_song_action_keyboard(
     track_id: str,
     *,
+    can_edit: bool = True,
     back_callback: str | None = None,
+    web_app_url: str | None = None,
 ) -> InlineKeyboardMarkup:
     """Build the ordered action menu for a song in `/songs` (Retrieval rows first, Edit rows second)."""
     sid = _short_id(track_id)
     builder = InlineKeyboardBuilder()
+    if web_app_url and web_app_url.strip():
+        builder.row(
+            InlineKeyboardButton(
+                text="🚀 Open in Mini App",
+                web_app=WebAppInfo(url=f"{web_app_url.strip().rstrip('/')}?startapp=track_{track_id}"),
+            )
+        )
     # --- Section 1: Retrieval, Export & Provenance (Read-Only) ---
     builder.row(
         InlineKeyboardButton(
@@ -229,36 +246,44 @@ def build_song_action_keyboard(
         ),
     )
     # --- Section 2: Editing, Enrichment & Import (Mutating with Dry-Run) ---
-    builder.row(
-        InlineKeyboardButton(
-            text="✏️ Edit Name / Metadata",
-            callback_data=SongsTrackCallback(action="edit_meta", track_id=sid).pack(),
-        ),
-        InlineKeyboardButton(
-            text="🖼️ Edit Cover",
-            callback_data=SongsTrackCallback(action="edit_cover", track_id=sid).pack(),
-        ),
-    )
-    builder.row(
-        InlineKeyboardButton(
-            text="📝 Edit Lyrics",
-            callback_data=SongsTrackCallback(action="edit_lyrics", track_id=sid).pack(),
-        ),
-        InlineKeyboardButton(
-            text="🔎 Auto Re-Search",
-            callback_data=SongsTrackCallback(action="research", track_id=sid).pack(),
-        ),
-    )
-    builder.row(
-        InlineKeyboardButton(
-            text="📥 Import Data",
-            callback_data=SongsTrackCallback(action="import", track_id=sid).pack(),
-        ),
-        InlineKeyboardButton(
-            text=f"📋 Copy Track ID ({sid})",
-            copy_text=CopyTextButton(text=track_id),
-        ),
-    )
+    if can_edit:
+        builder.row(
+            InlineKeyboardButton(
+                text="✏️ Edit Name / Metadata",
+                callback_data=SongsTrackCallback(action="edit_meta", track_id=sid).pack(),
+            ),
+            InlineKeyboardButton(
+                text="🖼️ Edit Cover",
+                callback_data=SongsTrackCallback(action="edit_cover", track_id=sid).pack(),
+            ),
+        )
+        builder.row(
+            InlineKeyboardButton(
+                text="📝 Edit Lyrics",
+                callback_data=SongsTrackCallback(action="edit_lyrics", track_id=sid).pack(),
+            ),
+            InlineKeyboardButton(
+                text="🔎 Auto Re-Search",
+                callback_data=SongsTrackCallback(action="research", track_id=sid).pack(),
+            ),
+        )
+        builder.row(
+            InlineKeyboardButton(
+                text="📥 Import Data",
+                callback_data=SongsTrackCallback(action="import", track_id=sid).pack(),
+            ),
+            InlineKeyboardButton(
+                text=f"📋 Copy Track ID ({sid})",
+                copy_text=CopyTextButton(text=track_id),
+            ),
+        )
+    else:
+        builder.row(
+            InlineKeyboardButton(
+                text=f"📋 Copy Track ID ({sid})",
+                copy_text=CopyTextButton(text=track_id),
+            ),
+        )
     effective_back = back_callback or SongsMenuCallback(action="list").pack()
     append_escape_row(
         builder,
@@ -329,8 +354,32 @@ def build_research_mode_keyboard(track_id: str) -> InlineKeyboardMarkup:
     )
     builder.row(
         InlineKeyboardButton(
+            text="🎵 Auto Re-Search Lyrics Only",
+            callback_data=SongsTrackCallback(action="research_lyrics", track_id=sid).pack(),
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
             text="⌨️ Custom Search Query / URL / MBID",
             callback_data=SongsTrackCallback(action="research_custom", track_id=sid).pack(),
+        )
+    )
+    append_escape_row(
+        builder,
+        back_callback=SongsTrackCallback(action="view", track_id=sid).pack(),
+        include_home=True,
+    )
+    return builder.as_markup()
+
+
+def build_lyrics_input_keyboard(track_id: str) -> InlineKeyboardMarkup:
+    """Build keyboard for active lyrics prompt offering auto-search and escape (Level 3)."""
+    sid = _short_id(track_id)
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="⚡ Auto-Search Lyrics",
+            callback_data=SongsTrackCallback(action="research_lyrics", track_id=sid).pack(),
         )
     )
     append_escape_row(
@@ -344,30 +393,90 @@ def build_research_mode_keyboard(track_id: str) -> InlineKeyboardMarkup:
 def build_dry_run_confirmation_keyboard(
     track_id: str,
     retry_action: str = "edit_meta",
+    *,
+    has_lyrics_change: bool = False,
+    has_meta_change: bool = False,
 ) -> InlineKeyboardMarkup:
-    """Build the Dry-Run Preview confirmation keyboard (Level 3)."""
+    """Build the Dry-Run Preview confirmation keyboard with Accept All, Select Some, and Discard (Level 3)."""
     sid = _short_id(track_id)
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
-            text="✅ Confirm & Apply Changes",
+            text="✅ Accept All Changes",
             callback_data=SongsTrackCallback(action="confirm_apply", track_id=sid).pack(),
+        )
+    )
+    if has_lyrics_change and has_meta_change:
+        builder.row(
+            InlineKeyboardButton(
+                text="🏷️ Metadata Only",
+                callback_data=SongsTrackCallback(action="apply_meta_only", track_id=sid).pack(),
+            ),
+            InlineKeyboardButton(
+                text="📝 Lyrics Only",
+                callback_data=SongsTrackCallback(action="apply_lyrics_only", track_id=sid).pack(),
+            ),
+        )
+    builder.row(
+        InlineKeyboardButton(
+            text="🎛️ Select Changes...",
+            callback_data=SongsTrackCallback(action="select_changes", track_id=sid).pack(),
         )
     )
     builder.row(
         InlineKeyboardButton(
-            text="✏️ Edit Again",
-            callback_data=SongsTrackCallback(action=retry_action, track_id=sid).pack(),
+            text="❌ Discard Changes",
+            callback_data=SongsTrackCallback(action="discard_changes", track_id=sid).pack(),
         ),
         InlineKeyboardButton(
-            text="❌ Cancel",
-            callback_data=SongsTrackCallback(action="view", track_id=sid).pack(),
+            text="✏️ Edit Again",
+            callback_data=SongsTrackCallback(action=retry_action, track_id=sid).pack(),
         ),
     )
     append_escape_row(
         builder,
         back_callback=SongsTrackCallback(action="view", track_id=sid).pack(),
         include_home=True,
+    )
+    return builder.as_markup()
+
+
+def build_selective_changes_keyboard(
+    track_id: str,
+    enabled_fields: set[str],
+    available_fields: list[tuple[str, str]],
+) -> InlineKeyboardMarkup:
+    """Build interactive toggle keyboard for selective changes acceptance."""
+    sid = _short_id(track_id)
+    builder = InlineKeyboardBuilder()
+    for field_key, display_label in available_fields:
+        is_enabled = field_key in enabled_fields
+        prefix = "✅ [Apply]" if is_enabled else "⬜ [Keep]"
+        btn_text = f"{prefix} {display_label}"
+        builder.row(
+            InlineKeyboardButton(
+                text=btn_text[:64],
+                callback_data=SongsToggleFieldCallback(track_id=sid, field=field_key).pack(),
+            )
+        )
+    enabled_count = len(enabled_fields)
+    total_count = len(available_fields)
+    if enabled_count > 0:
+        builder.row(
+            InlineKeyboardButton(
+                text=f"✅ Apply Selected ({enabled_count}/{total_count})",
+                callback_data=SongsTrackCallback(action="confirm_apply_selected", track_id=sid).pack(),
+            )
+        )
+    builder.row(
+        InlineKeyboardButton(
+            text="❌ Discard Changes",
+            callback_data=SongsTrackCallback(action="discard_changes", track_id=sid).pack(),
+        ),
+        InlineKeyboardButton(
+            text="◀ Back to Review",
+            callback_data=SongsTrackCallback(action="review_proposal", track_id=sid).pack(),
+        ),
     )
     return builder.as_markup()
 

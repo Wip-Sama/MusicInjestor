@@ -185,6 +185,34 @@ def format_queued_job_card(
     )
 
 
+def format_batch_queued_card(
+    enqueued_items: list[tuple[IngestionJob, int]],
+    failed_items: list[tuple[str, int, str]] | None = None,
+) -> str:
+    """Format a consolidated queue feedback message for a batch of forwarded files or albums."""
+    total_count = len(enqueued_items) + (len(failed_items) if failed_items else 0)
+    lines: list[str] = []
+    for job, pos in enqueued_items:
+        filename = html.escape(job.original_filename or job.source_path.name)
+        size_label = _format_file_size_mb(job.file_size_bytes)
+        pos_label = f"#{pos}" if pos > 0 else "Active"
+        lines.append(f"• <b>{filename}</b> ({size_label}) — Position: <code>{pos_label}</code>")
+
+    if failed_items:
+        for fname, size, err in failed_items:
+            fname_esc = html.escape(fname)
+            size_label = _format_file_size_mb(size)
+            lines.append(f"• ⚠️ <b>{fname_esc}</b> ({size_label}) — <i>{html.escape(err)}</i>")
+
+    return (
+        f"<b>⏳ Ingestion Queued ({len(enqueued_items)}/{total_count} files)</b>\n"
+        "<blockquote>\n"
+        + "\n".join(lines)
+        + "\n</blockquote>\n"
+        + "<i>⚙️ Status: Queued for worker processing. Tap View Queue to monitor jobs.</i>"
+    )
+
+
 def format_job_inspector_card(
     job: IngestionJob,
     uploader_label: str | None = None,

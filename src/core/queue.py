@@ -1,6 +1,7 @@
 """Serialized and runtime-configurable async Ingestion Queue Engine (Specification Section 4)."""
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import time
@@ -81,7 +82,11 @@ class IngestionQueueWorker:
         self._semaphore = asyncio.Semaphore(concurrency_limit)
         self._active_count = 0
         self._condition = asyncio.Condition()
-        self._progress_callback = progress_callback
+        self._wake_event = asyncio.Event()
+        self._processing_job_ids: set[str] = set()
+        self._progress_callbacks: list[ProgressCallback] = (
+            [progress_callback] if progress_callback is not None else []
+        )
 
     @property
     def concurrency_limit(self) -> int:
@@ -92,6 +97,10 @@ class IngestionQueueWorker:
     def active_count(self) -> int:
         """Return the number of jobs currently executing inside the worker engine."""
         return self._active_count
+
+    def add_progress_callback(self, callback: ProgressCallback) -> None:
+        """Register a subscriber callback invoked whenever a job changes stage or completes."""
+        self._progress_callbacks.append(callback)
 
     async def set_concurrency_limit(
         self,
@@ -158,6 +167,7 @@ class IngestionQueueWorker:
             )
         )
         position = await self.get_queue_position(job.job_id)
+        self._wake_event.set()
         return job, position
 
     async def get_queue_position(self, job_id: str) -> int:
@@ -226,6 +236,7 @@ class IngestionQueueWorker:
                 details={"filename": job.original_filename or job.source_path.name},
             )
         )
+        self._wake_event.set()
         return job
 
     async def review_job_manually(
@@ -251,8 +262,57 @@ class IngestionQueueWorker:
         if not queued_jobs:
             return None
 
-        target_job = queued_jobs[0]
-        return await self.execute_job(target_job.job_id)
+        target_job = None
+        for j in queued_jobs:
+            if j.job_id not in self._processing_job_ids and j.state == JobState.QUEUED:
+                target_job = j
+                break
+        if target_job is None:
+            return None
+
+        self._processing_job_ids.add(target_job.job_id)
+        try:
+            return await self.execute_job(target_job.job_id)
+        finally:
+            self._processing_job_ids.discard(target_job.job_id)
+
+    async def run_worker_loop(self, stop_event: asyncio.Event | None = None) -> None:
+        """Autonomous background loop popping oldest QUEUED jobs up to concurrency limit."""
+        effective_stop = stop_event or asyncio.Event()
+        self._wake_event.set()
+        logger.info(
+            "IngestionQueueWorker background loop started (concurrency_limit=%d)",
+            self._concurrency_limit,
+        )
+        while not effective_stop.is_set():
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._wake_event.wait(), timeout=2.0)
+            self._wake_event.clear()
+            if effective_stop.is_set():
+                break
+
+            while self._active_count < self._concurrency_limit and not effective_stop.is_set():
+                queued_jobs = await self._governance.list_queued_jobs()
+                next_job = None
+                for j in queued_jobs:
+                    if j.job_id not in self._processing_job_ids and j.state == JobState.QUEUED:
+                        next_job = j
+                        break
+                if next_job is None:
+                    break
+
+                self._processing_job_ids.add(next_job.job_id)
+                asyncio.create_task(self._safe_execute_job(next_job.job_id))
+
+    async def _safe_execute_job(self, job_id: str) -> None:
+        """Helper to run a queued job inside the worker loop and ensure wake_event triggers afterwards."""
+        try:
+            await self.execute_job(job_id)
+        except Exception as exc:
+            logger.error("Background queue worker error on job %s: %s", job_id, exc)
+        finally:
+            self._processing_job_ids.discard(job_id)
+            self._wake_event.set()
 
     async def _dispatch_progress(
         self,
@@ -261,8 +321,11 @@ class IngestionQueueWorker:
         call_callback: ProgressCallback | None = None,
     ) -> None:
         """Invoke worker-level and per-call progress callbacks."""
-        if self._progress_callback is not None:
-            await self._progress_callback(job, result)
+        for cb in self._progress_callbacks:
+            try:
+                await cb(job, result)
+            except Exception as exc:
+                logger.warning("Queue progress subscriber failed: %s", exc)
         if call_callback is not None:
             await call_callback(job, result)
 
@@ -283,6 +346,15 @@ class IngestionQueueWorker:
             if job is None or job.state == JobState.CANCELLED:
                 return None
             if job.state == JobState.PAUSED and not force_confirmation:
+                return None
+
+            if not job.source_path.is_file():
+                logger.error("Job %s source file not found on disk: %s", job.job_id, job.source_path)
+                job.state = JobState.FAILED
+                job.error_message = f"Source audio file not found on disk: {job.source_path}"
+                job.completed_at = datetime.now(UTC)
+                await self._catalog.save_job(job)
+                await self._dispatch_progress(job, None, progress_callback)
                 return None
 
             started_clock = time.monotonic()
@@ -323,9 +395,11 @@ class IngestionQueueWorker:
 
             return result
         finally:
+            self._processing_job_ids.discard(job_id)
             async with self._condition:
                 self._active_count -= 1
                 self._condition.notify_all()
+            self._wake_event.set()
 
     async def record_confirmed_completion(
         self,
@@ -334,8 +408,11 @@ class IngestionQueueWorker:
     ) -> None:
         """Emit audit log and Admin Channel events when an awaiting-confirmation job finishes."""
         await self._emit_completion_events(result, duration_seconds)
-        if self._progress_callback is not None:
-            await self._progress_callback(result.job, result)
+        for cb in self._progress_callbacks:
+            try:
+                await cb(result.job, result)
+            except Exception as exc:
+                logger.warning("Queue progress subscriber failed on confirmed completion: %s", exc)
 
     async def recover_pending_jobs(self) -> list[IngestionJob]:
         """Reset any interrupted in-flight jobs back to `QUEUED` on startup and return the FIFO queue."""
@@ -344,6 +421,7 @@ class IngestionQueueWorker:
             if job.state not in {JobState.AWAITING_CONFIRMATION, JobState.AWAITING_INPUT, JobState.PAUSED}:
                 job.state = JobState.QUEUED
                 await self._catalog.save_job(job)
+        self._wake_event.set()
         return await self._governance.list_queued_jobs()
 
     async def _emit_completion_events(

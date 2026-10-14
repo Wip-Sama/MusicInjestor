@@ -7,9 +7,10 @@ from pathlib import Path
 
 
 class UserRole(StrEnum):
-    """Five-tier Role-Based Access Control (RBAC) hierarchy."""
+    """Six-tier Role-Based Access Control (RBAC) hierarchy."""
 
     GUEST = "GUEST"
+    LISTENER = "LISTENER"
     UPLOADER = "UPLOADER"
     MODERATOR = "MODERATOR"
     ADMIN = "ADMIN"
@@ -20,10 +21,11 @@ class UserRole(StrEnum):
         """Numeric hierarchy level used for role comparisons."""
         ranks: dict[UserRole, int] = {
             UserRole.GUEST: 0,
-            UserRole.UPLOADER: 1,
-            UserRole.MODERATOR: 2,
-            UserRole.ADMIN: 3,
-            UserRole.OWNER: 4,
+            UserRole.LISTENER: 1,
+            UserRole.UPLOADER: 2,
+            UserRole.MODERATOR: 3,
+            UserRole.ADMIN: 4,
+            UserRole.OWNER: 5,
         }
         return ranks[self]
 
@@ -38,6 +40,7 @@ class Permission(StrEnum):
     BASIC_COMMANDS = "BASIC_COMMANDS"
     LINK_OIDC = "LINK_OIDC"
     SUBMIT_ACCESS_REQUEST = "SUBMIT_ACCESS_REQUEST"
+    VIEW_CATALOG = "VIEW_CATALOG"
     SUBMIT_INGESTION = "SUBMIT_INGESTION"
     VIEW_OWN_JOBS = "VIEW_OWN_JOBS"
     RESOLVE_OWN_DISAMBIGUATION = "RESOLVE_OWN_DISAMBIGUATION"

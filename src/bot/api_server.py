@@ -79,4 +79,19 @@ def resolve_local_api_file_path(
         )
         return resolved
     except ValueError:
-        return Path(str(reported_file_path))
+        direct = Path(str(reported_file_path))
+        if direct.is_file():
+            return direct
+        try:
+            if settings.telegram_local_api_host_dir.is_dir():
+                candidate = settings.telegram_local_api_host_dir / reported_file_path
+                if candidate.is_file():
+                    return candidate
+                for sub in settings.telegram_local_api_host_dir.iterdir():
+                    if sub.is_dir():
+                        nested = sub / reported_file_path
+                        if nested.is_file():
+                            return nested
+        except OSError:
+            pass
+        return direct

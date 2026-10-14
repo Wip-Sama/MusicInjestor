@@ -5,7 +5,8 @@ import html
 from aiogram import F, Router
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from src.bot.keyboards.admin import (
     BTN_MAIN_INFO,
@@ -733,6 +734,7 @@ async def _inspect_id_query(
     pipeline: IngestionPipeline | None,
     queue_worker: IngestionQueueWorker | None,
     state: FSMContext | None = None,
+    settings: AppSettings | None = None,
 ) -> bool:
     """Look up `raw_query` as a Job ID or Track ID and reply with an interactive Inspector Card if matched."""
     query = raw_query.strip()
@@ -777,6 +779,7 @@ async def _inspect_id_query(
             default_back="queue:mine",
             reset_to_home=True,
         )
+        web_url = settings.web_app_url.strip() if settings and settings.web_app_url else None
         await safe_answer(
             message,
             format_job_inspector_card(target_job, uploader_label=uploader_lbl, position=pos),
@@ -785,6 +788,7 @@ async def _inspect_id_query(
                 state=target_job.state,
                 back_callback=back_cb,
                 include_home=back_cb != "menu:home",
+                web_app_url=web_url,
             ),
         )
         return True
@@ -817,6 +821,7 @@ async def _inspect_id_query(
                 default_back="songs:list",
                 reset_to_home=True,
             )
+            web_url = settings.web_app_url.strip() if settings and settings.web_app_url else None
             await safe_answer(
                 message,
                 format_song_detail_card(
@@ -826,7 +831,11 @@ async def _inspect_id_query(
                     uploader_label=up_lbl,
                     modifier_label=mod_lbl,
                 ),
-                reply_markup=build_song_action_keyboard(track.id, back_callback=back_cb),
+                reply_markup=build_song_action_keyboard(
+                    track.id,
+                    back_callback=back_cb,
+                    web_app_url=web_url,
+                ),
             )
             return True
 
@@ -842,6 +851,7 @@ async def handle_job_command(
     pipeline: IngestionPipeline | None = None,
     queue_worker: IngestionQueueWorker | None = None,
     state: FSMContext | None = None,
+    settings: AppSettings | None = None,
 ) -> None:
     """Inspect and control a specific job by ID (`/job <job_id>`)."""
     await reset_fsm_state(state)
@@ -880,6 +890,7 @@ async def handle_job_command(
         pipeline=pipeline,
         queue_worker=queue_worker,
         state=state,
+        settings=settings,
     )
     if not matched:
         await message.answer(
@@ -909,6 +920,7 @@ async def handle_idle_id_lookup_text(
     pipeline: IngestionPipeline | None = None,
     queue_worker: IngestionQueueWorker | None = None,
     state: FSMContext | None = None,
+    settings: AppSettings | None = None,
 ) -> None:
     """Allow pasting a Job ID or Track ID in idle chat to open its interactive Inspector Card."""
     if current_user is not None and current_user.role == UserRole.GUEST:
@@ -925,6 +937,7 @@ async def handle_idle_id_lookup_text(
         pipeline=pipeline,
         queue_worker=queue_worker,
         state=state,
+        settings=settings,
     )
 
 
@@ -1048,4 +1061,40 @@ async def handle_fixtags_command(
             footer_lines=[f"<i>Track ID:</i> <code>{html.escape(track.id)}</code>"],
         ),
         reply_markup=kb,
+    )
+
+
+@commands_router.message(Command("app"))
+async def handle_cmd_app(
+    message: Message,
+    settings: AppSettings | None = None,
+) -> None:
+    """Launch the Telegram Mini App via `/app`."""
+    web_app_url = settings.web_app_url.strip() if settings and settings.web_app_url else ""
+    if not web_app_url:
+        await message.answer(
+            format_screen(
+                title="🎵 Music Mini App",
+                context_lines=["The Web Mini App URL is not configured on this server."],
+                footer_lines=["<i>Contact the bot administrator to configure WEB_APP_URL.</i>"],
+            )
+        )
+        return
+
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="🚀 Open Music Mini App",
+            web_app=WebAppInfo(url=web_app_url),
+        )
+    )
+    await message.answer(
+        format_screen(
+            title="🎵 Music Mini App",
+            context_lines=[
+                "Launch the Web Music Studio, Catalog Player, and Ingestion Queue Board inside Telegram.",
+            ],
+            footer_lines=["<i>Tap below to open the application.</i>"],
+        ),
+        reply_markup=builder.as_markup(),
     )

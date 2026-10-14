@@ -72,18 +72,21 @@ from tests.unit.test_pipeline import (
 
 
 def test_role_hierarchy_and_permission_matrix() -> None:
-    """Verify 5-tier role hierarchy ranks and Section 3.1 capability permissions."""
+    """Verify 6-tier role hierarchy ranks and Section 3.1 capability permissions."""
     assert (
         UserRole.GUEST.rank
+        < UserRole.LISTENER.rank
         < UserRole.UPLOADER.rank
         < UserRole.MODERATOR.rank
         < UserRole.ADMIN.rank
         < UserRole.OWNER.rank
     )
     assert UserRole.ADMIN.has_at_least(UserRole.MODERATOR)
-    assert not UserRole.UPLOADER.has_at_least(UserRole.MODERATOR)
+    assert UserRole.UPLOADER.has_at_least(UserRole.LISTENER)
+    assert not UserRole.LISTENER.has_at_least(UserRole.UPLOADER)
 
     guest = UserAccount(telegram_id=1, display_name="Guest", role=UserRole.GUEST)
+    listener = UserAccount(telegram_id=20, display_name="Listener", role=UserRole.LISTENER)
     uploader = UserAccount(telegram_id=2, display_name="Uploader", role=UserRole.UPLOADER)
     moderator = UserAccount(telegram_id=3, display_name="Moderator", role=UserRole.MODERATOR)
     admin = UserAccount(telegram_id=4, display_name="Admin", role=UserRole.ADMIN)
@@ -96,8 +99,12 @@ def test_role_hierarchy_and_permission_matrix() -> None:
     )
 
     assert has_permission(guest, Permission.SUBMIT_ACCESS_REQUEST)
+    assert not has_permission(guest, Permission.VIEW_CATALOG)
     assert not has_permission(guest, Permission.SUBMIT_INGESTION)
+    assert has_permission(listener, Permission.VIEW_CATALOG)
+    assert not has_permission(listener, Permission.SUBMIT_INGESTION)
     assert not has_permission(uploader, Permission.SUBMIT_ACCESS_REQUEST)
+    assert has_permission(uploader, Permission.VIEW_CATALOG)
     assert has_permission(uploader, Permission.SUBMIT_INGESTION)
     assert not has_permission(uploader, Permission.VIEW_GLOBAL_QUEUE)
     assert has_permission(moderator, Permission.VIEW_GLOBAL_QUEUE)
@@ -110,16 +117,23 @@ def test_role_hierarchy_and_permission_matrix() -> None:
     assert not has_permission(blocked_admin, Permission.BASIC_COMMANDS)
 
     with pytest.raises(PermissionDeniedError):
-        require_permission(guest, Permission.SUBMIT_INGESTION)
+        require_permission(guest, Permission.VIEW_CATALOG)
+    with pytest.raises(PermissionDeniedError):
+        require_permission(listener, Permission.SUBMIT_INGESTION)
 
-    assert next_promotion_role(UserRole.GUEST) == UserRole.UPLOADER
+    assert next_promotion_role(UserRole.GUEST) == UserRole.LISTENER
+    assert next_promotion_role(UserRole.LISTENER) == UserRole.UPLOADER
     assert next_promotion_role(UserRole.ADMIN) is None
     assert next_demotion_role(UserRole.MODERATOR) == UserRole.UPLOADER
+    assert next_demotion_role(UserRole.UPLOADER) == UserRole.LISTENER
+    assert next_demotion_role(UserRole.LISTENER) == UserRole.GUEST
     assert next_demotion_role(UserRole.GUEST) is None
 
 
 def test_evaluate_oidc_role_mapping() -> None:
     """Verify Authentik group claims map to the highest matching RBAC role."""
+    assert evaluate_oidc_role(["music-listeners"]) == UserRole.LISTENER
+    assert evaluate_oidc_role(["music-viewers"]) == UserRole.LISTENER
     assert evaluate_oidc_role(["music-uploaders"]) == UserRole.UPLOADER
     assert evaluate_oidc_role(["music-uploaders", "music-moderators"]) == UserRole.MODERATOR
     assert evaluate_oidc_role(["music-admins", "music-uploaders"]) == UserRole.ADMIN

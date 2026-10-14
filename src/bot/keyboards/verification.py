@@ -185,3 +185,20 @@ def build_job_input_cancel_keyboard(job_id: str) -> InlineKeyboardMarkup:
         include_home=True,
     )
     return builder.as_markup()
+
+
+def build_job_lyrics_prompt_keyboard(job_id: str) -> InlineKeyboardMarkup:
+    """Build keyboard for queued job lyrics prompt with auto-search button."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="⚡ Auto-Search Lyrics",
+            callback_data=VerifyActionCallback(action="auto_lyrics", job_id=job_id).pack(),
+        )
+    )
+    append_escape_row(
+        builder,
+        back_callback=VerifyActionCallback(action="edit", job_id=job_id).pack(),
+        include_home=True,
+    )
+    return builder.as_markup()

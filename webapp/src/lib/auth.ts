@@ -7,7 +7,7 @@ import { retrieveLaunchParams } from '@telegram-apps/sdk-react';
 
 export interface UserProfile {
   telegram_id: number;
-  role: 'GUEST' | 'UPLOADER' | 'MODERATOR' | 'ADMIN' | 'OWNER';
+  role: 'GUEST' | 'LISTENER' | 'UPLOADER' | 'MODERATOR' | 'ADMIN' | 'OWNER';
   display_name: string;
   username: string | null;
   authentik_linked: boolean;
@@ -135,4 +135,55 @@ export async function fetchCurrentProfile(): Promise<UserProfile> {
   }
   return resp.json();
 }
+
+/**
+ * Check if the user profile holds a specific domain permission.
+ */
+export function hasPermission(profile: UserProfile | null, permission: string): boolean {
+  if (!profile || !profile.permissions) return false;
+  return profile.permissions.includes(permission);
+}
+
+/**
+ * Check if the user is authorized to browse and stream catalog music.
+ */
+export function canViewCatalog(profile: UserProfile | null): boolean {
+  return hasPermission(profile, 'VIEW_CATALOG');
+}
+
+/**
+ * Check if the user is authorized to submit audio or archives for ingestion.
+ */
+export function canSubmitIngestion(profile: UserProfile | null): boolean {
+  return hasPermission(profile, 'SUBMIT_INGESTION');
+}
+
+/**
+ * Check if the user is authorized to access the Governance & User Management console.
+ */
+export function canManageUsers(profile: UserProfile | null): boolean {
+  return hasPermission(profile, 'MANAGE_USERS');
+}
+
+/**
+ * Check if the user is authorized to view the global ingestion queue across all users.
+ */
+export function canViewGlobalQueue(profile: UserProfile | null): boolean {
+  return hasPermission(profile, 'VIEW_GLOBAL_QUEUE');
+}
+
+/**
+ * Check if the user is authorized to pause, resume, cancel, or resolve other users' jobs.
+ */
+export function canResolveOthersJobs(profile: UserProfile | null): boolean {
+  return hasPermission(profile, 'RESOLVE_OTHERS_JOBS');
+}
+
+/**
+ * Check if the user is authorized to approve tag corrections.
+ */
+export function canApproveTagCorrections(profile: UserProfile | null): boolean {
+  return hasPermission(profile, 'APPROVE_TAG_CORRECTIONS');
+}
+
 

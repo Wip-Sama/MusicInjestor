@@ -3,6 +3,8 @@
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from src.core.exceptions import FingerprintingError
 from src.core.models import (
     AudioFingerprint,
@@ -445,3 +447,100 @@ def test_pipeline_multi_track_archive_release_tracklist_mapping_and_stage_callba
     assert JobState.FETCHING_LYRICS in stages_seen
     assert JobState.ORGANIZING in stages_seen
     assert JobState.COMPLETED in stages_seen
+
+
+def test_confirm_candidate_handles_failure_and_notifies_stage(tmp_path: Path) -> None:
+    """Verify that failure during _complete_ingestion marks the job FAILED and notifies stage_callback."""
+    source_file = tmp_path / "track.flac"
+    source_file.write_bytes(b"dummy-audio-content")
+
+    catalog = InMemoryCatalogRepository()
+    extractor = StubExtractor()
+    candidates = [
+        MetadataCandidate(
+            metadata=TrackMetadata(title="Song", artist="Artist", album="Album", year=2024, track_number=1),
+            confidence=0.70,
+        )
+    ]
+
+    class FailingOrganizer:
+        def build_target_audio_path(self, metadata: TrackMetadata, extension: str) -> Path:
+            return Path("/tmp") / f"{metadata.title}{extension}"
+
+        async def finalize_track(
+            self,
+            source_audio_path: Path,
+            metadata: TrackMetadata,
+            lyrics: LyricsData | None = None,
+        ) -> Path:
+            await asyncio.sleep(0)
+            msg = "Disk write failed or file missing"
+            raise FileNotFoundError(msg)
+
+    pipeline = IngestionPipeline(
+        extractor=extractor,
+        fingerprinter=StubFingerprinter("FP_FAIL"),
+        metadata_provider=StubMetadataProvider(candidates),
+        lyrics_provider=StubLyricsProvider(),
+        organizer=FailingOrganizer(),
+        catalog_repository=catalog,
+        auto_approve_confidence=0.90,
+    )
+
+    paused = asyncio.run(pipeline.process_file(source_file, job_id="job_fail_test"))
+    assert paused.job.state == JobState.AWAITING_CONFIRMATION
+
+    stages_seen: list[JobState] = []
+
+    async def _on_stage(job: IngestionJob) -> None:
+        stages_seen.append(job.state)
+
+    with pytest.raises(FileNotFoundError, match="Disk write failed"):
+        asyncio.run(
+            pipeline.confirm_candidate(
+                job_id="job_fail_test",
+                candidate_index=0,
+                staged_audio_path=source_file,
+                stage_callback=_on_stage,
+            )
+        )
+
+    saved_job = asyncio.run(catalog.get_job("job_fail_test"))
+    assert saved_job is not None
+    assert saved_job.state == JobState.FAILED
+    assert "Disk write failed" in (saved_job.error_message or "")
+    assert saved_job.completed_at is not None
+    assert JobState.FETCHING_LYRICS in stages_seen
+    assert JobState.ORGANIZING in stages_seen
+    assert JobState.FAILED in stages_seen
+
+
+def test_confirm_candidate_raises_file_not_found_when_missing_staged(tmp_path: Path) -> None:
+    """Verify that confirm_candidate raises FileNotFoundError when staged file does not exist on disk."""
+    non_existent = tmp_path / "scratch" / "job_ghost" / "missing.flac"
+    catalog = InMemoryCatalogRepository()
+    job = IngestionJob(
+        job_id="job_ghost",
+        source_path=non_existent,
+        scratch_dir=non_existent.parent,
+        candidates=[
+            MetadataCandidate(
+                metadata=TrackMetadata(title="Ghost", artist="Ghost", album="Ghost"),
+                confidence=0.5,
+            )
+        ],
+        state=JobState.AWAITING_CONFIRMATION,
+    )
+    asyncio.run(catalog.save_job(job))
+
+    pipeline = IngestionPipeline(
+        extractor=StubExtractor(),
+        fingerprinter=StubFingerprinter("FP_GHOST"),
+        metadata_provider=StubMetadataProvider([]),
+        lyrics_provider=StubLyricsProvider(),
+        organizer=LibraryOrganizer(tmp_path / "library"),
+        catalog_repository=catalog,
+    )
+
+    with pytest.raises(FileNotFoundError, match="Staged audio file does not exist"):
+        asyncio.run(pipeline.confirm_candidate("job_ghost", candidate_index=0))

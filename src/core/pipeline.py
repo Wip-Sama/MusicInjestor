@@ -1,5 +1,6 @@
 """High-level IngestionPipeline coordinating extraction, deduplication, enrichment, and filing."""
 
+import contextlib
 import hashlib
 import logging
 import uuid
@@ -98,16 +99,65 @@ def _merge_original_filename_metadata(
     )
 
 
-def _discover_staged_audio_files(job: IngestionJob) -> list[Path]:
-    """Locate staged audio files in `job.scratch_dir` or fall back to `job.source_path`."""
-    if job.scratch_dir is not None and job.scratch_dir.is_dir():
-        found = sorted(
-            path
-            for path in job.scratch_dir.rglob("*")
-            if path.is_file() and path.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS
-        )
-        if found:
-            return found
+def _discover_staged_audio_files(
+    job: IngestionJob,
+    extractor: ArchiveExtractorPort | None = None,
+) -> list[Path]:
+    """Locate staged audio files in `job.scratch_dir`, `extractor` scratch root,
+    or fall back to `job.source_path`.
+    """
+    candidate_dirs: list[Path] = []
+    if job.scratch_dir is not None:
+        candidate_dirs.append(job.scratch_dir)
+        raw_scratch = str(job.scratch_dir).replace("\\", "/")
+        if "/storage/scratch/" in raw_scratch:
+            rel_scratch = raw_scratch.split("/storage/scratch/", 1)[1]
+            candidate_dirs.append(Path("storage/scratch") / rel_scratch)
+            candidate_dirs.append(Path("./storage/scratch") / rel_scratch)
+            candidate_dirs.append(Path("/app/storage/scratch") / rel_scratch)
+        with contextlib.suppress(Exception):
+            candidate_dirs.append(Path(job.scratch_dir.name))
+
+    if extractor is not None:
+        get_dir_fn = getattr(extractor, "get_job_scratch_dir", None)
+        if callable(get_dir_fn):
+            with contextlib.suppress(Exception):
+                candidate_dirs.append(get_dir_fn(job.job_id))
+        scratch_root = getattr(extractor, "_scratch_root", None)
+        if isinstance(scratch_root, Path):
+            candidate_dirs.append(scratch_root / job.job_id)
+
+    seen_dirs: set[Path] = set()
+    for d in candidate_dirs:
+        try:
+            resolved_d = d.resolve() if d.is_dir() else d
+        except Exception:
+            resolved_d = d
+        if resolved_d in seen_dirs:
+            continue
+        seen_dirs.add(resolved_d)
+        if d.is_dir():
+            found = sorted(
+                path
+                for path in d.rglob("*")
+                if path.is_file() and path.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS
+            )
+            if found:
+                return found
+
+    if job.source_path.is_file():
+        return [job.source_path]
+
+    raw_src = str(job.source_path).replace("\\", "/")
+    if "/telegram-bot-api/" in raw_src:
+        rel_part = raw_src.split("/telegram-bot-api/", 1)[1]
+        host_candidate = Path("./storage/telegram-bot-api") / Path(rel_part)
+        if host_candidate.is_file():
+            return [host_candidate]
+        container_candidate = Path("/var/lib/telegram-bot-api") / Path(rel_part)
+        if container_candidate.is_file():
+            return [container_candidate]
+
     return [job.source_path]
 
 
@@ -285,31 +335,41 @@ class IngestionPipeline:
         job.state = JobState.AWAITING_CONFIRMATION
         await self._catalog.save_job(job)
 
-        if job.source_path.is_file() and not job.candidates:
-            staged_files = await self._extractor.extract_or_stage(job.source_path, job.job_id)
-            primary_audio = staged_files[0]
-            job.scratch_dir = primary_audio.parent
-            job.total_tracks = len(staged_files)
-
-            raw_local_meta = await self._metadata.read_local_metadata(primary_audio)
-            local_meta = _merge_original_filename_metadata(
-                raw_local_meta,
-                primary_audio.stem,
-                job.original_filename,
-            )
-            if job.fingerprint is None:
-                job.fingerprint = await self._compute_fingerprint_with_fallback(
-                    primary_audio,
-                    known_duration=local_meta.duration_seconds,
-                )
-            candidates = await self._metadata.find_candidates(local_meta, job.fingerprint)
-            job.candidates = candidates
-            if candidates:
-                job.confidence_score = candidates[0].confidence
-                job.matched_release_mbid = candidates[0].metadata.release_mbid
-                job.selected_metadata = candidates[0].metadata
+        if not job.candidates:
+            discovered = _discover_staged_audio_files(job, extractor=self._extractor)
+            if discovered and discovered[0].is_file():
+                staged_files = discovered
+                primary_audio = staged_files[0]
+                job.scratch_dir = primary_audio.parent
+                job.total_tracks = len(staged_files)
+            elif job.source_path.is_file():
+                staged_files = await self._extractor.extract_or_stage(job.source_path, job.job_id)
+                primary_audio = staged_files[0]
+                job.scratch_dir = primary_audio.parent
+                job.total_tracks = len(staged_files)
             else:
-                job.selected_metadata = local_meta
+                primary_audio = discovered[0] if discovered else job.source_path
+
+            if primary_audio.is_file():
+                raw_local_meta = await self._metadata.read_local_metadata(primary_audio)
+                local_meta = _merge_original_filename_metadata(
+                    raw_local_meta,
+                    primary_audio.stem,
+                    job.original_filename,
+                )
+                if job.fingerprint is None:
+                    job.fingerprint = await self._compute_fingerprint_with_fallback(
+                        primary_audio,
+                        known_duration=local_meta.duration_seconds,
+                    )
+                candidates = await self._metadata.find_candidates(local_meta, job.fingerprint)
+                job.candidates = candidates
+                if candidates:
+                    job.confidence_score = candidates[0].confidence
+                    job.matched_release_mbid = candidates[0].metadata.release_mbid
+                    job.selected_metadata = candidates[0].metadata
+                else:
+                    job.selected_metadata = local_meta
         elif job.selected_metadata is None:
             if job.candidates:
                 job.selected_metadata = job.candidates[0].metadata
@@ -489,9 +549,16 @@ class IngestionPipeline:
             primary_audio = staged_audio_path
             extra_paths: list[Path] = []
         else:
-            discovered = _discover_staged_audio_files(job)
+            discovered = _discover_staged_audio_files(job, extractor=self._extractor)
+            if not discovered:
+                msg = f"No staged audio files found for job {job_id}"
+                raise FileNotFoundError(msg)
             primary_audio = discovered[0]
             extra_paths = discovered[1:]
+
+        if not primary_audio.is_file():
+            msg = f"Staged audio file does not exist for job {job_id}: {primary_audio}"
+            raise FileNotFoundError(msg)
 
         job.total_tracks = 1 + len(extra_paths)
         chosen = job.candidates[candidate_index]
@@ -521,7 +588,7 @@ class IngestionPipeline:
             msg = f"Unknown ingestion job: {job_id}"
             raise KeyError(msg)
 
-        discovered = _discover_staged_audio_files(job)
+        discovered = _discover_staged_audio_files(job, extractor=self._extractor)
         if (
             len(discovered) == 1
             and discovered[0] == job.source_path
@@ -532,8 +599,16 @@ class IngestionPipeline:
             job.scratch_dir = staged_files[0].parent
             discovered = staged_files
 
+        if not discovered:
+            msg = f"No staged audio files found for job {job_id}"
+            raise FileNotFoundError(msg)
+
         primary_audio = discovered[0]
         extra_paths = discovered[1:]
+        if not primary_audio.is_file():
+            msg = f"Staged audio file does not exist for job {job_id}: {primary_audio}"
+            raise FileNotFoundError(msg)
+
         job.total_tracks = 1 + len(extra_paths)
 
         if job.fingerprint is None and primary_audio.is_file():
@@ -576,7 +651,11 @@ class IngestionPipeline:
             msg = f"Unknown ingestion job: {job_id}"
             raise KeyError(msg)
 
-        discovered = _discover_staged_audio_files(job)
+        discovered = _discover_staged_audio_files(job, extractor=self._extractor)
+        if not discovered:
+            msg = f"No staged audio files found for job {job_id}"
+            raise FileNotFoundError(msg)
+
         job.total_tracks = len(discovered)
         primary_audio = discovered[0]
         raw_local_meta = await self._metadata.read_local_metadata(primary_audio)
@@ -650,124 +729,135 @@ class IngestionPipeline:
         custom_lyrics: LyricsData | None = None,
     ) -> IngestionResult:
         """Execute stages 8–10: fetch release tracklist, lyrics, write tags & move file(s), cleanup."""
-        extra_list = extra_audio_paths or []
-        job.total_tracks = max(job.total_tracks, 1 + len(extra_list))
-        release_tracks: list[TrackMetadata] = []
-        if extra_list and selected_metadata.release_mbid:
-            release_tracks = await self._lookup_release_tracklist(selected_metadata)
+        try:
+            extra_list = extra_audio_paths or []
+            job.total_tracks = max(job.total_tracks, 1 + len(extra_list))
+            release_tracks: list[TrackMetadata] = []
+            if extra_list and selected_metadata.release_mbid:
+                release_tracks = await self._lookup_release_tracklist(selected_metadata)
 
-        primary_meta = selected_metadata
-        if release_tracks and not primary_meta.recording_mbid:
-            primary_meta = _match_track_from_release(
-                local_meta=primary_meta,
-                ordinal_index=1,
-                release_tracks=release_tracks,
-                fallback_release=selected_metadata,
-                known_duration=primary_meta.duration_seconds,
+            primary_meta = selected_metadata
+            if release_tracks and not primary_meta.recording_mbid:
+                primary_meta = _match_track_from_release(
+                    local_meta=primary_meta,
+                    ordinal_index=1,
+                    release_tracks=release_tracks,
+                    fallback_release=selected_metadata,
+                    known_duration=primary_meta.duration_seconds,
+                )
+
+            job.selected_metadata = primary_meta
+            job.matched_release_mbid = primary_meta.release_mbid or job.matched_release_mbid
+
+            final_dup = await self._deduplicator.check_track(
+                job.fingerprint,
+                recording_mbid=primary_meta.recording_mbid,
+                metadata=primary_meta,
             )
+            if final_dup.is_duplicate:
+                job.state = JobState.DUPLICATE_REJECTED
+                job.completed_at = datetime.now(UTC)
+                job.final_path = final_dup.existing_path
+                await self._catalog.save_job(job)
+                await self._extractor.cleanup_job_scratch(job.job_id)
+                return IngestionResult(
+                    job=job,
+                    requires_user_confirmation=False,
+                    duplicate=final_dup,
+                    tracks_ingested=0,
+                    lyrics_embedded_count=0,
+                )
 
-        job.selected_metadata = primary_meta
-        job.matched_release_mbid = primary_meta.release_mbid or job.matched_release_mbid
+            job.state = JobState.FETCHING_LYRICS
+            await self._notify_stage(job, stage_callback)
+            lyrics = (
+                custom_lyrics if custom_lyrics is not None else await self._lyrics.fetch_lyrics(primary_meta)
+            )
+            lyrics_count = 1 if (lyrics and lyrics.has_any) else 0
+            job.lyrics_matched_count = lyrics_count
 
-        final_dup = await self._deduplicator.check_track(
-            job.fingerprint,
-            recording_mbid=primary_meta.recording_mbid,
-            metadata=primary_meta,
-        )
-        if final_dup.is_duplicate:
-            job.state = JobState.DUPLICATE_REJECTED
+            job.state = JobState.ORGANIZING
+            await self._notify_stage(job, stage_callback)
+            final_path = await self._organizer.finalize_track(
+                source_audio_path=audio_path,
+                metadata=primary_meta,
+                lyrics=lyrics,
+            )
+            job.final_path = final_path
+            tracks_written = 1
+            job.processed_tracks = 1
+
+            if job.fingerprint is not None:
+                await self._catalog.register_ingested_track(
+                    job_id=job.job_id,
+                    metadata=primary_meta,
+                    fingerprint=job.fingerprint,
+                    library_path=final_path,
+                )
+
+            for index, extra_path in enumerate(extra_list, start=2):
+                extra_local = await self._metadata.read_local_metadata(extra_path)
+                extra_fp = await self._compute_fingerprint_with_fallback(
+                    extra_path,
+                    known_duration=extra_local.duration_seconds,
+                )
+                extra_meta = _match_track_from_release(
+                    local_meta=extra_local,
+                    ordinal_index=index,
+                    release_tracks=release_tracks,
+                    fallback_release=selected_metadata,
+                    known_duration=extra_fp.duration_seconds or extra_local.duration_seconds,
+                )
+                if extra_meta.recording_mbid and not extra_fp.acoustid_mbid:
+                    extra_fp = AudioFingerprint(
+                        duration_seconds=extra_fp.duration_seconds,
+                        fingerprint=extra_fp.fingerprint,
+                        acoustid_mbid=extra_meta.recording_mbid,
+                    )
+                extra_dup = await self._deduplicator.check_track(
+                    extra_fp,
+                    recording_mbid=extra_meta.recording_mbid,
+                    metadata=extra_meta,
+                )
+                if extra_dup.is_duplicate:
+                    continue
+
+                extra_lyrics = await self._lyrics.fetch_lyrics(extra_meta)
+                if extra_lyrics and extra_lyrics.has_any:
+                    lyrics_count += 1
+                    job.lyrics_matched_count = lyrics_count
+
+                extra_final = await self._organizer.finalize_track(
+                    source_audio_path=extra_path,
+                    metadata=extra_meta,
+                    lyrics=extra_lyrics,
+                )
+                await self._catalog.register_ingested_track(
+                    job_id=job.job_id,
+                    metadata=extra_meta,
+                    fingerprint=extra_fp,
+                    library_path=extra_final,
+                )
+                tracks_written += 1
+                job.processed_tracks = tracks_written
+
+            job.state = JobState.COMPLETED
             job.completed_at = datetime.now(UTC)
-            job.final_path = final_dup.existing_path
-            await self._catalog.save_job(job)
+            await self._notify_stage(job, stage_callback)
+
             await self._extractor.cleanup_job_scratch(job.job_id)
             return IngestionResult(
                 job=job,
                 requires_user_confirmation=False,
-                duplicate=final_dup,
-                tracks_ingested=0,
-                lyrics_embedded_count=0,
+                lyrics_attached=lyrics_count > 0,
+                tracks_ingested=tracks_written,
+                lyrics_embedded_count=lyrics_count,
             )
-
-        job.state = JobState.FETCHING_LYRICS
-        await self._notify_stage(job, stage_callback)
-        lyrics = custom_lyrics if custom_lyrics is not None else await self._lyrics.fetch_lyrics(primary_meta)
-        lyrics_count = 1 if (lyrics and lyrics.has_any) else 0
-        job.lyrics_matched_count = lyrics_count
-
-        job.state = JobState.ORGANIZING
-        await self._notify_stage(job, stage_callback)
-        final_path = await self._organizer.finalize_track(
-            source_audio_path=audio_path,
-            metadata=primary_meta,
-            lyrics=lyrics,
-        )
-        job.final_path = final_path
-        tracks_written = 1
-        job.processed_tracks = 1
-
-        if job.fingerprint is not None:
-            await self._catalog.register_ingested_track(
-                job_id=job.job_id,
-                metadata=primary_meta,
-                fingerprint=job.fingerprint,
-                library_path=final_path,
-            )
-
-        for index, extra_path in enumerate(extra_list, start=2):
-            extra_local = await self._metadata.read_local_metadata(extra_path)
-            extra_fp = await self._compute_fingerprint_with_fallback(
-                extra_path,
-                known_duration=extra_local.duration_seconds,
-            )
-            extra_meta = _match_track_from_release(
-                local_meta=extra_local,
-                ordinal_index=index,
-                release_tracks=release_tracks,
-                fallback_release=selected_metadata,
-                known_duration=extra_fp.duration_seconds or extra_local.duration_seconds,
-            )
-            if extra_meta.recording_mbid and not extra_fp.acoustid_mbid:
-                extra_fp = AudioFingerprint(
-                    duration_seconds=extra_fp.duration_seconds,
-                    fingerprint=extra_fp.fingerprint,
-                    acoustid_mbid=extra_meta.recording_mbid,
-                )
-            extra_dup = await self._deduplicator.check_track(
-                extra_fp,
-                recording_mbid=extra_meta.recording_mbid,
-                metadata=extra_meta,
-            )
-            if extra_dup.is_duplicate:
-                continue
-
-            extra_lyrics = await self._lyrics.fetch_lyrics(extra_meta)
-            if extra_lyrics and extra_lyrics.has_any:
-                lyrics_count += 1
-                job.lyrics_matched_count = lyrics_count
-
-            extra_final = await self._organizer.finalize_track(
-                source_audio_path=extra_path,
-                metadata=extra_meta,
-                lyrics=extra_lyrics,
-            )
-            await self._catalog.register_ingested_track(
-                job_id=job.job_id,
-                metadata=extra_meta,
-                fingerprint=extra_fp,
-                library_path=extra_final,
-            )
-            tracks_written += 1
-            job.processed_tracks = tracks_written
-
-        job.state = JobState.COMPLETED
-        job.completed_at = datetime.now(UTC)
-        await self._notify_stage(job, stage_callback)
-
-        await self._extractor.cleanup_job_scratch(job.job_id)
-        return IngestionResult(
-            job=job,
-            requires_user_confirmation=False,
-            lyrics_attached=lyrics_count > 0,
-            tracks_ingested=tracks_written,
-            lyrics_embedded_count=lyrics_count,
-        )
+        except Exception as exc:
+            job.state = JobState.FAILED
+            job.error_message = str(exc)
+            job.completed_at = datetime.now(UTC)
+            await self._catalog.save_job(job)
+            with contextlib.suppress(Exception):
+                await self._notify_stage(job, stage_callback)
+            raise

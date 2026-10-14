@@ -14,7 +14,7 @@ from pathlib import Path
 import httpx
 import mutagen
 from mutagen.easyid3 import EasyID3
-from mutagen.flac import Picture
+from mutagen.flac import FLAC, Picture
 from mutagen.id3 import APIC, ID3, SYLT, TXXX, USLT, Encoding
 from mutagen.mp4 import MP4Cover
 from pathvalidate import sanitize_filename
@@ -256,10 +256,41 @@ def _write_enriched_tags_sync(
         logger.debug("Could not save easy tags on %s: %s", audio_path.name, exc)
         return False
 
+    _sanitize_audio_pictures_sync(audio_path)
+
     if lyrics is not None and lyrics.has_any:
         _embed_lyrics_into_audio_sync(audio_path, lyrics)
 
     return True
+
+
+def _sanitize_audio_pictures_sync(audio_path: Path) -> None:
+    """Ensure all embedded pictures (especially in FLAC) have valid non-empty MIME types and structure."""
+    if not audio_path.is_file():
+        return
+    suffix = audio_path.suffix.lower()
+    if suffix == ".flac":
+        try:
+            raw_flac = FLAC(audio_path)
+            changed = False
+            for pic in getattr(raw_flac, "pictures", []):
+                mime = getattr(pic, "mime", "")
+                if not mime or not mime.strip():
+                    if pic.data.startswith(b"\xff\xd8\xff"):
+                        pic.mime = "image/jpeg"
+                    elif pic.data.startswith(b"\x89PNG"):
+                        pic.mime = "image/png"
+                    else:
+                        pic.mime = "image/jpeg"
+                    changed = True
+                if getattr(pic, "type", 0) <= 0:
+                    pic.type = 3
+                    changed = True
+            if changed:
+                raw_flac.save()
+                logger.debug("Sanitized picture metadata block in %s", audio_path.name)
+        except Exception as exc:
+            logger.debug("Failed to sanitize picture metadata on %s: %s", audio_path.name, exc)
 
 
 def _extract_embedded_cover_bytes_sync(audio_path: Path) -> bytes | None:
@@ -779,6 +810,7 @@ def _embed_cover_art_into_audio_sync(
     if not audio_path.is_file() or not cover_bytes:
         return False
 
+    clean_mime = mime_type.strip() if mime_type and mime_type.strip() else "image/jpeg"
     suffix = audio_path.suffix.lower()
     try:
         if suffix == ".mp3":
@@ -792,7 +824,7 @@ def _embed_cover_art_into_audio_sync(
             id3.add(
                 APIC(
                     encoding=Encoding.UTF8,
-                    mime=mime_type,
+                    mime=clean_mime,
                     type=3,
                     desc="Front Cover",
                     data=cover_bytes,
@@ -812,7 +844,7 @@ def _embed_cover_art_into_audio_sync(
                 clear_pics_fn()
             pic = Picture()
             pic.type = 3
-            pic.mime = mime_type
+            pic.mime = clean_mime
             pic.desc = "Front Cover"
             pic.data = cover_bytes
             add_pic_fn(pic)
@@ -822,14 +854,14 @@ def _embed_cover_art_into_audio_sync(
         raw_tags = getattr(raw_audio, "tags", None)
         if raw_tags is not None:
             if suffix in {".m4a", ".mp4"}:
-                img_fmt = MP4Cover.FORMAT_PNG if "png" in mime_type.lower() else MP4Cover.FORMAT_JPEG
+                img_fmt = MP4Cover.FORMAT_PNG if "png" in clean_mime.lower() else MP4Cover.FORMAT_JPEG
                 raw_tags["covr"] = [MP4Cover(cover_bytes, imageformat=img_fmt)]
                 raw_audio.save()
                 return True
 
             pic = Picture()
             pic.type = 3
-            pic.mime = mime_type
+            pic.mime = clean_mime
             pic.desc = "Front Cover"
             pic.data = cover_bytes
             b64_pic = base64.b64encode(pic.write()).decode("ascii")
@@ -1036,6 +1068,7 @@ def _inspect_library_audio_file_sync(
     folder_year = int(year_match.group(1)) if year_match else None
     clean_album_folder = re.sub(r"\s*\(\d{4}\)\s*$", "", album_folder).strip()
 
+    _sanitize_audio_pictures_sync(audio_path)
     meta = _read_mutagen_metadata_sync(audio_path, fallback)
     artist = (
         meta.artist

@@ -976,6 +976,49 @@ class SqliteCatalogRepository:
             rows = await cursor.fetchall()
         return [_row_to_job(tuple(r)) for r in rows]
 
+    async def list_jobs(
+        self,
+        user_id: int | None = None,
+        limit: int = 50,
+    ) -> list[IngestionJob]:
+        """List ingestion jobs, optionally filtered by user_id, ordered newest-first."""
+        async with self._db.connect() as conn:
+            if user_id is not None:
+                cursor = await conn.execute(
+                    """
+                    SELECT job_id, source_path, state, candidates_json,
+                           selected_metadata_json, fingerprint_json,
+                           final_path, error_message, created_at,
+                           user_id, source_type, original_filename,
+                           file_size_bytes, scratch_dir, sha256_hash,
+                           confidence_score, matched_release_mbid,
+                           started_at, completed_at
+                    FROM ingestion_jobs
+                    WHERE user_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (user_id, limit),
+                )
+            else:
+                cursor = await conn.execute(
+                    """
+                    SELECT job_id, source_path, state, candidates_json,
+                           selected_metadata_json, fingerprint_json,
+                           final_path, error_message, created_at,
+                           user_id, source_type, original_filename,
+                           file_size_bytes, scratch_dir, sha256_hash,
+                           confidence_score, matched_release_mbid,
+                           started_at, completed_at
+                    FROM ingestion_jobs
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+            rows = await cursor.fetchall()
+        return [_row_to_job(tuple(r)) for r in rows]
+
     async def cancel_queued_jobs_for_user(self, user_id: int) -> int:
         """Cancel all QUEUED or PAUSED jobs belonging to `user_id` and return the count cancelled."""
         now_iso = datetime.now(UTC).isoformat()

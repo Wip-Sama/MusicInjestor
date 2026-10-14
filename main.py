@@ -3,6 +3,8 @@
 import asyncio
 import contextlib
 import logging
+import shutil
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.types import BotCommand, MenuButtonWebApp, WebAppInfo
@@ -159,10 +161,51 @@ async def run_periodic_library_rescan_loop(
             logger.warning("Periodic library rescan failed: %s", exc)
 
 
+async def start_vite_dev_server_if_needed(settings: AppSettings) -> asyncio.subprocess.Process | None:
+    """Auto-start Vite dev server in webapp/ if in dev_mode and not already running on port 5173."""
+    if not (settings.web_app_enabled and settings.web_app_dev_mode):
+        return None
+
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", 5173), timeout=0.15)
+        writer.close()
+        await writer.wait_closed()
+        logger.info("Vite dev server is already running on http://127.0.0.1:5173")
+        return None
+    except Exception:
+        pass
+
+    webapp_dir = Path("webapp")
+    if not (webapp_dir / "package.json").is_file():
+        return None
+
+    npm_path = shutil.which("npm.cmd") or shutil.which("npm")
+    if not npm_path:
+        logger.info("Node/npm not detected in PATH; serving pre-built webapp/dist static assets.")
+        return None
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            npm_path,
+            "run",
+            "dev",
+            cwd=str(webapp_dir),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        logger.info("Auto-started Vite dev server (PID %d) at http://127.0.0.1:5173", proc.pid)
+        return proc
+    except Exception as exc:
+        logger.warning("Could not auto-start Vite dev server: %s", exc)
+        return None
+
+
 async def run_app(settings: AppSettings | None = None) -> None:
     """Initialize SQLite WAL storage, assemble RBAC/OIDC/Queue services, and start Telegram polling."""
     resolved_settings = settings or load_settings()
     configure_logging(resolved_settings.log_level)
+
+    vite_proc = await start_vite_dev_server_if_needed(resolved_settings)
 
     db_manager = SqliteDatabaseManager(resolved_settings.database_path)
     await db_manager.initialize()
@@ -238,6 +281,7 @@ async def run_app(settings: AppSettings | None = None) -> None:
             stop_event=background_stop_event,
         )
     )
+    queue_task = asyncio.create_task(queue_worker.run_worker_loop(stop_event=background_stop_event))
     coordinator: OidcCallbackCoordinator | None = None
     if resolved_settings.oidc_enabled:
         coordinator = OidcCallbackCoordinator(
@@ -254,6 +298,8 @@ async def run_app(settings: AppSettings | None = None) -> None:
         )
 
     if resolved_settings.web_app_enabled or resolved_settings.oidc_enabled:
+        meta_service = getattr(pipeline, "_metadata", None)
+        lyrics_client = getattr(pipeline, "_lyrics", None)
         web_server = BotWebServer(
             bot_token=resolved_settings.telegram_bot_token,
             governance_service=governance_service,
@@ -263,6 +309,13 @@ async def run_app(settings: AppSettings | None = None) -> None:
             port=resolved_settings.web_listen_port,
             owner_telegram_ids=resolved_settings.owner_telegram_ids,
             dev_mode=resolved_settings.web_app_dev_mode,
+            catalog_repository=repository,
+            organizer=organizer,
+            metadata_service=meta_service if isinstance(meta_service, MusicBrainzMetadataService) else None,
+            lyrics_client=lyrics_client if isinstance(lyrics_client, LrclibLyricsClient) else None,
+            queue_worker=queue_worker,
+            pipeline=pipeline,
+            scratch_dir=resolved_settings.storage_scratch_dir,
         )
         await web_server.start()
 
@@ -272,6 +325,9 @@ async def run_app(settings: AppSettings | None = None) -> None:
         await dispatcher.start_polling(bot)
     finally:
         background_stop_event.set()
+        queue_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await queue_task
         rescan_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await rescan_task
@@ -281,6 +337,13 @@ async def run_app(settings: AppSettings | None = None) -> None:
                 await oidc_sync_task
         if web_server is not None:
             await web_server.stop()
+        if vite_proc is not None:
+            try:
+                vite_proc.terminate()
+                await asyncio.wait_for(vite_proc.wait(), timeout=3.0)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    vite_proc.kill()
         await bot.session.close()
 
 

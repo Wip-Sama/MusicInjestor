@@ -143,6 +143,18 @@ class GovernanceRepositoryPort(Protocol):
         """Return jobs currently actively processing or awaiting disambiguation."""
         ...
 
+    async def list_jobs(
+        self,
+        user_id: int | None = None,
+        limit: int = 50,
+    ) -> list[IngestionJob]:
+        """List ingestion jobs, optionally filtered by user_id, ordered newest-first."""
+        ...
+
+    async def get_job(self, job_id: str) -> IngestionJob | None:
+        """Retrieve an ingestion job by ID (or prefix)."""
+        ...
+
     async def cancel_queued_jobs_for_user(self, user_id: int) -> int:
         """Cancel all QUEUED jobs belonging to `user_id` and return the count cancelled."""
         ...

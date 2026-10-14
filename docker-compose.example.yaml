@@ -58,8 +58,10 @@ services:
       STORAGE_LIBRARY_DIR: /mnt/music/library
       DATABASE_PATH: /app/storage/library.db
       UMASK: ${UMASK:-0022}
+      WEB_LISTEN_HOST: ${WEB_LISTEN_HOST:-0.0.0.0}
+      WEB_LISTEN_PORT: ${WEB_LISTEN_PORT:-8080}
     ports:
-      - "${OIDC_LISTEN_PORT:-8080}:8080"
+      - "${WEB_LISTEN_PORT:-${OIDC_LISTEN_PORT:-8080}}:${WEB_LISTEN_PORT:-8080}"
     volumes:
       # 1. Shared volume with telegram-bot-api for zero-copy local file access (up to 2GB)
       - ./storage/telegram-bot-api:/var/lib/telegram-bot-api:ro

@@ -219,14 +219,122 @@ Before concluding any task that modifies code:
   - Scaffolded modern Telegram Mini App frontend in `webapp/` using React 18, Vite, TypeScript, `@telegram-apps/sdk-react`, `@telegram-apps/telegram-ui`, client-side Telegram bootstrap (`miniApp.ready()`, `miniApp.mount()`, `viewport.expand()`, `swipeBehavior.disableVertical()`), dynamic CSS theme variables (`--tg-theme-*`), and resilient `initData` capture (`sessionStorage`).
   - Built production bundle (`webapp/dist`) and created unit test suites (`tests/unit/test_webapp_auth.py` and `tests/unit/test_webapp_server.py`), achieving 100% pass rate across all 86 unit and integration tests.
 
+- [x] **M19 (TMA Phase 2): Telegram Mini App Music Catalog, HTTP 206 Partial Content Audio Streaming, Interactive Player & Synced Karaoke Lyrics**
+  - Extended `src/bot/webapp_server.py` with authenticated catalog and streaming endpoints:
+    - `GET /api/v1/app/tracks`: Paginated library tracks with debounced search, sort ordering (`recent`, `artist`, `title`, `album`, `year`), and count metadata.
+    - `GET /api/v1/app/tracks/{id}`: Single track details, technical specs (duration, bitrate, file size, audio container).
+    - `GET /api/v1/app/tracks/{id}/cover`: Cover art streaming with `Cache-Control` (`public, max-age=604800, immutable`), extracting `cover.jpg`/`cover.png` or embedded mutagen pictures with clean SVG fallback.
+    - `GET /api/v1/app/tracks/{id}/audio`: HTTP 206 Partial Content range-enabled audio streaming via `aiohttp.web.FileResponse` (`Accept-Ranges: bytes`, `Content-Range`) supporting FLAC, MP3, AAC, and Opus.
+    - `GET /api/v1/app/tracks/{id}/lyrics`: Structured raw and synced LRC sidecar extraction via `LibraryOrganizer`.
+  - Built full music player frontend inside `webapp/`:
+    - `AudioPlayerContext`: Global playback state, queue management, repeat/shuffle modes, Telegram haptic feedback (`hapticFeedback.impactOccurred('light')`), and `navigator.mediaSession` integration for native lock-screen controls and media keys.
+    - `MiniPlayer`: Docked bottom bar (64px) with track thumbnail, progress line, and play/skip buttons.
+    - `FullscreenPlayer`: Expandable player sheet with large high-res album art, interactive scrubber/seekbar, format chip, shuffle, repeat, and drawer triggers.
+    - `SyncedLyrics`: Real-time karaoke `.lrc` scroller highlighting the current line, auto-centering playback, and supporting tap-to-seek to jump to any lyric timestamp.
+    - `QueueDrawer`: Reorderable and clickable "Up Next" playlist drawer.
+    - `CatalogView`: Search bar with 300ms debouncing, sort dropdown, track cards with format and LRC chips, and pagination controls.
+  - Rebuilt production bundle (`webapp/dist/`) and added unit test coverage in `tests/unit/test_webapp_server.py`, achieving 100% pass rate across 90 unit and integration tests.
+
+- [x] **M20 (TMA Phase 3): Metadata, Cover & Synced Lyrics Studio with Mandatory Dry-Run Confirmation**
+  - Extended `src/bot/webapp_server.py` with authenticated Studio API endpoints:
+    - `POST /api/v1/app/tracks/{id}/propose-edit`: Computes `SongEditProposal` diff, target filesystem path preview (`LibraryOrganizer.build_target_audio_path`), and change summary.
+    - `POST /api/v1/app/tracks/{id}/apply-edit`: Commits confirmed changes to audio tags, relocates audio file and sidecars on disk (`LibraryOrganizer.relocate_and_retag_track`), updates SQLite `library_tracks` via `update_library_track_full`, and writes immutable audit log entry (`SONG_UPDATED_MINIAPP`).
+    - `POST /api/v1/app/tracks/{id}/cover`: Supports multipart/form-data image upload and JSON base64; supports dry-run preview (`apply=false`) returning image hex for confirmation diff or live commit (`apply=true`) writing `cover.jpg` and embedding picture tags.
+    - `POST /api/v1/app/tracks/{id}/lyrics`: Supports dry-run preview comparing old vs new lyrics and live commit (`apply=true`) writing `.lrc` sidecar, embedding audio lyric tags, and updating SQLite `has_synced_lyrics` flag.
+    - `POST /api/v1/app/tracks/{id}/auto-enrich`: Re-queries MusicBrainz (`find_candidates`), Genius, Last.fm, and LRCLIB, returning candidate release matches with confidence percentages and best auto-fill values.
+  - Enforced strict RBAC permission validation across all mutation endpoints (`has_permission(user, Permission.REQUEST_TAG_CORRECTION)`), denying `GUEST` users with HTTP 403 Forbidden.
+  - Built comprehensive interactive Studio frontend in `webapp/src/components/studio/`:
+    - `DryRunConfirmModal`: Strict implementation of the **Mandatory Dry-Run & Confirmation Policy**, displaying before/after diffs (`<s>Old</s> ➡️ <b color="#30d158">New</b>`), disk path relocation previews (`Old Path ➡️ New Path`), cover art and lyrics change badges, and requiring explicit `✅ Confirm & Apply Changes` confirmation before touching disk or database.
+    - `EditMetadataModal`: Visual tag editor for Title, Artist, Album, Year, Track Number, plus interactive `🔎 Auto Search` querying MusicBrainz/Genius candidates for one-tap auto-filling.
+    - `CoverUploaderModal`: Drag-and-drop or device file picker with current vs new artwork preview comparison.
+    - `LrcEditorModal`: Dual-mode synced karaoke editor (interactive line editor with playback time-stamping `[mm:ss.xx]`, timing nudges `±0.5s`, and raw text editor).
+    - `SongStudioModal`: Unified tabbed dialog coordinator embedded directly in `CatalogView` and `FullscreenPlayer`.
+  - Built production bundle (`webapp/dist/`) and added unit test coverage in `tests/unit/test_webapp_server.py`, achieving 100% pass rate across all 95 unit and integration tests.
+
+- [x] **M21 (TMA Phase 4): Web Ingestion Hub, Multipart Audio/Archive Upload, Real-Time SSE Event Stream & Interactive Live Queue Board**
+  - Extended `src/bot/webapp_server.py` with authenticated Ingestion Hub and Queue Board endpoints:
+    - `POST /api/v1/app/ingest/upload`: Multipart stream parser for audio (`.mp3`, `.flac`, `.m4a`, `.ogg`, `.opus`, `.wav`) and multi-track archives (`.zip`, `.7z`), writing directly to staging scratch directories, enforcing `Permission.SUBMIT_INGESTION` (rejecting `GUEST` with HTTP 403), enqueuing into `IngestionQueueWorker`, and asynchronously executing jobs under the worker semaphore.
+    - `GET /api/v1/app/queue`: Fetches active, queued, paused, and recent jobs; differentiates owner scope (`?mine=true` or `VIEW_OWN_JOBS`) and moderator global scope (`VIEW_GLOBAL_QUEUE`); includes worker active count and concurrency limit.
+    - `POST /api/v1/app/queue/{id}/action`: Comprehensive queue control endpoint supporting `pause`, `resume` / `unlock`, `cancel`, `select_candidate` (resolving disambiguation via `pipeline.confirm_candidate` and `queue_worker.record_confirmed_completion`), and `manual_search` (re-querying MusicBrainz via `pipeline.search_manual_candidates`).
+    - `GET /api/v1/app/queue/events`: Server-Sent Events (SSE) streaming live updates (`job_enqueued`, `stage_changed`, `confirmation_required`, `job_completed`, `job_failed`, `job_state_changed`) and periodic keepalive pings (`: ping\n\n`) via `QueueEventBus`.
+  - Built real-time Queue & Ingestion frontend in `webapp/`:
+    - `FileDropzone`: Drag-and-drop / file picker upload component with format chips, file size calculation, and live `XMLHttpRequest` percentage progress bar (0..100%).
+    - `StageVisualizer`: 6-stage visual pipeline tracker (Staging ➡️ Fingerprinting ➡️ Deduplication ➡️ Metadata ➡️ Lyrics ➡️ Library Organization) with animated active pulses and completion indicators.
+    - `DisambiguationCard`: Candidate release selector rendering confidence match badges (`98% MATCH`), album/year/type details, MusicBrainz links, one-tap release confirmation, and manual query search input.
+    - `JobCard`: Interactive job aggregate with status badges, controls (Pause, Resume, Cancel), and copyable job IDs.
+    - `IngestQueueView`: Unified view combining `FileDropzone` with `Live Queue Board`, worker status indicator, SSE connection status pill, moderator scope toggle (My Uploads vs Global Queue), and active/history filter tabs.
+  - Integrated third navigation tab (`⚡ Ingest & Queue`) into `webapp/src/App.tsx` and compiled production bundle (`webapp/dist/`).
+
+- [x] **M22 (TMA Phase 5): Mini App User Governance, Role-Based Feature Locking, Deep-Linking & Offline Resilience**
+  - Extended `src/bot/webapp_server.py` with authenticated Governance endpoints:
+    - `GET /api/v1/app/admin/users`: Lists registered users with optional role and query search filters, enriched with upload stats (`albums` and `tracks` counts), requiring `Permission.MANAGE_USERS` (403 for unauthorized users).
+    - `POST /api/v1/app/admin/users/{id}/role`: Updates a user's role tier via `governance_service.change_user_role`, preventing self-modification and unauthorized OWNER changes.
+    - `POST /api/v1/app/admin/users/{id}/block`: Blocks or unblocks accounts via `governance_service.set_user_blocked`, preventing self-blocking.
+    - `GET /api/v1/app/admin/access-requests`: Lists pending access requests awaiting review.
+    - `POST /api/v1/app/admin/access-requests/{id}/resolve`: Approves (promoting to Uploader) or denies requests via `governance_service.approve_access_request` / `deny_access_request`.
+  - Enforced strict **Role-Based Feature Locking** across the Mini App:
+    - **Guest Users:** File upload dropzone is replaced with a locked access card; track editing slider in `TrackCard` is completely hidden; candidate release selection and job actions are locked.
+    - **Non-Admins:** The Governance / Admin navigation tab and view are completely omitted and return access restriction cards if navigated to directly.
+    - **Queue Actions:** Pause, resume, and cancel buttons on `JobCard` and release disambiguation selection on `DisambiguationCard` are only visible to the job submitter or moderators (`RESOLVE_OTHERS_JOBS`).
+  - Implemented Telegram **Deep-Linking (`start_param`)**:
+    - `track_{id}`: Automatically opens and streams the audio track in the player with synced lyrics.
+    - `job_{id}` / `queue`: Switches directly to the Ingest & Queue view.
+    - `admin` / `governance`: Switches to the Governance view for authorized admins.
+    - Added `🚀 Open in Mini App` deep-link buttons in song action cards (`build_song_action_keyboard`), queued job cards (`build_queued_job_keyboard`), and `/app` command (`handle_cmd_app`).
+  - Added **Offline Resilience & Service Worker**:
+    - Created `webapp/public/manifest.json` and `webapp/public/sw.js` with app shell precaching, cache-first strategy for static assets, network-first for API requests, and registered in `main.tsx`.
+- [x] **M23 (TMA Phase 6): Granular Catalog Access Control (`LISTENER` Role Tier), Low-Level Catalog Lockdown, Audio Picture Demuxer Repair & Range Stream Auth**
+  - **Granular RBAC Split & Catalog Lockdown:**
+    - Split unprivileged users into `GUEST` (default onboarding tier: no catalog viewing or streaming) and `LISTENER` (approved read-only tier with catalog browsing and streaming rights, but no upload/mutation permissions).
+    - Added `UserRole.LISTENER = "LISTENER"` (Rank 1: `GUEST: 0 < LISTENER: 1 < UPLOADER: 2 < MODERATOR: 3 < ADMIN: 4 < OWNER: 5`) and `Permission.VIEW_CATALOG = "VIEW_CATALOG"`.
+    - Protected all catalog endpoints in `src/bot/webapp_server.py` (`/api/v1/app/tracks`, `/audio`, `/lyrics`, `/cover`) and Telegram `/songs` menu with `Permission.VIEW_CATALOG`, denying `GUEST` users with HTTP 403 Forbidden.
+    - Updated promotion/demotion hierarchies and Authentik OIDC group mapping (`music-listeners` / `music-viewers` -> `LISTENER`) in `src/core/rbac.py`.
+    - Added `GuestCatalogLockedCard` in `webapp/src/App.tsx` and updated `GovernanceView.tsx` with `LISTENER` badge, filter pills, and access approval actions.
+  - **Audio Streaming Failure Diagnosis & FLAC Header Sanitization:**
+    - Diagnosed audio streaming failure on FLAC tracks (`Stay Alive` by Rie Takahashi and `La coda del diavolo` by Rkomi): embedded `METADATA_BLOCK_PICTURE` blocks contained empty MIME strings (`mime_len == 0`), which causes Chromium and FFmpeg demuxers (`libavformat/flac_picture.c`) to abort decoding immediately with `AVERROR_INVALIDDATA`.
+    - Repaired picture headers on disk and added automatic FLAC picture sanitization (`_sanitize_audio_pictures_sync` in `src/core/organizer.py`), inspecting magic bytes to guarantee valid non-empty MIME types (`image/jpeg` / `image/png`) across tag writing and library rescanning.
+  - **HTML5 `<audio>` Authenticated Range Streaming:**
+    - HTML5 `<audio>` elements cannot set custom `Authorization` request headers; added `?tgWebAppData=${encodeURIComponent(rawInit)}` query parameter support in `webapp/src/context/AudioPlayerContext.tsx` and query extraction in `extract_raw_init_data_from_request` (`src/bot/webapp_server.py`).
+    - Added playback error handling in `AudioPlayerContext.tsx` to prevent UI play state desynchronization.
+    - Achieved 100% test pass rate across all 103 unit and integration tests (`exit code 0`), zero type errors (`ty check`), and zero lint warnings (`ruff`).
+- [x] **M24: Autonomous Queue Worker Loop, Resilient Local/HTTP File Resolution & Multi-File Forward Debouncing**
+  - **Autonomous Background Ingestion Loop:** Added `IngestionQueueWorker.run_worker_loop(stop_event)` backed by an `asyncio.Event` wake-up trigger (`_wake_event`), continuously polling oldest `QUEUED` jobs up to the concurrency limit (`concurrency_limit` 1..4) and processing them asynchronously. Wired worker loop lifecycle into `main.py` with graceful shutdown handling.
+  - **Resilient File Ingress & Ghost Job Elimination:** Updated `_resolve_incoming_file_path` in `src/bot/routers/files.py` to return `(Path | None, str, str | None)`. Added direct HTTP streaming fallback via `telegram_local_api_url` if local disk resolution fails. Prevented phantom queued jobs when file fetching fails (e.g. Telegram Cloud API 20 MB file size limit when `--local` API is unavailable), reporting descriptive errors directly to users.
+  - **Queue Stalling Guard:** Updated `execute_job` so if a job's `source_path` does not exist on disk, it immediately transitions to `FAILED`, notifies the progress handler, logs the incident, and frees the worker slot without stalling other jobs in the queue.
+  - **Multi-File Forward & Album Debouncing:** Implemented a debounce buffer (`_BATCH_BUFFERS`, `_BATCH_TIMERS`, `_BATCH_LOCK`) grouping multiple forwarded files or media group album bursts. Aggregates all files into the queue concurrently and renders a single consolidated batch status card (`format_batch_queued_card` + `build_batch_queued_keyboard`) instead of posting fragmented individual messages.
+- [x] **M25: Transparent Vite Dev Proxy, Auto-Launcher & Port 8080 Docker Conflict Resolution**
+  - **Transparent Vite Dev Reverse-Proxy:** Enhanced `handle_spa_fallback` in `src/bot/webapp_server.py`. In `dev_mode` (`web_app_dev_mode=True`), whenever the Vite dev server is running on `http://127.0.0.1:5173`, `BotWebServer` (listening on port 8080) transparently proxies all SPA assets, Vite scripts, and WebSocket HMR upgrades to Vite while handling all `/api/v1/...` routes natively. When Vite is not running, it automatically falls back to serving compiled `webapp/dist/` assets.
+  - **Vite Dev Server Auto-Launcher:** Added `start_vite_dev_server_if_needed` to `main.py`, automatically detecting whether Vite is already active on port 5173 or spawning `npm run dev` in the background when running on the host in `dev_mode`, with clean process termination on bot shutdown.
+  - **Docker Port 8080 Conflict Diagnosis:** Diagnosed `502 Bad Gateway` error when using `cloudflared tunnel --url http://localhost:8080`: a stale `music-ingest-bot` container running in Docker had bound host port 8080 without an active webapp listener, dropping incoming tunnel connections. Stopped the conflicting container and documented hybrid development workflow (`docker compose up -d telegram-bot-api` only).
+- [x] **M26: External Web App Port Exposure, Ingestion Finalization Exception Recovery, Real-Time Disambiguation SSE & Live Auto-Sync**
+  - **Docker Compose Port Exposure:** Added `WEB_LISTEN_HOST: ${WEB_LISTEN_HOST:-0.0.0.0}` and `WEB_LISTEN_PORT: ${WEB_LISTEN_PORT:-8080}` to `docker-compose.yml` and `docker-compose.example.yaml`, exposing `${WEB_LISTEN_PORT:-${OIDC_LISTEN_PORT:-8080}}:${WEB_LISTEN_PORT:-8080}` so the Web App / Telegram Mini App can be accessed externally via reverse proxy, Cloudflare tunnel, or domain URL.
+  - **Cross-Environment Staging Path Resolution:** Upgraded `_discover_staged_audio_files` in `src/core/pipeline.py` with multi-directory lookups translating container `/app/storage/scratch` to host `./storage/scratch` and resolving `telegram-bot-api` local paths. Added strict staged file existence checks (`primary_audio.is_file()`) in `confirm_candidate`, `complete_custom_ingestion`, and `search_manual_candidates`, eliminating unhandled crashes when jobs move between container and host environments.
+  - **Ingestion Finalization Recovery:** Wrapped `_complete_ingestion` in `try...except Exception as exc:`, transitioning aborted jobs to `JobState.FAILED`, setting `error_message` and `completed_at`, saving to SQLite, and notifying stage listeners. Eliminated permanent stalls at `JobState.ORGANIZING`.
+  - **Telegram Bot In-Place Failure UI:** Wired `stage_callback` into `handle_verification_callback` (`select` and `apply_edit`) in `src/bot/routers/verification.py`, rendering in-place progress during lyrics fetch and file organization, and rendering `⚠️ Ingestion Finalization Failed` with back navigation rather than leaving the user stuck on the loading card.
+  - **Mini App Real-Time SSE & Fallback Auto-Sync:**
+    - Provided `stage_callback` to `pipeline.confirm_candidate` in `src/bot/webapp_server.py`, streaming `stage_changed` SSE events during confirmation and publishing `job_failed` upon failure.
+    - Updated `webapp/src/lib/queueApi.ts` to ensure `initData` is resolved before connecting `EventSource`.
+    - Updated `webapp/src/views/IngestQueueView.tsx` with immediate `await loadQueue()` after candidate selection, pause, resume, cancel, or manual search, plus a 3.5s auto-polling fallback whenever active jobs exist or SSE disconnects, preventing the UI from freezing on selection.
+
+- [x] **M27: Automated Lyrics Research (LRCLIB) & Selective Review (Accept All, Select Changes, Discard) in Bot & Mini App**
+  - **Mini App Lyrics Research & Fine-Grained Dry-Run Selection:**
+    - Added `POST /api/v1/app/tracks/{track_id}/auto-lyrics` on `BotWebServer` to research synced and unsynced lyrics via `LrclibLyricsClient` using track metadata or optional query overrides (`artist`, `title`, `query`).
+    - Extended `POST /api/v1/app/tracks/{track_id}/apply-edit` to accept `accepted_fields: list[str]`, applying only the selected field modifications and preserving existing database and disk tags/sidecars for unselected fields.
+    - Updated `LrcEditorModal` in Mini App Studio with an interactive Auto-Search Lyrics toolbar, live search status, query input override, and one-tap options to load into the synced editor or review and propose directly.
+    - Upgraded `DryRunConfirmModal` with interactive checkboxes for each changed metadata field, cover art, and lyrics, quick filter pills (`Select All`, `Deselect All`, `Only Lyrics`, `Only Metadata`), a `❌ Discard Changes` action, and dynamic `✅ Accept All Changes` / `✅ Accept Selected Changes (X/Y)` submission.
+  - **Telegram Bot Auto-Lyrics & Selective Dry-Run Workflow:**
+    - Added `⚡ Auto-Search Lyrics` button to `build_lyrics_input_keyboard` (`songs:lyrics_menu`) and `build_job_lyrics_prompt_keyboard` (`verify:lyrics`), instantly fetching lyrics via LRCLIB and transitioning to the dry-run confirmation card or attaching lyrics to the queued job.
+    - Updated `build_dry_run_confirmation_keyboard` in `src/bot/keyboards/songs.py` to offer 3 clear post-search actions:
+      1. `✅ Accept All Changes`
+      2. Quick filters: `🏷️ Metadata Only` and `📝 Lyrics Only`
+      3. `🎛️ Select Changes...` to toggle individual fields via `SongsToggleFieldCallback` (`songstog`) in `build_selective_changes_keyboard` with live `[x]` / `[ ]` states and dynamic `Apply Selected (X/Y)`
+      4. `❌ Discard Changes` (`songs:discard_changes`) safely resetting FSM state and preserving the original track intact.
+    - Added comprehensive unit test suites in `tests/unit/test_bot_auto_lyrics_and_selective_review.py` and extended `tests/unit/test_webapp_server.py`, passing all 115 unit and integration tests.
+
 ### Planned Backlog (Future Enhancements)
-- [ ] **Phase 2: Telegram Mini App Music Catalog & Audio Streaming Player**
-  - Implement `/api/v1/app/tracks` search & pagination, cover art stream, and HTTP 206 range-enabled audio streaming with interactive player and synced lyrics in `webapp/`.
-- [ ] **Phase 3: Telegram Mini App Metadata, Cover & Synced Lyrics Studio**
-  - Implement visual metadata editor with dry-run diff preview (`SongEditProposal`), visual cover art cropper/uploader, and interactive LRC editor.
-- [ ] **Phase 4: Telegram Mini App Web Ingestion Hub & Live Queue Board**
-  - Implement multipart audio/archive upload and real-time SSE stage visualizer (0..10) with interactive verification resolution.
-- [ ] **Phase 5: Telegram Mini App Governance, Deep-Linking & Offline Resilience**
-  - Implement admin user management, `?startapp=` deep-linking, and offline Service Worker shell caching.
+- [x] **Phase 4: Telegram Mini App Web Ingestion Hub & Live Queue Board** (Completed in M21)
+- [x] **Phase 5: Telegram Mini App Governance, Deep-Linking & Offline Resilience** (Completed in M22)
+- [x] **Phase 6: Granular Catalog Access Control, Guest Lockdown & Audio Streaming Repair** (Completed in M23)
 - [ ] **Low-Priority Backlog: Admin Folder Structure Viewer & Mass Migration**
   - Allow upper roles (`ADMIN` / `OWNER`) to browse the `storage/library` folder hierarchy in Telegram and run dry-run previewed mass path/tag migrations across the catalog.
+

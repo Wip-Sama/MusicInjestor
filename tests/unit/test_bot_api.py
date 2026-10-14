@@ -210,8 +210,11 @@ def test_admin_and_onboarding_keyboards_and_parsers() -> None:
     assert mod_menu.keyboard[1][0].text == BTN_MAIN_INFO
 
     approval_kb = build_access_request_approval_keyboard(7)
-    assert len(approval_kb.inline_keyboard[0]) == 3
-    assert approval_kb.inline_keyboard[0][0].callback_data == "access_req:approve:7:UPLOADER"
+    assert len(approval_kb.inline_keyboard[0]) == 2
+    assert approval_kb.inline_keyboard[0][0].callback_data == "access_req:approve:7:LISTENER"
+    assert approval_kb.inline_keyboard[0][1].callback_data == "access_req:approve:7:UPLOADER"
+    assert approval_kb.inline_keyboard[1][0].callback_data == "access_req:approve:7:MODERATOR"
+    assert approval_kb.inline_keyboard[1][1].callback_data == "access_req:deny:7"
 
     queue_kb = build_queued_job_keyboard("job-uuid-1")
     assert queue_kb.inline_keyboard[0][0].callback_data == "queue:get_file:job-uuid-1"
@@ -242,7 +245,7 @@ def test_admin_and_onboarding_keyboards_and_parsers() -> None:
 
     detail_kb = build_user_detail_keyboard(sample_user)
     assert detail_kb.inline_keyboard[0][0].callback_data == "admin:promote:987654321:MODERATOR"
-    assert detail_kb.inline_keyboard[0][1].callback_data == "admin:demote:987654321:GUEST"
+    assert detail_kb.inline_keyboard[0][1].callback_data == "admin:demote:987654321:LISTENER"
     assert detail_kb.inline_keyboard[2][0].callback_data == "admin:user_uploads:987654321"
     assert detail_kb.inline_keyboard[2][1].callback_data == "admin:user_changes:987654321"
 
@@ -2070,7 +2073,7 @@ def test_song_provenance_history_user_activity_and_job_pause_review_controls(tmp
             await _click_button("Edit Title")
             text = await _send_user_text("Stay Alive (TV Size)")
             assert "Dry-Run Preview" in text
-            text = await _click_button("Confirm & Apply Changes")
+            text = await _click_button("Accept All Changes")
             assert "Modified: <code>1 time(s)</code>" in text
             assert "Last by <code>@owner_u (1001)</code>" in text
 
@@ -2219,5 +2222,303 @@ def test_song_provenance_history_user_activity_and_job_pause_review_controls(tmp
             assert any(t.title == "Wishing (Remastered)" for t in all_tracks)
         finally:
             await bot.session.close()
+
+    asyncio.run(_scenario())
+
+
+def test_multi_file_forwarding_and_media_group_batching(
+    tmp_path: Path,
+    sample_settings: AppSettings,
+) -> None:
+    """Verify multiple forwarded files or media group albums are batched into a single queue message."""
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(parents=True)
+    db = SqliteDatabaseManager(tmp_path / "library.db")
+    repo = SqliteCatalogRepository(db)
+
+    f1 = scratch / "Track_01.flac"
+    f1.write_bytes(b"fLaC-track-01")
+    f2 = scratch / "Track_02.flac"
+    f2.write_bytes(b"fLaC-track-02")
+    f3 = scratch / "Track_03.flac"
+    f3.write_bytes(b"fLaC-track-03")
+
+    candidates = [
+        MetadataCandidate(
+            metadata=TrackMetadata(title="Song", artist="Artist", album="Album", year=2024, track_number=1),
+            confidence=0.99,
+        )
+    ]
+    pipeline = IngestionPipeline(
+        extractor=SevenZipArchiveExtractor(scratch_root=scratch),
+        fingerprinter=StubFingerprinter("FP_BATCH"),
+        metadata_provider=StubMetadataProvider(candidates),
+        lyrics_provider=StubLyricsProvider(),
+        organizer=LibraryOrganizer(tmp_path / "library"),
+        catalog_repository=repo,
+        auto_approve_confidence=0.90,
+    )
+    worker = IngestionQueueWorker(
+        pipeline=pipeline,
+        catalog_repository=repo,
+        governance_repository=repo,
+        concurrency_limit=2,
+    )
+
+    settings = sample_settings.model_copy(
+        update={
+            "storage_scratch_dir": scratch,
+            "database_path": tmp_path / "library.db",
+        }
+    )
+
+    async def _scenario() -> None:
+        await db.initialize()
+        uploader = UserAccount(
+            telegram_id=987654321,
+            display_name="MultiForwarder",
+            username="forwarder",
+            role=UserRole.UPLOADER,
+        )
+        await repo.upsert_user(uploader)
+
+        bot_mock = MagicMock()
+
+        # Mock get_file returning files that exist on disk
+        async def _mock_get_file(fid: str) -> MagicMock:
+            tg_f = MagicMock()
+            if fid == "f1":
+                tg_f.file_path = str(f1)
+            elif fid == "f2":
+                tg_f.file_path = str(f2)
+            elif fid == "f3":
+                tg_f.file_path = str(f3)
+            elif fid == "f_toobig":
+                raise TelegramBadRequest(method=MagicMock(), message="Bad Request: file is too big")
+            else:
+                tg_f.file_path = str(f1)
+            return tg_f
+
+        bot_mock.get_file = AsyncMock(side_effect=_mock_get_file)
+
+        # 1. Simulate 3 forwarded messages arriving together with forward_date
+        msg1 = MagicMock(spec=Message)
+        msg1.bot = bot_mock
+        msg1.chat = MagicMock(id=111222)
+        msg1.audio = MagicMock(file_id="f1", file_name="01. Song One.flac", file_size=10_000_000)
+        msg1.document = None
+        msg1.forward_date = 1700000000
+        msg1.media_group_id = None
+        msg1.answer = AsyncMock()
+
+        msg2 = MagicMock(spec=Message)
+        msg2.bot = bot_mock
+        msg2.chat = MagicMock(id=111222)
+        msg2.audio = MagicMock(file_id="f2", file_name="02. Song Two.flac", file_size=12_000_000)
+        msg2.document = None
+        msg2.forward_date = 1700000001
+        msg2.media_group_id = None
+        msg2.answer = AsyncMock()
+
+        msg3 = MagicMock(spec=Message)
+        msg3.bot = bot_mock
+        msg3.chat = MagicMock(id=111222)
+        msg3.audio = MagicMock(file_id="f3", file_name="03. Song Three.flac", file_size=15_000_000)
+        msg3.document = None
+        msg3.forward_date = 1700000002
+        msg3.media_group_id = None
+        msg3.answer = AsyncMock()
+
+        # Call with small debounce (0.1s)
+        await handle_incoming_media(
+            msg1,
+            current_user=uploader,
+            queue_worker=worker,
+            pipeline=pipeline,
+            governance_repository=repo,
+            settings=settings,
+            batch_debounce_seconds=0.1,
+        )
+        await handle_incoming_media(
+            msg2,
+            current_user=uploader,
+            queue_worker=worker,
+            pipeline=pipeline,
+            governance_repository=repo,
+            settings=settings,
+            batch_debounce_seconds=0.1,
+        )
+        await handle_incoming_media(
+            msg3,
+            current_user=uploader,
+            queue_worker=worker,
+            pipeline=pipeline,
+            governance_repository=repo,
+            settings=settings,
+            batch_debounce_seconds=0.1,
+        )
+
+        # Wait for debounce to complete
+        await asyncio.sleep(0.3)
+
+        # Only ONE single message was sent for the batch (to the last message in the batch)
+        assert msg1.answer.call_count == 0
+        assert msg2.answer.call_count == 0
+        assert msg3.answer.call_count == 1
+
+        batch_reply = str(msg3.answer.call_args[0][0])
+        assert "Ingestion Queued (3/3 files)" in batch_reply
+        assert "01. Song One.flac" in batch_reply
+        assert "02. Song Two.flac" in batch_reply
+        assert "03. Song Three.flac" in batch_reply
+
+        # All 3 were enqueued in repository
+        queued = await repo.list_queued_jobs()
+        assert len(queued) == 3
+        filenames = {j.original_filename for j in queued}
+        assert filenames == {"01. Song One.flac", "02. Song Two.flac", "03. Song Three.flac"}
+
+        # 2. Test Media Group album containing an oversized file (>20MB)
+        msg_ok = MagicMock(spec=Message)
+        msg_ok.bot = bot_mock
+        msg_ok.chat = MagicMock(id=333444)
+        msg_ok.audio = MagicMock(file_id="f1", file_name="Album_01.flac", file_size=18_000_000)
+        msg_ok.document = None
+        msg_ok.media_group_id = "album_999"
+        msg_ok.answer = AsyncMock()
+
+        msg_big = MagicMock(spec=Message)
+        msg_big.bot = bot_mock
+        msg_big.chat = MagicMock(id=333444)
+        msg_big.audio = MagicMock(file_id="f_toobig", file_name="Album_02_Big.flac", file_size=25_000_000)
+        msg_big.document = None
+        msg_big.media_group_id = "album_999"
+        msg_big.answer = AsyncMock()
+
+        await handle_incoming_media(
+            msg_ok,
+            current_user=uploader,
+            queue_worker=worker,
+            pipeline=pipeline,
+            governance_repository=repo,
+            settings=settings,
+            batch_debounce_seconds=0.1,
+        )
+        await handle_incoming_media(
+            msg_big,
+            current_user=uploader,
+            queue_worker=worker,
+            pipeline=pipeline,
+            governance_repository=repo,
+            settings=settings,
+            batch_debounce_seconds=0.1,
+        )
+
+        await asyncio.sleep(0.3)
+
+        assert msg_ok.answer.call_count == 0
+        assert msg_big.answer.call_count == 1
+        mixed_reply = str(msg_big.answer.call_args[0][0])
+        assert "Ingestion Queued (1/2 files)" in mixed_reply
+        assert "Album_01.flac" in mixed_reply
+        assert "Album_02_Big.flac" in mixed_reply
+        assert "exceeds Telegram Cloud Bot API 20 MB limit" in mixed_reply
+
+    asyncio.run(_scenario())
+
+
+def test_queue_worker_background_loop_and_missing_file_recovery(
+    tmp_path: Path,
+    sample_settings: AppSettings,
+) -> None:
+    """Verify background queue loop executes jobs and handles missing files without hanging."""
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(parents=True)
+    db = SqliteDatabaseManager(tmp_path / "library.db")
+    repo = SqliteCatalogRepository(db)
+
+    valid_audio = scratch / "Valid_Track.flac"
+    valid_audio.write_bytes(b"fLaC-valid-track")
+    ghost_audio = scratch / "NonExistent_Ghost.flac"
+
+    candidates = [
+        MetadataCandidate(
+            metadata=TrackMetadata(title="Valid", artist="Singer", album="Album", year=2024, track_number=1),
+            confidence=0.99,
+        )
+    ]
+    pipeline = IngestionPipeline(
+        extractor=SevenZipArchiveExtractor(scratch_root=scratch),
+        fingerprinter=StubFingerprinter("FP_VALID"),
+        metadata_provider=StubMetadataProvider(candidates),
+        lyrics_provider=StubLyricsProvider(),
+        organizer=LibraryOrganizer(tmp_path / "library"),
+        catalog_repository=repo,
+        auto_approve_confidence=0.90,
+    )
+    worker = IngestionQueueWorker(
+        pipeline=pipeline,
+        catalog_repository=repo,
+        governance_repository=repo,
+        concurrency_limit=1,
+    )
+
+    async def _scenario() -> None:
+        await db.initialize()
+        uploader = UserAccount(
+            telegram_id=123123123,
+            display_name="QueueTester",
+            username="queuetester",
+            role=UserRole.UPLOADER,
+        )
+        await repo.upsert_user(uploader)
+
+        # Enqueue ghost job first (missing file on disk)
+        ghost_job, _ = await worker.enqueue_job(
+            user=uploader,
+            source_path=ghost_audio,
+            original_filename="NonExistent_Ghost.flac",
+            file_size_bytes=20_000_000,
+        )
+        assert ghost_job.state == JobState.QUEUED
+
+        # Enqueue valid job second
+        valid_job, _ = await worker.enqueue_job(
+            user=uploader,
+            source_path=valid_audio,
+            original_filename="Valid_Track.flac",
+            file_size_bytes=valid_audio.stat().st_size,
+        )
+        assert valid_job.state == JobState.QUEUED
+
+        # Start autonomous queue loop
+        stop_event = asyncio.Event()
+        loop_task = asyncio.create_task(worker.run_worker_loop(stop_event=stop_event))
+
+        # Give worker loop time to process both jobs
+        for _ in range(30):
+            await asyncio.sleep(0.1)
+            g_check = await repo.get_job(ghost_job.job_id)
+            v_check = await repo.get_job(valid_job.job_id)
+            ghost_done = g_check is not None and g_check.state == JobState.FAILED
+            valid_done = v_check is not None and v_check.state == JobState.COMPLETED
+            if ghost_done and valid_done:
+                break
+
+        stop_event.set()
+        loop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await loop_task
+
+        # Verify ghost job was marked FAILED with clean error message
+        finished_ghost = await repo.get_job(ghost_job.job_id)
+        assert finished_ghost is not None
+        assert finished_ghost.state == JobState.FAILED
+        assert "Source audio file not found on disk" in (finished_ghost.error_message or "")
+
+        # Verify valid job was successfully processed to COMPLETED without being blocked!
+        finished_valid = await repo.get_job(valid_job.job_id)
+        assert finished_valid is not None
+        assert finished_valid.state == JobState.COMPLETED
 
     asyncio.run(_scenario())

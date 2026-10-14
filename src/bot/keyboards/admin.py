@@ -350,11 +350,13 @@ def build_oidc_link_keyboard(
 def build_main_menu_keyboard(user: UserAccount) -> ReplyKeyboardMarkup:
     """Create the persistent bottom `ReplyKeyboardMarkup` dock under the Telegram text input field."""
     builder = ReplyKeyboardBuilder()
-    builder.row(
-        KeyboardButton(text=BTN_MAIN_SONGS),
-        KeyboardButton(text=BTN_MAIN_QUEUE),
-        KeyboardButton(text=BTN_MAIN_SSO),
-    )
+    row1: list[KeyboardButton] = []
+    if has_permission(user, Permission.VIEW_CATALOG):
+        row1.append(KeyboardButton(text=BTN_MAIN_SONGS))
+    if has_permission(user, Permission.SUBMIT_INGESTION):
+        row1.append(KeyboardButton(text=BTN_MAIN_QUEUE))
+    row1.append(KeyboardButton(text=BTN_MAIN_SSO))
+    builder.row(*row1)
     if has_permission(user, Permission.MANAGE_USERS):
         builder.row(
             KeyboardButton(text=BTN_MAIN_ADMIN),
@@ -371,12 +373,21 @@ def build_access_request_approval_keyboard(request_id: int) -> InlineKeyboardMar
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(
+            text="Approve: Listener",
+            callback_data=AccessReqApproveCallback(
+                request_id=request_id,
+                role=UserRole.LISTENER.value,
+            ).pack(),
+        ),
+        InlineKeyboardButton(
             text="Approve: Uploader",
             callback_data=AccessReqApproveCallback(
                 request_id=request_id,
                 role=UserRole.UPLOADER.value,
             ).pack(),
         ),
+    )
+    builder.row(
         InlineKeyboardButton(
             text="Approve: Moderator",
             callback_data=AccessReqApproveCallback(
@@ -398,6 +409,7 @@ def build_queued_job_keyboard(
     state: JobState = JobState.QUEUED,
     back_callback: str | None = None,
     include_home: bool = False,
+    web_app_url: str | None = None,
 ) -> InlineKeyboardMarkup:
     """Create the ordered control keyboard for a queued, paused, or inspected ingestion job.
 
@@ -407,6 +419,13 @@ def build_queued_job_keyboard(
     Row 4: Navigation (`◀ Back` | `🏠 Menu`)
     """
     builder = InlineKeyboardBuilder()
+    if web_app_url and web_app_url.strip():
+        builder.row(
+            InlineKeyboardButton(
+                text="🚀 View in Mini App",
+                web_app=WebAppInfo(url=f"{web_app_url.strip().rstrip('/')}?startapp=job_{job_id}"),
+            )
+        )
     if state in {
         JobState.QUEUED,
         JobState.PROCESSING,
@@ -470,6 +489,36 @@ def build_queued_job_keyboard(
         builder,
         back_callback=effective_back,
         include_home=include_home or effective_back != MenuCallback(action="home").pack(),
+    )
+    return builder.as_markup()
+
+
+def build_batch_queued_keyboard(
+    job_ids: list[str],
+    *,
+    web_app_url: str | None = None,
+    back_callback: str | None = None,
+) -> InlineKeyboardMarkup:
+    """Build a consolidated inline keyboard for a batch of queued files."""
+    builder = InlineKeyboardBuilder()
+    if web_app_url and web_app_url.strip():
+        builder.row(
+            InlineKeyboardButton(
+                text="🚀 View in Mini App",
+                web_app=WebAppInfo(url=f"{web_app_url.strip().rstrip('/')}?startapp=queue"),
+            )
+        )
+    builder.row(
+        InlineKeyboardButton(
+            text="📋 View Queue",
+            callback_data=QueueActionCallback(action="mine").pack(),
+        ),
+    )
+    effective_back = back_callback or MenuCallback(action="home").pack()
+    append_escape_row(
+        builder,
+        back_callback=effective_back,
+        include_home=effective_back != MenuCallback(action="home").pack(),
     )
     return builder.as_markup()
 
