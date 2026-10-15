@@ -28,6 +28,7 @@ from src.core.models import (
     TrackMetadata,
 )
 from src.core.ports import GovernanceRepositoryPort
+from src.core.throttler import ApiThrottler, default_api_throttler
 
 logger = logging.getLogger(__name__)
 
@@ -415,6 +416,7 @@ class LibraryOrganizer:
         cover_art_base_url: str = "https://coverartarchive.org",
         transport: httpx.AsyncBaseTransport | None = None,
         enable_network: bool = False,
+        throttler: ApiThrottler | None = None,
     ) -> None:
         self._library_root = library_root
         parsed_umask = _parse_umask_mode(umask)
@@ -425,6 +427,7 @@ class LibraryOrganizer:
         self._cover_art_base_url = cover_art_base_url.rstrip("/")
         self._transport = transport
         self._enable_network = enable_network
+        self._throttler = throttler or default_api_throttler
         self._is_reconciling: bool = False
         self._reconciliation_status: str = "idle"
 
@@ -537,6 +540,7 @@ class LibraryOrganizer:
             else:
                 url = f"{self._cover_art_base_url}/release/{rel_mbid}/front"
             try:
+                await self._throttler.throttle("coverartarchive")
                 async with httpx.AsyncClient(
                     transport=self._transport,
                     follow_redirects=True,

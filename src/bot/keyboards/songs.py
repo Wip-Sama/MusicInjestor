@@ -158,7 +158,11 @@ def build_songs_search_menu_keyboard(
             InlineKeyboardButton(
                 text="🔄 Rescan Library Folder",
                 callback_data=SongsMenuCallback(action="rescan_dryrun").pack(),
-            )
+            ),
+            InlineKeyboardButton(
+                text="✨ Bulk Re-Search",
+                callback_data=SongsMenuCallback(action="bulk_menu").pack(),
+            ),
         )
 
     if is_filtered:
@@ -505,6 +509,50 @@ def build_input_cancel_keyboard(track_id: str) -> InlineKeyboardMarkup:
     append_escape_row(
         builder,
         back_callback=SongsTrackCallback(action="view", track_id=sid).pack(),
+        include_home=True,
+    )
+    return builder.as_markup()
+
+
+def build_bulk_research_menu_keyboard() -> InlineKeyboardMarkup:
+    """Build the scope selection keyboard for planned bulk metadata & lyrics re-search (Level 2)."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="🔍 All Library Tracks",
+            callback_data=SongsMenuCallback(action="bulk_plan_all").pack(),
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="📝 Missing Lyrics Only",
+            callback_data=SongsMenuCallback(action="bulk_plan_missing_lyrics").pack(),
+        ),
+        InlineKeyboardButton(
+            text="🏷️ Missing MBID Tags",
+            callback_data=SongsMenuCallback(action="bulk_plan_missing_mbid").pack(),
+        ),
+    )
+    append_escape_row(
+        builder,
+        back_callback=SongsMenuCallback(action="list").pack(),
+        include_home=True,
+    )
+    return builder.as_markup()
+
+
+def build_bulk_research_plan_keyboard(filter_mode: str) -> InlineKeyboardMarkup:
+    """Build the execution confirmation keyboard for a planned bulk research run."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="🚀 Start Bulk Re-Search",
+            callback_data=SongsMenuCallback(action=f"bulk_run_{filter_mode}").pack(),
+        )
+    )
+    append_escape_row(
+        builder,
+        back_callback=SongsMenuCallback(action="bulk_menu").pack(),
         include_home=True,
     )
     return builder.as_markup()

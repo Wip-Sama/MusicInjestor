@@ -9,6 +9,7 @@ import httpx
 
 from src.core.exceptions import FingerprintingError
 from src.core.models import AudioFingerprint
+from src.core.throttler import ApiThrottler, default_api_throttler
 
 logger = logging.getLogger(__name__)
 
@@ -23,12 +24,14 @@ class ChromaprintFingerprinter:
         acoustid_base_url: str = "https://api.acoustid.org/v2/lookup",
         timeout_seconds: float = 10.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        throttler: ApiThrottler | None = None,
     ) -> None:
         self._fpcalc_binary = fpcalc_binary
         self._acoustid_api_key = acoustid_api_key.strip()
         self._acoustid_base_url = acoustid_base_url
         self._timeout = timeout_seconds
         self._transport = transport
+        self._throttler = throttler or default_api_throttler
 
     async def compute_fingerprint(self, audio_path: Path) -> AudioFingerprint:
         """Execute `fpcalc -json` asynchronously to extract duration, Chromaprint hash, and AcoustID MBID."""
@@ -91,6 +94,7 @@ class ChromaprintFingerprinter:
             "meta": "recordings releasegroups compress",
         }
         try:
+            await self._throttler.throttle("acoustid")
             async with httpx.AsyncClient(
                 timeout=self._timeout,
                 transport=self._transport,

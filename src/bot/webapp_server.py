@@ -20,6 +20,7 @@ from mutagen.mp4 import MP4Cover
 
 from src.bot.auth import TelegramInitDataValidationError, validate_telegram_init_data
 from src.bot.oidc_server import OidcCallbackCoordinator
+from src.core.bulk_research import BulkResearchService
 from src.core.exceptions import OidcAuthenticationError, PermissionDeniedError
 from src.core.extractor import SUPPORTED_ARCHIVE_EXTENSIONS, SUPPORTED_AUDIO_EXTENSIONS
 from src.core.lyrics import LrclibLyricsClient
@@ -45,6 +46,11 @@ from src.core.rbac import (
     GovernanceService,
     has_permission,
     require_permission,
+)
+from src.core.transcoder import (
+    async_transcode_audio,
+    default_transcode_cache,
+    is_ffmpeg_available,
 )
 
 logger = logging.getLogger(__name__)
@@ -139,51 +145,98 @@ DEFAULT_COVER_SVG: str = (
 )
 
 
+_COVER_CACHE: dict[str, tuple[bytes, str]] = {}
+_COVER_CACHE_MAX_ENTRIES = 256
+
+
 def extract_cover_bytes(audio_path: Path) -> tuple[bytes, str] | None:
-    """Extract embedded cover image bytes and mime type from audio file if available."""
+    """Extract embedded cover image bytes and mime type from audio file if available.
+
+    Uses an in-RAM cache to avoid repeated disk reads and mutagen decoding. When embedded
+    artwork is discovered inside FLAC/MP3 files, it also opportunistically writes a
+    sidecar `cover.jpg` next to the audio file so subsequent reads bypass decoding entirely.
+    """
+    if not audio_path.is_file():
+        return None
+
+    try:
+        mtime = audio_path.stat().st_mtime_ns
+    except OSError:
+        mtime = 0
+
+    cache_key = f"{audio_path.resolve()}:{mtime}"
+    if cache_key in _COVER_CACHE:
+        return _COVER_CACHE[cache_key]
+
     cover_file = audio_path.parent / "cover.jpg"
     if cover_file.is_file():
         try:
-            return cover_file.read_bytes(), "image/jpeg"
+            data = cover_file.read_bytes(), "image/jpeg"
+            if len(_COVER_CACHE) >= _COVER_CACHE_MAX_ENTRIES:
+                _COVER_CACHE.pop(next(iter(_COVER_CACHE)))
+            _COVER_CACHE[cache_key] = data
+            return data
         except Exception:
             pass
 
     png_cover = audio_path.parent / "cover.png"
     if png_cover.is_file():
         try:
-            return png_cover.read_bytes(), "image/png"
+            data = png_cover.read_bytes(), "image/png"
+            if len(_COVER_CACHE) >= _COVER_CACHE_MAX_ENTRIES:
+                _COVER_CACHE.pop(next(iter(_COVER_CACHE)))
+            _COVER_CACHE[cache_key] = data
+            return data
         except Exception:
             pass
-
-    if not audio_path.is_file():
-        return None
 
     try:
         f = mutagen.File(audio_path)
         if f is None:
             return None
 
+        result: tuple[bytes, str] | None = None
+
         # FLAC pictures
         pictures = getattr(f, "pictures", None)
         if pictures:
             mime = (getattr(pictures[0], "mime", None) or "").strip() or "image/jpeg"
-            return bytes(pictures[0].data), mime
+            result = bytes(pictures[0].data), mime
 
         # MP3 ID3 tags
-        tags = getattr(f, "tags", None)
-        if tags:
-            for tag in tags.values():
-                if getattr(tag, "FrameID", None) == "APIC":
-                    return bytes(tag.data), getattr(tag, "mime", "image/jpeg")
+        if result is None:
+            tags = getattr(f, "tags", None)
+            if tags:
+                for tag in tags.values():
+                    if getattr(tag, "FrameID", None) == "APIC":
+                        result = bytes(tag.data), getattr(tag, "mime", "image/jpeg")
+                        break
 
         # MP4 covr atoms
-        if hasattr(f, "tags") and f.tags:
+        if result is None and hasattr(f, "tags") and f.tags:
             covr = f.tags.get("covr")
             if covr and len(covr) > 0:
                 img_data = bytes(covr[0])
                 fmt = getattr(covr[0], "imageformat", None)
                 mime = "image/png" if fmt == MP4Cover.FORMAT_PNG else "image/jpeg"
-                return img_data, mime
+                result = img_data, mime
+
+        if result is not None:
+            # Cache in RAM
+            if len(_COVER_CACHE) >= _COVER_CACHE_MAX_ENTRIES:
+                _COVER_CACHE.pop(next(iter(_COVER_CACHE)))
+            _COVER_CACHE[cache_key] = result
+
+            # Write-through sidecar cache to speed up all future accesses
+            try:
+                target_ext = ".png" if result[1] == "image/png" else ".jpg"
+                target_sidecar = audio_path.parent / f"cover{target_ext}"
+                if not target_sidecar.exists():
+                    target_sidecar.write_bytes(result[0])
+            except Exception:
+                pass
+
+            return result
     except Exception:
         pass
 
@@ -525,17 +578,31 @@ def build_webapp_api(
         cover_art = extract_cover_bytes(record.storage_path)
         if cover_art is not None:
             img_bytes, mime_type = cover_art
+            etag = f'"{hashlib.md5(img_bytes[:512] + str(len(img_bytes)).encode()).hexdigest()}"'
+            if request.headers.get("If-None-Match") == etag:
+                return web.Response(
+                    status=304,
+                    headers={
+                        "ETag": etag,
+                        "Cache-Control": "public, max-age=604800, immutable",
+                        "Access-Control-Allow-Origin": "*",
+                    },
+                )
             return web.Response(
                 body=img_bytes,
                 content_type=mime_type,
-                headers={"Cache-Control": "public, max-age=604800, immutable"},
+                headers={
+                    "ETag": etag,
+                    "Cache-Control": "public, max-age=604800, immutable",
+                    "Access-Control-Allow-Origin": "*",
+                },
             )
 
         return web.Response(text=DEFAULT_COVER_SVG, content_type="image/svg+xml")
 
     app.router.add_get("/api/v1/app/tracks/{track_id}/cover", handle_get_cover)
 
-    # 2.4 Audio streaming with HTTP 206 Partial Content range support
+    # 2.4 Audio streaming with HTTP 206 Partial Content range support & on-the-fly RAM transcoding
     async def handle_get_audio(request: web.Request) -> web.StreamResponse:
         user, _ = await authenticate_tma_request(
             request=request,
@@ -565,6 +632,74 @@ def build_webapp_api(
             )
 
         ext = record.storage_path.suffix.lower()
+        req_format = request.query.get("format", "auto").strip().lower()
+        bitrate_kbps = 128
+        with contextlib.suppress(Exception):
+            bitrate_kbps = int(request.query.get("bitrate", "128"))
+
+        # On-the-fly server-side transcoding in RAM for heavy FLAC tracks or when requested
+        want_transcode = req_format in {"opus", "mp3"} or (req_format == "auto" and ext == ".flac")
+        if want_transcode and is_ffmpeg_available():
+            target_fmt = "mp3" if req_format == "mp3" else "opus"
+            target_mime = "audio/mpeg" if target_fmt == "mp3" else "audio/ogg; codecs=opus"
+            transcoded_data = await default_transcode_cache.get(record.storage_path, target_fmt, bitrate_kbps)
+            if transcoded_data is None:
+                try:
+                    transcoded_data = await async_transcode_audio(
+                        record.storage_path,
+                        target_format=target_fmt,
+                        bitrate_kbps=bitrate_kbps,
+                    )
+                    await default_transcode_cache.put(
+                        record.storage_path, target_fmt, bitrate_kbps, transcoded_data
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "On-the-fly transcoding failed for %s (%s): %s; streaming original",
+                        record.id,
+                        target_fmt,
+                        exc,
+                    )
+                    transcoded_data = None
+
+            if transcoded_data is not None:
+                total_len = len(transcoded_data)
+                range_header = request.headers.get("Range", "").strip()
+                if range_header.startswith("bytes="):
+                    try:
+                        range_spec = range_header[6:].split("-", 1)
+                        start = int(range_spec[0]) if range_spec[0] else 0
+                        end = int(range_spec[1]) if len(range_spec) > 1 and range_spec[1] else total_len - 1
+                        start = max(0, min(start, total_len - 1))
+                        end = max(start, min(end, total_len - 1))
+                        slice_bytes = transcoded_data[start : end + 1]
+                        return web.Response(
+                            status=206,
+                            body=slice_bytes,
+                            headers={
+                                "Content-Type": target_mime,
+                                "Content-Range": f"bytes {start}-{end}/{total_len}",
+                                "Content-Length": str(len(slice_bytes)),
+                                "Accept-Ranges": "bytes",
+                                "Cache-Control": "public, max-age=86400",
+                                "Access-Control-Allow-Origin": "*",
+                            },
+                        )
+                    except Exception:
+                        pass
+
+                return web.Response(
+                    status=200,
+                    body=transcoded_data,
+                    headers={
+                        "Content-Type": target_mime,
+                        "Content-Length": str(total_len),
+                        "Accept-Ranges": "bytes",
+                        "Cache-Control": "public, max-age=86400",
+                        "Access-Control-Allow-Origin": "*",
+                    },
+                )
+
         content_type = "audio/mpeg"
         if ext == ".flac":
             content_type = "audio/flac"
@@ -1360,6 +1495,142 @@ def build_webapp_api(
         )
 
     app.router.add_post("/api/v1/app/tracks/{track_id}/auto-lyrics", handle_auto_lyrics)
+
+    # 2.12 Planned bulk metadata & lyrics re-search endpoints
+    async def handle_bulk_research_plan(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        if not has_permission(user, Permission.REQUEST_TAG_CORRECTION):
+            raise web.HTTPForbidden(
+                text=json.dumps({"error": "Permission denied: UPLOADER role or above required."}),
+                content_type="application/json",
+            )
+        if (
+            catalog_repository is None
+            or metadata_service is None
+            or lyrics_client is None
+            or organizer is None
+        ):
+            raise web.HTTPServiceUnavailable(
+                text=json.dumps({"error": "Bulk research services unavailable."}),
+                content_type="application/json",
+            )
+
+        body: dict[str, Any] = {}
+        with contextlib.suppress(Exception):
+            parsed = await request.json()
+            if isinstance(parsed, dict):
+                body = parsed
+
+        raw_ids = body.get("track_ids")
+        track_ids = [str(t).strip() for t in raw_ids if str(t).strip()] if isinstance(raw_ids, list) else None
+        filter_mode = str(body.get("filter_mode", "all")).strip()
+        search_metadata = bool(body.get("search_metadata", True))
+        search_lyrics = bool(body.get("search_lyrics", True))
+        auto_apply = bool(body.get("auto_apply", True))
+
+        bulk_service = BulkResearchService(
+            catalog_repository=catalog_repository,
+            metadata_service=metadata_service,
+            lyrics_client=lyrics_client,
+            organizer=organizer,
+        )
+
+        plan = await bulk_service.plan_bulk_research(
+            track_ids=track_ids,
+            filter_mode=filter_mode,
+            search_metadata=search_metadata,
+            search_lyrics=search_lyrics,
+            auto_apply=auto_apply,
+        )
+
+        return web.json_response(
+            {
+                "track_ids": plan.track_ids,
+                "total_tracks": plan.total_tracks,
+                "missing_lyrics_count": plan.missing_lyrics_count,
+                "missing_mbid_count": plan.missing_mbid_count,
+                "estimated_seconds": plan.estimated_seconds,
+                "search_metadata": plan.search_metadata,
+                "search_lyrics": plan.search_lyrics,
+                "auto_apply": plan.auto_apply,
+            }
+        )
+
+    app.router.add_post("/api/v1/app/tracks/bulk-research/plan", handle_bulk_research_plan)
+
+    async def handle_bulk_research_execute(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        if not has_permission(user, Permission.REQUEST_TAG_CORRECTION):
+            raise web.HTTPForbidden(
+                text=json.dumps({"error": "Permission denied: UPLOADER role or above required."}),
+                content_type="application/json",
+            )
+        if (
+            catalog_repository is None
+            or metadata_service is None
+            or lyrics_client is None
+            or organizer is None
+        ):
+            raise web.HTTPServiceUnavailable(
+                text=json.dumps({"error": "Bulk research services unavailable."}),
+                content_type="application/json",
+            )
+
+        body: dict[str, Any] = {}
+        with contextlib.suppress(Exception):
+            parsed = await request.json()
+            if isinstance(parsed, dict):
+                body = parsed
+
+        raw_ids = body.get("track_ids")
+        track_ids = [str(t).strip() for t in raw_ids if str(t).strip()] if isinstance(raw_ids, list) else None
+        filter_mode = str(body.get("filter_mode", "all")).strip()
+        search_metadata = bool(body.get("search_metadata", True))
+        search_lyrics = bool(body.get("search_lyrics", True))
+        auto_apply = bool(body.get("auto_apply", True))
+
+        bulk_service = BulkResearchService(
+            catalog_repository=catalog_repository,
+            metadata_service=metadata_service,
+            lyrics_client=lyrics_client,
+            organizer=organizer,
+        )
+
+        plan = await bulk_service.plan_bulk_research(
+            track_ids=track_ids,
+            filter_mode=filter_mode,
+            search_metadata=search_metadata,
+            search_lyrics=search_lyrics,
+            auto_apply=auto_apply,
+        )
+
+        report = await bulk_service.execute_bulk_research(
+            plan,
+            actor_id=user.telegram_id,
+            actor_name=user.display_name,
+        )
+
+        return web.json_response(
+            {
+                "total_tracks": report.total_tracks,
+                "applied_count": report.applied_count,
+                "needs_review_count": report.needs_review_count,
+                "skipped_count": report.skipped_count,
+                "failed_count": report.failed_count,
+                "elapsed_seconds": report.elapsed_seconds,
+                "details": report.details,
+            }
+        )
+
+    app.router.add_post("/api/v1/app/tracks/bulk-research/execute", handle_bulk_research_execute)
 
     # 2.8 Ingestion Hub & Live Queue Board Endpoints (Phase 4)
     async def handle_ingest_upload(request: web.Request) -> web.Response:

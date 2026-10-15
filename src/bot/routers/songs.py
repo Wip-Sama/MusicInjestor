@@ -27,6 +27,8 @@ from src.bot.keyboards.songs import (
     SongsPageCallback,
     SongsSortCallback,
     SongsToggleFieldCallback,
+    build_bulk_research_menu_keyboard,
+    build_bulk_research_plan_keyboard,
     build_dry_run_confirmation_keyboard,
     build_input_cancel_keyboard,
     build_lyrics_input_keyboard,
@@ -51,6 +53,7 @@ from src.bot.ui import (
 )
 from src.config.settings import AppSettings
 from src.core.audit import format_job_inspector_card
+from src.core.bulk_research import BulkResearchService
 from src.core.extractor import SUPPORTED_ARCHIVE_EXTENSIONS, SUPPORTED_AUDIO_EXTENSIONS
 from src.core.lyrics import LrclibLyricsClient
 from src.core.metadata import (
@@ -1241,6 +1244,9 @@ async def handle_songs_callback(
     mutation_actions = {
         "rescan_dryrun",
         "rescan_apply",
+        "bulk_run_all",
+        "bulk_run_missing_lyrics",
+        "bulk_run_missing_mbid",
         "edit_meta",
         "field",
         "edit_cover",
@@ -1512,6 +1518,116 @@ async def handle_songs_callback(
                 can_rescan=True,
                 back_callback=back_cb,
             ),
+        )
+        return
+
+    # 4. Planned Bulk Metadata & Lyrics Re-Search
+    if action == "bulk_menu":
+        await ack_callback(callback)
+        await safe_edit_text(
+            msg,
+            format_screen(
+                title="✨ Planned Bulk Metadata Re-Search",
+                context_lines=[
+                    "Automatically re-query <b>MusicBrainz</b>, <b>Genius</b>, <b>Last.fm</b>, and "
+                    "<b>LRCLIB</b> for multiple library tracks in a polite, rate-throttled batch.",
+                    "• Rate-limiting: Requests are throttled to official API limits "
+                    "(1 req/s MusicBrainz, 3 req/s LRCLIB) to prevent rate limit blocks (HTTP 429).",
+                    "• Dry-run: A preview of tracks and estimated duration will be displayed.",
+                ],
+                footer_lines=["<i>🧭 Home › Songs › Bulk Re-Search</i>"],
+            ),
+            reply_markup=build_bulk_research_menu_keyboard(),
+        )
+        return
+
+    if action.startswith("bulk_plan_"):
+        await ack_callback(callback)
+        filter_mode = action[len("bulk_plan_") :]
+        filter_labels = {
+            "all": "All Library Tracks",
+            "missing_lyrics": "Tracks Missing Lyrics",
+            "missing_mbid": "Tracks Missing MusicBrainz Tags",
+        }
+        filter_name = filter_labels.get(filter_mode, filter_mode)
+
+        meta_svc = _resolve_metadata_service(pipeline, settings)
+        lyrics_client = _resolve_lyrics_client(pipeline, settings)
+        bulk_svc = BulkResearchService(
+            catalog_repository=governance_repository,
+            metadata_service=meta_svc,
+            lyrics_client=lyrics_client,
+            organizer=organizer,
+        )
+
+        plan = await bulk_svc.plan_bulk_research(filter_mode=filter_mode)
+        est_min = plan.estimated_seconds // 60
+        est_sec = plan.estimated_seconds % 60
+        time_str = f"{est_min}m {est_sec}s" if est_min > 0 else f"{est_sec}s"
+
+        await safe_edit_text(
+            msg,
+            format_screen(
+                title=f"📋 Bulk Re-Search Plan: {html.escape(filter_name)}",
+                context_lines=[
+                    f"• Target Scope: <b>{html.escape(filter_name)}</b>",
+                    f"• Tracks Selected: <b>{plan.total_tracks}</b>",
+                    f"• Missing Lyrics: <b>{plan.missing_lyrics_count}</b>",
+                    f"• Missing MBID Tags: <b>{plan.missing_mbid_count}</b>",
+                    f"• Estimated Duration: <b>~{time_str}</b> (at safe throttled speeds)",
+                    "• High-confidence matches (&gt;= 98%) and fetched lyrics will be applied automatically.",
+                ],
+                footer_lines=["<i>🧭 Home › Songs › Bulk Re-Search › Plan</i>"],
+            ),
+            reply_markup=build_bulk_research_plan_keyboard(filter_mode),
+        )
+        return
+
+    if action.startswith("bulk_run_"):
+        await ack_callback(callback, "Bulk re-search started.")
+        filter_mode = action[len("bulk_run_") :]
+        meta_svc = _resolve_metadata_service(pipeline, settings)
+        lyrics_client = _resolve_lyrics_client(pipeline, settings)
+        bulk_svc = BulkResearchService(
+            catalog_repository=governance_repository,
+            metadata_service=meta_svc,
+            lyrics_client=lyrics_client,
+            organizer=organizer,
+        )
+
+        plan = await bulk_svc.plan_bulk_research(filter_mode=filter_mode)
+        await safe_edit_text(
+            msg,
+            format_loading_card(
+                "Executing Bulk Re-Search",
+                f"Starting throttled metadata & lyrics re-search across {plan.total_tracks} tracks...",
+                "🧭 Home › Songs › Bulk Re-Search",
+            ),
+        )
+
+        actor_id = current_user.telegram_id if current_user is not None else 0
+        actor_name = current_user.display_name if current_user is not None else "Admin"
+
+        report = await bulk_svc.execute_bulk_research(
+            plan,
+            actor_id=actor_id,
+            actor_name=actor_name,
+        )
+
+        await safe_edit_text(
+            msg,
+            format_screen(
+                title="✅ Bulk Re-Search Completed",
+                context_lines=[
+                    f"• Total Processed: <b>{report.total_tracks}</b>",
+                    f"• Successfully Enriched: <b>{report.applied_count}</b>",
+                    f"• Unchanged / Skipped: <b>{report.skipped_count}</b>",
+                    f"• Errors / Failed: <b>{report.failed_count}</b>",
+                    f"• Total Duration: <b>{report.elapsed_seconds}s</b>",
+                ],
+                footer_lines=["<i>🧭 Home › Songs › Bulk Re-Search › Results</i>"],
+            ),
+            reply_markup=build_bulk_research_menu_keyboard(),
         )
         return
 

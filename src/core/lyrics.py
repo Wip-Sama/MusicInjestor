@@ -11,6 +11,7 @@ from src.core.metadata import (
     extract_title_search_variants,
 )
 from src.core.models import LyricsData, TrackMetadata
+from src.core.throttler import ApiThrottler, default_api_throttler
 
 logger = logging.getLogger(__name__)
 
@@ -95,10 +96,12 @@ class LrclibLyricsClient:
         base_url: str = "https://lrclib.net/api",
         timeout_seconds: float = 10.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        throttler: ApiThrottler | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout_seconds
         self._transport = transport
+        self._throttler = throttler or default_api_throttler
 
     async def fetch_lyrics(self, metadata: TrackMetadata) -> LyricsData | None:
         """Query `/get` on LRCLIB using artist/title variants, falling back to `/search` on 404."""
@@ -123,6 +126,7 @@ class LrclibLyricsClient:
                         if metadata.duration_seconds is not None:
                             params["duration"] = metadata.duration_seconds
 
+                        await self._throttler.throttle("lrclib")
                         response = await client.get(get_url, params=params)
                         if response.status_code != 200:
                             continue
@@ -155,6 +159,7 @@ class LrclibLyricsClient:
                 best_hit: dict[str, object] | None = None
                 best_score = 0.0
                 for q_params in search_queries:
+                    await self._throttler.throttle("lrclib")
                     resp = await client.get(search_url, params=q_params)
                     if resp.status_code != 200:
                         continue

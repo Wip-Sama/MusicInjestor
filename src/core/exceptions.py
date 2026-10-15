@@ -38,3 +38,7 @@ class OidcAuthenticationError(IngestionError):
 
 class QueueConcurrencyError(IngestionError):
     """Raised when an invalid concurrency limit or queue state transition is requested."""
+
+
+class AudioTranscodingError(IngestionError):
+    """Raised when on-the-fly server-side audio transcoding fails."""

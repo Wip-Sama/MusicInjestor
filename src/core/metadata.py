@@ -13,6 +13,7 @@ import musicbrainzngs
 import mutagen
 
 from src.core.models import AudioFingerprint, MetadataCandidate, TrackMetadata
+from src.core.throttler import ApiThrottler, default_api_throttler
 
 logger = logging.getLogger(__name__)
 
@@ -923,6 +924,7 @@ class MusicBrainzMetadataService:
         search_fn: MusicBrainzSearchFn | None = None,
         release_lookup_fn: ReleaseLookupFn | None = None,
         http_transport: httpx.BaseTransport | None = None,
+        throttler: ApiThrottler | None = None,
     ) -> None:
         self._app_name = app_name
         self._app_version = app_version
@@ -933,6 +935,7 @@ class MusicBrainzMetadataService:
         self._search_fn = search_fn
         self._release_lookup_fn = release_lookup_fn
         self._http_transport = http_transport
+        self._throttler = throttler or default_api_throttler
         musicbrainzngs.set_useragent(self._app_name, self._app_version, self._contact)
 
     async def read_local_metadata(self, audio_path: Path) -> TrackMetadata:
@@ -953,6 +956,8 @@ class MusicBrainzMetadataService:
             return []
         if not (self._enable_network or self._release_lookup_fn is not None):
             return []
+        if self._enable_network:
+            await self._throttler.throttle("musicbrainz")
         return await asyncio.to_thread(
             self._fetch_release_tracks_sync,
             clean_mbid,
@@ -1088,6 +1093,12 @@ class MusicBrainzMetadataService:
             self._app_version,
         )
         if self._enable_network or self._search_fn is not None or self._http_transport is not None:
+            if self._enable_network:
+                await self._throttler.throttle("musicbrainz")
+                if self._genius_access_token:
+                    await self._throttler.throttle("genius")
+                if self._lastfm_api_key:
+                    await self._throttler.throttle("lastfm")
             candidates = await asyncio.to_thread(
                 self._search_all_providers_sync,
                 local_metadata,

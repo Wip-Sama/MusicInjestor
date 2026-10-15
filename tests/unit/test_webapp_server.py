@@ -5,16 +5,24 @@ import json
 import time
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, patch
 from urllib.parse import quote
 
 import httpx
 import pytest
 from aiohttp import web
 
-from src.bot.webapp_server import BotWebServer
+from src.bot.webapp_server import (
+    _COVER_CACHE,
+    _COVER_CACHE_MAX_ENTRIES,
+    BotWebServer,
+    extract_cover_bytes,
+)
+from src.core.exceptions import OidcAuthenticationError, PermissionDeniedError
 from src.core.lyrics import LrclibLyricsClient
 from src.core.metadata import MusicBrainzMetadataService
 from src.core.models import (
+    AccessRequestStatus,
     IngestionJob,
     IngestionResult,
     JobState,
@@ -26,6 +34,7 @@ from src.core.models import (
     UserAccount,
     UserRole,
 )
+from src.core.oidc import OidcSyncOutcome
 from src.core.organizer import LibraryOrganizer
 from src.core.queue import IngestionQueueWorker
 from src.core.rbac import GovernanceService
@@ -45,6 +54,7 @@ async def _setup_test_server(
     queue_worker: IngestionQueueWorker | None = None,
     pipeline: Any = None,
     scratch_dir: Path | None = None,
+    coordinator: Any = None,
 ) -> tuple[BotWebServer, SqliteCatalogRepository]:
     """Helper bootstrapping SQLite persistence, GovernanceService, and BotWebServer on an ephemeral port."""
     db_manager = SqliteDatabaseManager(tmp_path / "webapp_test.db")
@@ -55,7 +65,7 @@ async def _setup_test_server(
     server = BotWebServer(
         bot_token=TEST_BOT_TOKEN,
         governance_service=gov_service,
-        coordinator=None,
+        coordinator=coordinator,
         static_dir=static_dir,
         host="127.0.0.1",
         port=0,
@@ -71,6 +81,15 @@ async def _setup_test_server(
     )
     await server.start()
     return server, repo
+
+
+def _make_dev_token(telegram_id: int) -> str:
+    """Helper building a valid signed TMA initData token for `telegram_id`."""
+    user_json = json.dumps(
+        {"id": telegram_id, "first_name": "Test", "username": "testuser"},
+        separators=(",", ":"),
+    )
+    return _build_signed_init_data({"auth_date": str(int(time.time())), "user": user_json})
 
 
 @pytest.mark.anyio
@@ -1551,5 +1570,846 @@ async def test_apply_edit_selective_accepted_fields(tmp_path: Path) -> None:
             track_after_none = await repo.get_library_track("trk_selective")
             assert track_after_none is not None
             assert track_after_none.title == "New Song Title"  # Preserved!
+    finally:
+        await server.stop()
+
+
+@pytest.mark.anyio
+async def test_track_audio_transcoding_and_cover_etag(tmp_path: Path) -> None:
+    """Verify cover ETag 304 response and on-the-fly audio transcoding with Range requests."""
+    organizer = LibraryOrganizer(library_root=tmp_path / "lib", enable_network=False)
+    server, repo = await _setup_test_server(
+        tmp_path, owner_telegram_ids=(123456,), dev_mode=True, organizer=organizer
+    )
+    try:
+        song_dir = tmp_path / "lib" / "Singer" / "Album"
+        song_dir.mkdir(parents=True)
+        flac_path = song_dir / "song.flac"
+        flac_path.write_bytes(b"fLaC" + b"\x00" * 200)
+        cover_path = song_dir / "cover.jpg"
+        cover_path.write_bytes(b"JPEG_COVER_BYTES_123")
+
+        rec = LibraryTrackRecord(
+            id="trk_transcode1",
+            job_id="job_trans",
+            uploaded_by=123456,
+            title="FLAC Song",
+            artist="Singer",
+            album="Album",
+            duration_seconds=210,
+            storage_path=flac_path,
+            fingerprint="fp_flac_test",
+        )
+        await repo.upsert_scanned_library_track(rec)
+
+        base_url = f"http://127.0.0.1:{server.bound_port}"
+        dev_token = _make_dev_token(123456)
+        headers = {"Authorization": f"tma {dev_token}"}
+
+        async with httpx.AsyncClient() as client:
+            # 1. Cover retrieval with ETag
+            resp_cover = await client.get(
+                f"{base_url}/api/v1/app/tracks/trk_transcode1/cover", headers=headers
+            )
+            assert resp_cover.status_code == 200
+            assert "ETag" in resp_cover.headers
+            etag = resp_cover.headers["ETag"]
+
+            # Repeat with If-None-Match -> 304 Not Modified
+            resp_304 = await client.get(
+                f"{base_url}/api/v1/app/tracks/trk_transcode1/cover",
+                headers={**headers, "If-None-Match": etag},
+            )
+            assert resp_304.status_code == 304
+
+            # 2. Audio transcoding with mock ffmpeg
+            with (
+                patch("src.bot.webapp_server.is_ffmpeg_available", return_value=True),
+                patch(
+                    "src.bot.webapp_server.async_transcode_audio",
+                    return_value=b"TRANSCODED_OPUS_BYTES_STREAM_DATA",
+                ),
+            ):
+                # Full retrieval
+                resp_audio = await client.get(
+                    f"{base_url}/api/v1/app/tracks/trk_transcode1/audio?format=opus",
+                    headers=headers,
+                )
+                assert resp_audio.status_code == 200
+                assert "audio/ogg" in resp_audio.headers["Content-Type"]
+                assert resp_audio.content == b"TRANSCODED_OPUS_BYTES_STREAM_DATA"
+
+                # Range request (HTTP 206)
+                resp_range = await client.get(
+                    f"{base_url}/api/v1/app/tracks/trk_transcode1/audio?format=opus",
+                    headers={**headers, "Range": "bytes=0-9"},
+                )
+                assert resp_range.status_code == 206
+                assert resp_range.content == b"TRANSCODED"
+    finally:
+        await server.stop()
+
+
+@pytest.mark.anyio
+async def test_bulk_research_plan_and_execute_endpoints(tmp_path: Path) -> None:
+    """Verify POST /api/v1/app/tracks/bulk-research/plan and execute endpoints."""
+    meta_svc = AsyncMock()
+    meta_svc.read_local_metadata.return_value = TrackMetadata(
+        title="Bulk Song", artist="Artist", album="Album"
+    )
+    meta_svc.find_candidates.return_value = []
+    lyrics_cli = AsyncMock()
+    lyrics_cli.fetch_lyrics.return_value = None
+    organizer = LibraryOrganizer(library_root=tmp_path / "lib", enable_network=False)
+    server, repo = await _setup_test_server(
+        tmp_path,
+        owner_telegram_ids=(123456,),
+        dev_mode=True,
+        metadata_service=meta_svc,
+        lyrics_client=lyrics_cli,
+        organizer=organizer,
+    )
+    try:
+        song_dir = tmp_path / "lib" / "Artist" / "Album"
+        song_dir.mkdir(parents=True)
+        audio = song_dir / "song.mp3"
+        audio.write_bytes(b"DATA")
+
+        rec = LibraryTrackRecord(
+            id="trk_bulk1",
+            job_id="job_bulk",
+            uploaded_by=123456,
+            title="Bulk Song",
+            artist="Artist",
+            album="Album",
+            duration_seconds=150,
+            storage_path=audio,
+            fingerprint="fp_bulk_test",
+        )
+        await repo.upsert_scanned_library_track(rec)
+
+        base_url = f"http://127.0.0.1:{server.bound_port}"
+        dev_token = _make_dev_token(123456)
+        headers = {"Authorization": f"tma {dev_token}"}
+
+        async with httpx.AsyncClient() as client:
+            # 1. Plan endpoint
+            resp_plan = await client.post(
+                f"{base_url}/api/v1/app/tracks/bulk-research/plan",
+                headers=headers,
+                json={"track_ids": ["trk_bulk1"], "filter_mode": "all"},
+            )
+            assert resp_plan.status_code == 200
+            plan_data = resp_plan.json()
+            assert plan_data["total_tracks"] == 1
+            assert "estimated_seconds" in plan_data
+
+            # 2. Execute endpoint
+            resp_exec = await client.post(
+                f"{base_url}/api/v1/app/tracks/bulk-research/execute",
+                headers=headers,
+                json={"track_ids": ["trk_bulk1"], "auto_apply": False},
+            )
+            assert resp_exec.status_code == 200
+            exec_data = resp_exec.json()
+            assert exec_data["total_tracks"] == 1
+            assert "elapsed_seconds" in exec_data
+    finally:
+        await server.stop()
+
+
+def test_extract_cover_bytes_unit_coverage(tmp_path: Path) -> None:
+    """Verify in-RAM caching, sidecar cover writing, mutagen decoders, and cache eviction."""
+    _COVER_CACHE.clear()
+    try:
+        # 1. Non-existent file
+        assert extract_cover_bytes(tmp_path / "nonexistent.mp3") is None
+
+        # 2. Parent directory has cover.png
+        track_dir = tmp_path / "track_png"
+        track_dir.mkdir()
+        audio_file = track_dir / "song.flac"
+        audio_file.write_bytes(b"FLACDATA")
+        png_cover = track_dir / "cover.png"
+        png_cover.write_bytes(b"\x89PNG\r\n\x1a\nPNG_DATA")
+
+        res_png = extract_cover_bytes(audio_file)
+        assert res_png is not None
+        assert res_png[0] == b"\x89PNG\r\n\x1a\nPNG_DATA"
+        assert res_png[1] == "image/png"
+
+        # 3. Mutagen FLAC pictures
+        flac_dir = tmp_path / "track_flac"
+        flac_dir.mkdir()
+        flac_audio = flac_dir / "song.flac"
+        flac_audio.write_bytes(b"FLACDATA2")
+
+        mock_pic = type("Pic", (), {"mime": "image/jpeg", "data": b"FLAC_PICTURE_BYTES"})()
+        mock_mutagen_flac = type("FlacFile", (), {"pictures": [mock_pic]})()
+
+        with patch("mutagen.File", return_value=mock_mutagen_flac):
+            res_flac = extract_cover_bytes(flac_audio)
+            assert res_flac is not None
+            assert res_flac[0] == b"FLAC_PICTURE_BYTES"
+            assert res_flac[1] == "image/jpeg"
+            # Verify write-through sidecar cover.jpg was created
+            assert (flac_dir / "cover.jpg").is_file()
+
+        # 4. Mutagen MP3 ID3 APIC frame
+        mp3_dir = tmp_path / "track_mp3"
+        mp3_dir.mkdir()
+        mp3_audio = mp3_dir / "song.mp3"
+        mp3_audio.write_bytes(b"MP3DATA")
+
+        mock_apic = type("APIC", (), {"FrameID": "APIC", "mime": "image/jpeg", "data": b"MP3_APIC_BYTES"})()
+        mock_mutagen_mp3 = type("Mp3File", (), {"pictures": None, "tags": {"APIC": mock_apic}})()
+
+        with patch("mutagen.File", return_value=mock_mutagen_mp3):
+            res_mp3 = extract_cover_bytes(mp3_audio)
+            assert res_mp3 is not None
+            assert res_mp3[0] == b"MP3_APIC_BYTES"
+
+        # 5. Mutagen MP4 covr atom
+        mp4_dir = tmp_path / "track_mp4"
+        mp4_dir.mkdir()
+        mp4_audio = mp4_dir / "song.m4a"
+        mp4_audio.write_bytes(b"MP4DATA")
+
+        class MockCovrItem(bytes):
+            imageformat = 14  # FORMAT_PNG
+
+        mock_covr_bytes = MockCovrItem(b"MP4_COVR_BYTES")
+        mock_mutagen_mp4 = type("Mp4File", (), {"pictures": None, "tags": {"covr": [mock_covr_bytes]}})()
+
+        with (
+            patch("mutagen.File", return_value=mock_mutagen_mp4),
+            patch("src.bot.webapp_server.MP4Cover", type("MP4Cover", (), {"FORMAT_PNG": 14})),
+        ):
+            res_mp4 = extract_cover_bytes(mp4_audio)
+            assert res_mp4 is not None
+            assert res_mp4[0] == b"MP4_COVR_BYTES"
+            assert res_mp4[1] == "image/png"
+            assert (mp4_dir / "cover.png").is_file()
+
+        # 6. Cache eviction when cache exceeds _COVER_CACHE_MAX_ENTRIES
+        for i in range(_COVER_CACHE_MAX_ENTRIES + 10):
+            _COVER_CACHE[f"dummy_key_{i}"] = (b"DUMMY", "image/jpeg")
+
+        res_evict = extract_cover_bytes(audio_file)
+        assert res_evict is not None
+    finally:
+        _COVER_CACHE.clear()
+
+
+@pytest.mark.anyio
+async def test_audio_streaming_content_types_and_errors(tmp_path: Path) -> None:
+    """Verify audio streaming 404s, direct formats, and transcoding fallbacks."""
+    server, repo = await _setup_test_server(
+        tmp_path,
+        owner_telegram_ids=(123456,),
+        dev_mode=True,
+    )
+    try:
+        base_url = f"http://127.0.0.1:{server.bound_port}"
+        dev_token = _make_dev_token(123456)
+        headers = {"Authorization": f"tma {dev_token}"}
+
+        async with httpx.AsyncClient() as client:
+            # 1. Track not found -> 404
+            resp_404 = await client.get(f"{base_url}/api/v1/app/tracks/nonexistent/audio", headers=headers)
+            assert resp_404.status_code == 404
+
+            # 2. Track in DB but file missing on disk -> 404
+            missing_rec = LibraryTrackRecord(
+                id="trk_missing_file",
+                job_id="job1",
+                uploaded_by=123456,
+                title="Missing File",
+                artist="Artist",
+                album="Album",
+                duration_seconds=100,
+                storage_path=tmp_path / "does_not_exist.flac",
+                fingerprint="fp1",
+            )
+            await repo.upsert_scanned_library_track(missing_rec)
+            resp_missing = await client.get(
+                f"{base_url}/api/v1/app/tracks/trk_missing_file/audio", headers=headers
+            )
+            assert resp_missing.status_code == 404
+
+            # 3. Direct streaming for different formats (when ffmpeg not used)
+            test_formats = [
+                (".flac", "audio/flac"),
+                (".mp4", "audio/mp4"),
+                (".ogg", "audio/ogg"),
+                (".opus", "audio/opus"),
+            ]
+            for ext, expected_mime in test_formats:
+                audio_file = tmp_path / f"test{ext}"
+                audio_file.write_bytes(b"TEST_AUDIO_CONTENT_STREAM_12345")
+                track_rec = LibraryTrackRecord(
+                    id=f"trk_{ext.lstrip('.')}",
+                    job_id="job1",
+                    uploaded_by=123456,
+                    title=f"Test {ext}",
+                    artist="Artist",
+                    album="Album",
+                    duration_seconds=60,
+                    storage_path=audio_file,
+                    fingerprint=f"fp_{ext}",
+                )
+                await repo.upsert_scanned_library_track(track_rec)
+
+                # Fetch without transcode
+                with patch("src.bot.webapp_server.is_ffmpeg_available", return_value=False):
+                    resp = await client.get(
+                        f"{base_url}/api/v1/app/tracks/trk_{ext.lstrip('.')}/audio?format=direct",
+                        headers=headers,
+                    )
+                    assert resp.status_code == 200
+                    assert expected_mime in resp.headers["Content-Type"]
+
+            # 4. Transcoding error fallback -> streams original file
+            with (
+                patch("src.bot.webapp_server.is_ffmpeg_available", return_value=True),
+                patch(
+                    "src.bot.webapp_server.async_transcode_audio",
+                    side_effect=RuntimeError("FFmpeg boom"),
+                ),
+            ):
+                resp_fallback = await client.get(
+                    f"{base_url}/api/v1/app/tracks/trk_flac/audio?format=opus",
+                    headers=headers,
+                )
+                assert resp_fallback.status_code == 200
+                assert "audio/flac" in resp_fallback.headers["Content-Type"]
+
+            # 5. Invalid Range header handling
+            with (
+                patch("src.bot.webapp_server.is_ffmpeg_available", return_value=True),
+                patch(
+                    "src.bot.webapp_server.async_transcode_audio",
+                    return_value=b"TRANSCODED_BYTES",
+                ),
+            ):
+                resp_invalid_range = await client.get(
+                    f"{base_url}/api/v1/app/tracks/trk_flac/audio?format=opus",
+                    headers={**headers, "Range": "bytes=invalid-spec"},
+                )
+                assert resp_invalid_range.status_code == 200
+    finally:
+        await server.stop()
+
+
+@pytest.mark.anyio
+async def test_cover_art_missing_returns_svg_and_upload_validation(tmp_path: Path) -> None:
+    """Verify cover art SVG fallback, size checks, format validations, and hex/base64 uploads."""
+    organizer = LibraryOrganizer(library_root=tmp_path / "lib", enable_network=False)
+    server, repo = await _setup_test_server(
+        tmp_path,
+        owner_telegram_ids=(123456,),
+        dev_mode=True,
+        organizer=organizer,
+    )
+    try:
+        base_url = f"http://127.0.0.1:{server.bound_port}"
+        dev_token = _make_dev_token(123456)
+        headers = {"Authorization": f"tma {dev_token}"}
+
+        song_dir = tmp_path / "lib" / "Artist" / "Album"
+        song_dir.mkdir(parents=True)
+        audio = song_dir / "song.mp3"
+        audio.write_bytes(b"DATA")
+
+        rec = LibraryTrackRecord(
+            id="trk_cover_test",
+            job_id="job_c",
+            uploaded_by=123456,
+            title="Cover Song",
+            artist="Artist",
+            album="Album",
+            duration_seconds=100,
+            storage_path=audio,
+            fingerprint="fp_c",
+        )
+        await repo.upsert_scanned_library_track(rec)
+
+        async with httpx.AsyncClient() as client:
+            # 1. Non-existent track cover -> returns default SVG
+            resp_svg = await client.get(f"{base_url}/api/v1/app/tracks/trk_unknown/cover")
+            assert resp_svg.status_code == 200
+            assert "image/svg+xml" in resp_svg.headers["Content-Type"]
+
+            # 2. Existing track without cover -> returns default SVG
+            resp_svg2 = await client.get(f"{base_url}/api/v1/app/tracks/trk_cover_test/cover")
+            assert resp_svg2.status_code == 200
+            assert "image/svg+xml" in resp_svg2.headers["Content-Type"]
+
+            # 3. Upload with invalid JSON -> 400
+            resp_bad_json = await client.post(
+                f"{base_url}/api/v1/app/tracks/trk_cover_test/cover",
+                headers={**headers, "Content-Type": "application/json"},
+                content=b"not-json",
+            )
+            assert resp_bad_json.status_code == 400
+
+            # 4. Upload with no image data -> 400
+            resp_no_data = await client.post(
+                f"{base_url}/api/v1/app/tracks/trk_cover_test/cover",
+                headers=headers,
+                json={},
+            )
+            assert resp_no_data.status_code == 400
+
+            # 5. Upload with too large image (>10MB) -> 400
+            huge_hex = ("aa" * (11 * 1024 * 1024))[: 22 * 1024 * 1024]
+            resp_huge = await client.post(
+                f"{base_url}/api/v1/app/tracks/trk_cover_test/cover",
+                headers=headers,
+                json={"cover_hex": huge_hex},
+            )
+            assert resp_huge.status_code == 400
+
+            # 6. Upload with hex string preview
+            hex_data = (b"\xff\xd8\xff\xe0" + b"\x00" * 32).hex()
+            resp_hex = await client.post(
+                f"{base_url}/api/v1/app/tracks/trk_cover_test/cover",
+                headers=headers,
+                json={"cover_hex": hex_data, "mime_type": "image/jpeg"},
+            )
+            assert resp_hex.status_code == 200
+            data_hex = resp_hex.json()
+            assert data_hex["status"] == "preview"
+
+            # 7. Upload with data URL base64
+            b64_str = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32).decode()
+            data_url = f"data:image/png;base64,{b64_str}"
+            resp_b64 = await client.post(
+                f"{base_url}/api/v1/app/tracks/trk_cover_test/cover",
+                headers=headers,
+                json={"image": data_url},
+            )
+            assert resp_b64.status_code == 200
+    finally:
+        await server.stop()
+
+
+@pytest.mark.anyio
+async def test_auto_lyrics_query_permutations_and_failures(tmp_path: Path) -> None:
+    """Verify auto-lyrics query formatting, artist/title overrides, and error resilience."""
+    lyrics_cli = AsyncMock()
+    lyrics_cli.fetch_lyrics.return_value = LyricsData(
+        synced_lyrics="[00:01.00] Line 1\n[00:02.00] Line 2",
+        plain_lyrics="Line 1\nLine 2",
+    )
+    server, repo = await _setup_test_server(
+        tmp_path,
+        owner_telegram_ids=(123456,),
+        dev_mode=True,
+        lyrics_client=lyrics_cli,
+    )
+    try:
+        base_url = f"http://127.0.0.1:{server.bound_port}"
+        dev_token = _make_dev_token(123456)
+        headers = {"Authorization": f"tma {dev_token}"}
+
+        song_dir = tmp_path / "lib"
+        song_dir.mkdir(parents=True)
+        audio = song_dir / "song.mp3"
+        audio.write_bytes(b"DATA")
+
+        rec = LibraryTrackRecord(
+            id="trk_lyrics_test",
+            job_id="job_l",
+            uploaded_by=123456,
+            title="Original Title",
+            artist="Original Artist",
+            album="Album",
+            duration_seconds=120,
+            storage_path=audio,
+            fingerprint="fp_l",
+        )
+        await repo.upsert_scanned_library_track(rec)
+
+        async with httpx.AsyncClient() as client:
+            # 1. Non-existent track -> 404
+            resp_404 = await client.post(
+                f"{base_url}/api/v1/app/tracks/trk_unknown/auto-lyrics",
+                headers=headers,
+                json={},
+            )
+            assert resp_404.status_code == 404
+
+            # 2. Query with "Artist - Title" format
+            resp_split = await client.post(
+                f"{base_url}/api/v1/app/tracks/trk_lyrics_test/auto-lyrics",
+                headers=headers,
+                json={"query": "Split Artist - Split Title"},
+            )
+            assert resp_split.status_code == 200
+            assert resp_split.json()["synced"] is True
+            assert resp_split.json()["found"] is True
+
+            # 3. Query with single string
+            resp_single = await client.post(
+                f"{base_url}/api/v1/app/tracks/trk_lyrics_test/auto-lyrics",
+                headers=headers,
+                json={"query": "Single Title"},
+            )
+            assert resp_single.status_code == 200
+
+            # 4. Overrides for artist and title
+            resp_overrides = await client.post(
+                f"{base_url}/api/v1/app/tracks/trk_lyrics_test/auto-lyrics",
+                headers=headers,
+                json={"artist": "New Artist", "title": "New Title"},
+            )
+            assert resp_overrides.status_code == 200
+
+            # 5. Client fetch_lyrics raises exception -> handled cleanly
+            lyrics_cli.fetch_lyrics.side_effect = RuntimeError("LRCLIB timeout")
+            resp_err = await client.post(
+                f"{base_url}/api/v1/app/tracks/trk_lyrics_test/auto-lyrics",
+                headers=headers,
+                json={},
+            )
+            assert resp_err.status_code == 200
+            assert resp_err.json()["found"] is False
+    finally:
+        await server.stop()
+
+
+@pytest.mark.anyio
+async def test_access_request_flow_and_rejections(tmp_path: Path) -> None:
+    """Verify guest access request submission, pending checks, duplicate error, and admin deny."""
+    server, repo = await _setup_test_server(
+        tmp_path,
+        owner_telegram_ids=(123456,),
+        dev_mode=True,
+    )
+    try:
+        base_url = f"http://127.0.0.1:{server.bound_port}"
+        guest_token = _make_dev_token(999999)  # Guest user
+        admin_token = _make_dev_token(123456)  # Owner/Admin user
+        guest_headers = {"Authorization": f"tma {guest_token}"}
+        admin_headers = {"Authorization": f"tma {admin_token}"}
+
+        async with httpx.AsyncClient() as client:
+            # 1. Initially no pending request
+            resp_none = await client.get(f"{base_url}/api/v1/app/access-request", headers=guest_headers)
+            assert resp_none.status_code == 200
+            assert resp_none.json()["has_pending"] is False
+
+            # 2. Guest submits access request
+            resp_submit = await client.post(f"{base_url}/api/v1/app/access-request", headers=guest_headers)
+            assert resp_submit.status_code == 200
+            submit_data = resp_submit.json()
+            assert submit_data["success"] is True
+            req_id = submit_data["request_id"]
+
+            # 3. Pending check now returns True
+            resp_pending = await client.get(f"{base_url}/api/v1/app/access-request", headers=guest_headers)
+            assert resp_pending.status_code == 200
+            assert resp_pending.json()["has_pending"] is True
+            assert resp_pending.json()["request"]["id"] == req_id
+
+            # 4. Duplicate request is debounced
+            resp_dup = await client.post(f"{base_url}/api/v1/app/access-request", headers=guest_headers)
+            assert resp_dup.status_code == 200
+            assert resp_dup.json()["request_id"] == req_id
+
+            # Exception during submission returns 400
+            with patch.object(
+                server._governance_service, "submit_access_request", side_effect=RuntimeError("DB lock")
+            ):
+                resp_err = await client.post(f"{base_url}/api/v1/app/access-request", headers=guest_headers)
+                assert resp_err.status_code == 400
+                assert resp_err.json()["success"] is False
+
+            # 5. Admin denies access request
+            resp_deny = await client.post(
+                f"{base_url}/api/v1/app/admin/access-requests/{req_id}/resolve",
+                headers=admin_headers,
+                json={"action": "deny"},
+            )
+            assert resp_deny.status_code == 200
+            assert resp_deny.json()["status"] == AccessRequestStatus.REJECTED.value
+
+            # 6. Admin resolves with invalid action -> 400
+            resp_invalid_action = await client.post(
+                f"{base_url}/api/v1/app/admin/access-requests/{req_id}/resolve",
+                headers=admin_headers,
+                json={"action": "unknown"},
+            )
+            assert resp_invalid_action.status_code == 400
+
+            # 7. Admin resolves non-existent request -> 404
+            resp_404 = await client.post(
+                f"{base_url}/api/v1/app/admin/access-requests/99999/resolve",
+                headers=admin_headers,
+                json={"action": "deny"},
+            )
+            assert resp_404.status_code == 404
+    finally:
+        await server.stop()
+
+
+@pytest.mark.anyio
+async def test_oidc_server_routes_integrated(tmp_path: Path) -> None:
+    """Verify OIDC callback handler and Authentik webhook handler with mock coordinator."""
+    mock_coordinator = AsyncMock()
+    mock_coordinator.handle_oauth_callback.return_value = (
+        type("Outcome", (), {"new_role": UserRole.UPLOADER})(),
+        "Account linked successfully!",
+    )
+    mock_coordinator.handle_authentik_webhook.return_value = OidcSyncOutcome(
+        user=UserAccount(
+            telegram_id=888888,
+            display_name="OIDC User",
+            username="oidcuser",
+            role=UserRole.UPLOADER,
+        ),
+        previous_role=UserRole.GUEST,
+        new_role=UserRole.UPLOADER,
+        role_changed=True,
+        was_blocked=False,
+        cancelled_jobs=0,
+        group_changes_description="Added to uploaders",
+    )
+
+    server, _ = await _setup_test_server(
+        tmp_path,
+        owner_telegram_ids=(123456,),
+        coordinator=mock_coordinator,
+    )
+    try:
+        base_url = f"http://127.0.0.1:{server.bound_port}"
+
+        async with httpx.AsyncClient() as client:
+            # 1. OAuth callback success
+            resp_cb = await client.get(f"{base_url}/api/v1/auth/callback?code=testcode&state=teststate")
+            assert resp_cb.status_code == 200
+            assert "Account linked successfully!" in resp_cb.text
+            assert resp_cb.headers.get("X-Assigned-Role") == UserRole.UPLOADER.value
+
+            # 2. OAuth callback auth error -> 400
+            mock_coordinator.handle_oauth_callback.side_effect = OidcAuthenticationError("Bad nonce")
+            resp_cb_err = await client.get(f"{base_url}/api/v1/auth/callback?code=bad&state=bad")
+            assert resp_cb_err.status_code == 400
+
+            # 3. Webhook invalid JSON -> 400
+            resp_wh_bad = await client.post(
+                f"{base_url}/api/v1/webhooks/authentik",
+                headers={"Content-Type": "application/json"},
+                content=b"not json",
+            )
+            assert resp_wh_bad.status_code == 400
+
+            # 4. Webhook valid payload
+            resp_wh = await client.post(
+                f"{base_url}/api/v1/webhooks/authentik",
+                headers={"X-Authentik-Secret": "secret"},
+                json={"event": "user_sync"},
+            )
+            assert resp_wh.status_code == 200
+            assert resp_wh.json()["status"] == "synced"
+
+            # 5. Webhook user not found -> ignored
+            mock_coordinator.handle_authentik_webhook.return_value = None
+            resp_wh_none = await client.post(
+                f"{base_url}/api/v1/webhooks/authentik",
+                json={"event": "unknown"},
+            )
+            assert resp_wh_none.status_code == 200
+            assert resp_wh_none.json()["reason"] == "user_not_found"
+
+            # 6. Webhook permission denied -> 403
+            mock_coordinator.handle_authentik_webhook.side_effect = PermissionDeniedError("Bad secret")
+            resp_wh_denied = await client.post(
+                f"{base_url}/api/v1/webhooks/authentik",
+                json={"event": "user_sync"},
+            )
+            assert resp_wh_denied.status_code == 403
+    finally:
+        await server.stop()
+
+
+@pytest.mark.anyio
+async def test_track_listing_filtering_and_sorting(tmp_path: Path) -> None:
+    """Verify track search query, sorting (artist, album, title, year, recent), and pagination."""
+    server, repo = await _setup_test_server(
+        tmp_path,
+        owner_telegram_ids=(123456,),
+        dev_mode=True,
+    )
+    try:
+        base_url = f"http://127.0.0.1:{server.bound_port}"
+        dev_token = _make_dev_token(123456)
+        headers = {"Authorization": f"tma {dev_token}"}
+
+        song_dir = tmp_path / "music"
+        song_dir.mkdir(parents=True)
+
+        for i in range(1, 4):
+            audio = song_dir / f"track{i}.mp3"
+            audio.write_bytes(b"DATA" * 50)
+            rec = LibraryTrackRecord(
+                id=f"trk_{i}",
+                job_id="job",
+                uploaded_by=123456,
+                title=f"Song {i}",
+                artist=f"Artist {4 - i}",
+                album=f"Album {i}",
+                year=2020 + i,
+                duration_seconds=100 * i,
+                storage_path=audio,
+                fingerprint=f"fp_{i}",
+            )
+            await repo.upsert_scanned_library_track(rec)
+
+        async with httpx.AsyncClient() as client:
+            # 1. Query search
+            resp_q = await client.get(f"{base_url}/api/v1/app/tracks?query=Song 2", headers=headers)
+            assert resp_q.status_code == 200
+            items_q = resp_q.json()["items"]
+            assert len(items_q) == 1
+            assert items_q[0]["id"] == "trk_2"
+
+            # 2. Sort by artist
+            resp_artist = await client.get(f"{base_url}/api/v1/app/tracks?sort_by=artist", headers=headers)
+            assert resp_artist.status_code == 200
+            items_artist = resp_artist.json()["items"]
+            assert items_artist[0]["artist"] <= items_artist[-1]["artist"]
+
+            # 3. Sort by album
+            resp_album = await client.get(f"{base_url}/api/v1/app/tracks?sort_by=album", headers=headers)
+            assert resp_album.status_code == 200
+
+            # 4. Sort by year
+            resp_year = await client.get(f"{base_url}/api/v1/app/tracks?sort_by=year", headers=headers)
+            assert resp_year.status_code == 200
+
+            # 5. Invalid sort_by defaults to recent
+            resp_invalid_sort = await client.get(
+                f"{base_url}/api/v1/app/tracks?sort_by=invalid_sort", headers=headers
+            )
+            assert resp_invalid_sort.status_code == 200
+
+            # 6. Pagination (page=1, per_page=1)
+            resp_page = await client.get(f"{base_url}/api/v1/app/tracks?page=1&per_page=1", headers=headers)
+            assert resp_page.status_code == 200
+            assert len(resp_page.json()["items"]) == 1
+            assert resp_page.json()["total"] == 3
+            assert resp_page.json()["total_pages"] == 3
+    finally:
+        await server.stop()
+
+
+@pytest.mark.anyio
+async def test_admin_user_filtering_and_edge_cases(tmp_path: Path) -> None:
+    """Verify admin user listing filters, self-block guard, and invalid role handling."""
+    server, repo = await _setup_test_server(
+        tmp_path,
+        owner_telegram_ids=(123456,),
+        dev_mode=True,
+    )
+    try:
+        base_url = f"http://127.0.0.1:{server.bound_port}"
+        admin_token = _make_dev_token(123456)
+        headers = {"Authorization": f"tma {admin_token}"}
+
+        # Create additional users in repo
+        user2 = UserAccount(
+            telegram_id=222222, username="mod_alice", display_name="Alice Mod", role=UserRole.MODERATOR
+        )
+        user3 = UserAccount(
+            telegram_id=333333, username="uploader_bob", display_name="Bob Uploader", role=UserRole.UPLOADER
+        )
+        await repo.upsert_user(user2)
+        await repo.upsert_user(user3)
+
+        async with httpx.AsyncClient() as client:
+            # 1. Filter by role
+            resp_role = await client.get(f"{base_url}/api/v1/app/admin/users?role=MODERATOR", headers=headers)
+            assert resp_role.status_code == 200
+            users = resp_role.json()["users"]
+            assert any(u["telegram_id"] == 222222 for u in users)
+
+            # 2. Filter by search query
+            resp_query = await client.get(f"{base_url}/api/v1/app/admin/users?query=bob", headers=headers)
+            assert resp_query.status_code == 200
+            users_query = resp_query.json()["users"]
+            assert len(users_query) == 1
+            assert users_query[0]["telegram_id"] == 333333
+
+            # 3. Self-block attempt -> 400
+            resp_self_block = await client.post(
+                f"{base_url}/api/v1/app/admin/users/123456/block",
+                headers=headers,
+                json={"is_blocked": True},
+            )
+            assert resp_self_block.status_code == 400
+            assert "cannot block your own account" in resp_self_block.json()["error"]
+
+            # 4. Invalid role string -> 400
+            resp_invalid_role = await client.post(
+                f"{base_url}/api/v1/app/admin/users/222222/role",
+                headers=headers,
+                json={"role": "SUPERADMIN"},
+            )
+            assert resp_invalid_role.status_code == 400
+
+            # 5. Invalid target user_id format -> 400
+            resp_bad_id = await client.post(
+                f"{base_url}/api/v1/app/admin/users/not-an-id/role",
+                headers=headers,
+                json={"role": "ADMIN"},
+            )
+            assert resp_bad_id.status_code == 400
+    finally:
+        await server.stop()
+
+
+@pytest.mark.anyio
+async def test_spa_static_and_placeholder_fallback(tmp_path: Path) -> None:
+    """Verify static directory file serving, index.html fallback, and placeholder HTML."""
+    static_dir = tmp_path / "dist"
+    static_dir.mkdir()
+    (static_dir / "asset.js").write_text("console.log('asset');")
+    (static_dir / "index.html").write_text("<html><body>SPA Index</body></html>")
+
+    server, _ = await _setup_test_server(
+        tmp_path,
+        owner_telegram_ids=(123456,),
+        static_dir=static_dir,
+        dev_mode=False,
+    )
+    try:
+        base_url = f"http://127.0.0.1:{server.bound_port}"
+        async with httpx.AsyncClient() as client:
+            # 1. Exact static file
+            resp_asset = await client.get(f"{base_url}/asset.js")
+            assert resp_asset.status_code == 200
+            assert "console.log('asset');" in resp_asset.text
+
+            # 2. SPA client route fallback to index.html
+            resp_route = await client.get(f"{base_url}/songs/view/123")
+            assert resp_route.status_code == 200
+            assert "SPA Index" in resp_route.text
+
+        # 3. Server without static_dir -> placeholder HTML
+        server_no_static, _ = await _setup_test_server(
+            tmp_path / "no_static",
+            owner_telegram_ids=(123456,),
+            static_dir=None,
+        )
+        try:
+            base_url2 = f"http://127.0.0.1:{server_no_static.bound_port}"
+            async with httpx.AsyncClient() as client:
+                resp_ph = await client.get(f"{base_url2}/any/route")
+                assert resp_ph.status_code == 200
+                assert "Telegram Music Mini App" in resp_ph.text
+        finally:
+            await server_no_static.stop()
     finally:
         await server.stop()
