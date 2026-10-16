@@ -41,6 +41,9 @@ select = ["E", "F", "I", "B", "UP", "N", "SIM"]
 [tool.ruff.lint.isort]
 known-first-party = ["src"]
 
+[tool.ty.src]
+exclude = ["tests"]
+
 [tool.ty.terminal]
 error-on-warning = true
 
