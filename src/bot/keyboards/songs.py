@@ -5,7 +5,7 @@ from aiogram.types import CopyTextButton, InlineKeyboardButton, InlineKeyboardMa
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from src.bot.keyboards.admin import MenuCallback, append_escape_row
-from src.core.models import LibraryTrackRecord
+from src.core.models import LibraryTrackRecord, UserAccount, UserPreferences
 
 
 class SongsMenuCallback(CallbackData, prefix="songs"):
@@ -35,6 +35,20 @@ class SongsToggleFieldCallback(CallbackData, prefix="songstog"):
     action: str = "t"
     track_id: str
     field: str
+
+
+class SettingsCallback(CallbackData, prefix="stg"):
+    """Callback schema for user preferences settings (`stg:<action>:<value>`)."""
+
+    action: str
+    value: str
+
+
+class SongsBulkReviewCallback(CallbackData, prefix="songsb"):
+    """Callback schema for bulk review session pagination and resolution (`songsb:<action>:<index>`)."""
+
+    action: str
+    index: int = 0
 
 
 class SongsPageCallback(CallbackData, prefix="songsp"):
@@ -514,9 +528,21 @@ def build_input_cancel_keyboard(track_id: str) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def build_bulk_research_menu_keyboard() -> InlineKeyboardMarkup:
+def build_bulk_research_menu_keyboard(
+    *,
+    has_filter: bool = False,
+    query: str = "",
+) -> InlineKeyboardMarkup:
     """Build the scope selection keyboard for planned bulk metadata & lyrics re-search (Level 2)."""
     builder = InlineKeyboardBuilder()
+    if has_filter and query.strip():
+        q_label = query.strip()[:16]
+        builder.row(
+            InlineKeyboardButton(
+                text=f"🎯 Current Search Filter ('{q_label}...')",
+                callback_data=SongsMenuCallback(action="bulk_plan_search").pack(),
+            )
+        )
     builder.row(
         InlineKeyboardButton(
             text="🔍 All Library Tracks",
@@ -553,6 +579,163 @@ def build_bulk_research_plan_keyboard(filter_mode: str) -> InlineKeyboardMarkup:
     append_escape_row(
         builder,
         back_callback=SongsMenuCallback(action="bulk_menu").pack(),
+        include_home=True,
+    )
+    return builder.as_markup()
+
+
+def build_user_settings_keyboard(
+    prefs: UserPreferences,
+    *,
+    user: UserAccount | None = None,
+    back_callback: str | None = None,
+) -> InlineKeyboardMarkup:
+    """Build the interactive single-screen keyboard for user preferences."""
+    builder = InlineKeyboardBuilder()
+
+    fmt = prefs.stream_format
+    builder.row(
+        InlineKeyboardButton(
+            text=f"{'✅ ' if fmt == 'auto' else ''}Auto",
+            callback_data=SettingsCallback(action="fmt", value="auto").pack(),
+        ),
+        InlineKeyboardButton(
+            text=f"{'✅ ' if fmt == 'original' else ''}Direct (Raw)",
+            callback_data=SettingsCallback(action="fmt", value="original").pack(),
+        ),
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text=f"{'✅ ' if fmt == 'opus' else ''}Opus",
+            callback_data=SettingsCallback(action="fmt", value="opus").pack(),
+        ),
+        InlineKeyboardButton(
+            text=f"{'✅ ' if fmt == 'mp3' else ''}MP3",
+            callback_data=SettingsCallback(action="fmt", value="mp3").pack(),
+        ),
+    )
+
+    if fmt in {"auto", "opus", "mp3"}:
+        br = prefs.stream_bitrate
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{'✅ ' if br == 128 else ''}128 kbps",
+                callback_data=SettingsCallback(action="br", value="128").pack(),
+            ),
+            InlineKeyboardButton(
+                text=f"{'✅ ' if br == 192 else ''}192 kbps",
+                callback_data=SettingsCallback(action="br", value="192").pack(),
+            ),
+            InlineKeyboardButton(
+                text=f"{'✅ ' if br == 320 else ''}320 kbps",
+                callback_data=SettingsCallback(action="br", value="320").pack(),
+            ),
+        )
+
+    lyr_state = (
+        "✅ [Enabled] Auto-Search Lyrics" if prefs.auto_lyrics_search else "⬜ [Disabled] Auto-Search Lyrics"
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text=lyr_state,
+            callback_data=SettingsCallback(action="lyrics", value="toggle").pack(),
+        )
+    )
+
+    if user is not None and user.is_oidc_linked:
+        builder.row(
+            InlineKeyboardButton(
+                text="❌ Disconnect Authentik SSO",
+                callback_data=SettingsCallback(action="oidc", value="disconnect").pack(),
+            )
+        )
+
+    effective_back = back_callback or MenuCallback(action="home").pack()
+    append_escape_row(
+        builder,
+        back_callback=effective_back,
+        include_home=effective_back != MenuCallback(action="home").pack(),
+    )
+    return builder.as_markup()
+
+
+def build_bulk_review_overview_keyboard(
+    pending_count: int,
+    *,
+    back_callback: str | None = None,
+) -> InlineKeyboardMarkup:
+    """Build the summary action keyboard for tracks requiring review after bulk research."""
+    builder = InlineKeyboardBuilder()
+    if pending_count > 0:
+        builder.row(
+            InlineKeyboardButton(
+                text=f"🎛️ Review Tracks ({pending_count} pending)",
+                callback_data=SongsBulkReviewCallback(action="view", index=0).pack(),
+            )
+        )
+        builder.row(
+            InlineKeyboardButton(
+                text="✅ Apply All Pending Changes",
+                callback_data=SongsBulkReviewCallback(action="apply_all", index=0).pack(),
+            )
+        )
+        builder.row(
+            InlineKeyboardButton(
+                text="❌ Discard All Pending",
+                callback_data=SongsBulkReviewCallback(action="discard_all", index=0).pack(),
+            )
+        )
+    append_escape_row(
+        builder,
+        back_callback=back_callback or SongsMenuCallback(action="bulk_menu").pack(),
+        include_home=True,
+    )
+    return builder.as_markup()
+
+
+def build_bulk_track_review_keyboard(
+    current_index: int,
+    total_count: int,
+) -> InlineKeyboardMarkup:
+    """Build the single-track decision keyboard during an interactive bulk review session."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="✅ Accept & Apply",
+            callback_data=SongsBulkReviewCallback(action="apply_one", index=current_index).pack(),
+        ),
+        InlineKeyboardButton(
+            text="⏭️ Skip Track",
+            callback_data=SongsBulkReviewCallback(action="skip_one", index=current_index).pack(),
+        ),
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="❌ Discard Changes",
+            callback_data=SongsBulkReviewCallback(action="discard_one", index=current_index).pack(),
+        )
+    )
+
+    prev_idx = max(0, current_index - 1)
+    next_idx = min(total_count - 1, current_index + 1)
+    builder.row(
+        InlineKeyboardButton(
+            text="◀ Prev" if current_index > 0 else "◀",
+            callback_data=SongsBulkReviewCallback(action="view", index=prev_idx).pack(),
+        ),
+        InlineKeyboardButton(
+            text=f"📄 {current_index + 1} / {total_count}",
+            callback_data=SongsBulkReviewCallback(action="noop", index=current_index).pack(),
+        ),
+        InlineKeyboardButton(
+            text="Next ▶" if current_index < total_count - 1 else "▶",
+            callback_data=SongsBulkReviewCallback(action="view", index=next_idx).pack(),
+        ),
+    )
+
+    append_escape_row(
+        builder,
+        back_callback=SongsBulkReviewCallback(action="list", index=0).pack(),
         include_home=True,
     )
     return builder.as_markup()

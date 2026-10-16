@@ -1,6 +1,7 @@
 """Typed environment, .env, and YAML configuration settings for local and Docker runtimes."""
 
 import contextlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -61,6 +62,7 @@ _YAML_SECTION_KEY_MAP: dict[str, dict[str, str]] = {
         "listen_host": "OIDC_LISTEN_HOST",
         "listen_port": "OIDC_LISTEN_PORT",
         "sync_interval_seconds": "OIDC_SYNC_INTERVAL_SECONDS",
+        "role_mapping": "OIDC_ROLE_MAPPING",
     },
     "webapp": {
         "enabled": "WEB_APP_ENABLED",
@@ -189,6 +191,7 @@ class AppSettings(BaseModel):
     oidc_listen_host: str = Field(default="0.0.0.0")
     oidc_listen_port: int = Field(default=8080, ge=0, le=65535)
     oidc_sync_interval_seconds: int = Field(default=3600, ge=60)
+    oidc_role_mapping: dict[str, str] = Field(default_factory=dict)
 
     # Telegram Mini App & Web Server settings
     web_app_enabled: bool = Field(default=True)
@@ -246,6 +249,38 @@ def _parse_int_tuple(raw: str) -> tuple[int, ...]:
     """Parse a comma-separated string of integers into a tuple."""
     parts = [item.strip() for item in raw.split(",") if item.strip()]
     return tuple(int(item) for item in parts)
+
+
+def _parse_role_mapping(raw: object) -> dict[str, str]:
+    """Parse OIDC role mapping from dict, JSON string, or comma-separated pairs."""
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return {str(k).strip(): str(v).strip() for k, v in raw.items() if str(k).strip()}
+    raw_str = str(raw).strip()
+    if raw_str.startswith("{") and raw_str.endswith("}"):
+        try:
+            parsed = json.loads(raw_str)
+            if isinstance(parsed, dict):
+                return {str(k).strip(): str(v).strip() for k, v in parsed.items() if str(k).strip()}
+        except Exception as exc:
+            logger.warning("Failed to parse OIDC_ROLE_MAPPING as JSON: %s", exc)
+    result: dict[str, str] = {}
+    for item in raw_str.split(","):
+        item = item.strip()
+        if "=" in item:
+            grp, role_name = item.split("=", maxsplit=1)
+            grp = grp.strip()
+            role_name = role_name.strip()
+            if grp and role_name:
+                result[grp] = role_name
+        elif ":" in item:
+            grp, role_name = item.split(":", maxsplit=1)
+            grp = grp.strip()
+            role_name = role_name.strip()
+            if grp and role_name:
+                result[grp] = role_name
+    return result
 
 
 def load_settings(
@@ -350,5 +385,8 @@ def load_settings(
 
     if "OIDC_SYNC_INTERVAL_SECONDS" in merged_env and merged_env["OIDC_SYNC_INTERVAL_SECONDS"] != "":
         raw_kwargs["oidc_sync_interval_seconds"] = int(merged_env["OIDC_SYNC_INTERVAL_SECONDS"])
+
+    if "OIDC_ROLE_MAPPING" in merged_env and merged_env["OIDC_ROLE_MAPPING"] != "":
+        raw_kwargs["oidc_role_mapping"] = _parse_role_mapping(merged_env["OIDC_ROLE_MAPPING"])
 
     return AppSettings.model_validate(raw_kwargs)

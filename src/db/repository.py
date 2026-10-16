@@ -29,6 +29,7 @@ from src.core.models import (
     TagCorrectionStatus,
     TrackMetadata,
     UserAccount,
+    UserPreferences,
     UserRole,
 )
 from src.db.database import SqliteDatabaseManager
@@ -80,6 +81,7 @@ def _row_to_user(row: tuple[object, ...]) -> UserAccount:
 
     created_dt = _parse_iso_datetime(row[12]) or datetime.now(UTC)
     updated_dt = _parse_iso_datetime(row[13]) or created_dt
+    oidc_role_override = bool(int(str(row[14]))) if len(row) > 14 and row[14] is not None else False
 
     return UserAccount(
         telegram_id=int(str(row[0])),
@@ -96,6 +98,7 @@ def _row_to_user(row: tuple[object, ...]) -> UserAccount:
         last_oidc_sync=_parse_iso_datetime(row[11]),
         created_at=created_dt,
         updated_at=updated_dt,
+        oidc_role_override=oidc_role_override,
     )
 
 
@@ -531,7 +534,8 @@ class SqliteCatalogRepository:
                 SELECT telegram_id, username, display_name, role, is_blocked,
                        authentik_sub, authentik_username, authentik_groups,
                        access_token_encrypted, refresh_token_encrypted,
-                       token_expires_at, last_oidc_sync, created_at, updated_at
+                       token_expires_at, last_oidc_sync, created_at, updated_at,
+                       oidc_role_override
                 FROM users
                 WHERE telegram_id = ?
                 """,
@@ -550,7 +554,8 @@ class SqliteCatalogRepository:
                 SELECT telegram_id, username, display_name, role, is_blocked,
                        authentik_sub, authentik_username, authentik_groups,
                        access_token_encrypted, refresh_token_encrypted,
-                       token_expires_at, last_oidc_sync, created_at, updated_at
+                       token_expires_at, last_oidc_sync, created_at, updated_at,
+                       oidc_role_override
                 FROM users
                 WHERE authentik_sub = ?
                 """,
@@ -571,8 +576,9 @@ class SqliteCatalogRepository:
                     telegram_id, username, display_name, role, is_blocked,
                     authentik_sub, authentik_username, authentik_groups,
                     access_token_encrypted, refresh_token_encrypted,
-                    token_expires_at, last_oidc_sync, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    token_expires_at, last_oidc_sync, created_at, updated_at,
+                    oidc_role_override
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(telegram_id) DO UPDATE SET
                     username = excluded.username,
                     display_name = excluded.display_name,
@@ -585,7 +591,8 @@ class SqliteCatalogRepository:
                     refresh_token_encrypted = excluded.refresh_token_encrypted,
                     token_expires_at = excluded.token_expires_at,
                     last_oidc_sync = excluded.last_oidc_sync,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    oidc_role_override = excluded.oidc_role_override
                 """,
                 (
                     user.telegram_id,
@@ -602,6 +609,7 @@ class SqliteCatalogRepository:
                     user.last_oidc_sync.isoformat() if user.last_oidc_sync else None,
                     user.created_at.isoformat(),
                     user.updated_at.isoformat(),
+                    1 if user.oidc_role_override else 0,
                 ),
             )
             await conn.commit()
@@ -616,7 +624,8 @@ class SqliteCatalogRepository:
                     SELECT telegram_id, username, display_name, role, is_blocked,
                            authentik_sub, authentik_username, authentik_groups,
                            access_token_encrypted, refresh_token_encrypted,
-                           token_expires_at, last_oidc_sync, created_at, updated_at
+                           token_expires_at, last_oidc_sync, created_at, updated_at,
+                           oidc_role_override
                     FROM users
                     WHERE role = ?
                     ORDER BY telegram_id ASC
@@ -629,7 +638,8 @@ class SqliteCatalogRepository:
                     SELECT telegram_id, username, display_name, role, is_blocked,
                            authentik_sub, authentik_username, authentik_groups,
                            access_token_encrypted, refresh_token_encrypted,
-                           token_expires_at, last_oidc_sync, created_at, updated_at
+                           token_expires_at, last_oidc_sync, created_at, updated_at,
+                           oidc_role_override
                     FROM users
                     ORDER BY telegram_id ASC
                     """
@@ -645,7 +655,8 @@ class SqliteCatalogRepository:
                 SELECT telegram_id, username, display_name, role, is_blocked,
                        authentik_sub, authentik_username, authentik_groups,
                        access_token_encrypted, refresh_token_encrypted,
-                       token_expires_at, last_oidc_sync, created_at, updated_at
+                       token_expires_at, last_oidc_sync, created_at, updated_at,
+                       oidc_role_override
                 FROM users
                 WHERE authentik_sub IS NOT NULL AND is_blocked = 0
                 ORDER BY telegram_id ASC
@@ -670,6 +681,70 @@ class SqliteCatalogRepository:
             if row is None:
                 return 0, 0
             return int(row[0] or 0), int(row[1] or 0)
+
+    async def get_user_preferences(self, telegram_id: int) -> UserPreferences:
+        """Retrieve user preferences, creating defaults if not yet configured."""
+        async with self._db.connect() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT telegram_id, stream_format, stream_bitrate, auto_lyrics_search, theme
+                FROM user_settings
+                WHERE telegram_id = ?
+                """,
+                (telegram_id,),
+            )
+            row = await cursor.fetchone()
+            if row is not None:
+                return UserPreferences(
+                    telegram_id=int(row[0]),
+                    stream_format=str(row[1]),
+                    stream_bitrate=int(row[2]),
+                    auto_lyrics_search=bool(row[3]),
+                    theme=str(row[4]),
+                )
+            default_prefs = UserPreferences(telegram_id=telegram_id)
+            await conn.execute(
+                """
+                INSERT OR IGNORE INTO user_settings (
+                    telegram_id, stream_format, stream_bitrate, auto_lyrics_search, theme
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    telegram_id,
+                    default_prefs.stream_format,
+                    default_prefs.stream_bitrate,
+                    1 if default_prefs.auto_lyrics_search else 0,
+                    default_prefs.theme,
+                ),
+            )
+            await conn.commit()
+            return default_prefs
+
+    async def update_user_preferences(self, preferences: UserPreferences) -> UserPreferences:
+        """Insert or update user preferences in persistent storage."""
+        async with self._db.connect() as conn:
+            await conn.execute(
+                """
+                INSERT INTO user_settings (
+                    telegram_id, stream_format, stream_bitrate, auto_lyrics_search, theme, updated_at
+                ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(telegram_id) DO UPDATE SET
+                    stream_format = excluded.stream_format,
+                    stream_bitrate = excluded.stream_bitrate,
+                    auto_lyrics_search = excluded.auto_lyrics_search,
+                    theme = excluded.theme,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    preferences.telegram_id,
+                    preferences.stream_format,
+                    preferences.stream_bitrate,
+                    1 if preferences.auto_lyrics_search else 0,
+                    preferences.theme,
+                ),
+            )
+            await conn.commit()
+        return preferences
 
     async def create_access_request(self, telegram_id: int) -> AccessRequestRecord:
         """Create a new PENDING access request for `telegram_id`."""

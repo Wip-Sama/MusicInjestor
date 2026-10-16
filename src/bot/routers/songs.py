@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 import math
+import time
 from pathlib import Path
 from typing import Any
 
@@ -24,11 +25,14 @@ from src.bot.keyboards.admin import (
 from src.bot.keyboards.songs import (
     SORT_DESCRIPTIONS,
     SORT_LABELS,
+    SongsBulkReviewCallback,
     SongsPageCallback,
     SongsSortCallback,
     SongsToggleFieldCallback,
     build_bulk_research_menu_keyboard,
     build_bulk_research_plan_keyboard,
+    build_bulk_review_overview_keyboard,
+    build_bulk_track_review_keyboard,
     build_dry_run_confirmation_keyboard,
     build_input_cancel_keyboard,
     build_lyrics_input_keyboard,
@@ -62,6 +66,7 @@ from src.core.metadata import (
     parse_manual_search_query,
 )
 from src.core.models import (
+    AuditAction,
     AuditLogEntry,
     LibraryRescanReport,
     LibraryTrackRecord,
@@ -1524,6 +1529,8 @@ async def handle_songs_callback(
     # 4. Planned Bulk Metadata & Lyrics Re-Search
     if action == "bulk_menu":
         await ack_callback(callback)
+        fsm_data = (await state.get_data()) if state else {}
+        active_query = str(fsm_data.get("search_query") or fsm_data.get("last_search_query") or "").strip()
         await safe_edit_text(
             msg,
             format_screen(
@@ -1533,11 +1540,12 @@ async def handle_songs_callback(
                     "<b>LRCLIB</b> for multiple library tracks in a polite, rate-throttled batch.",
                     "• Rate-limiting: Requests are throttled to official API limits "
                     "(1 req/s MusicBrainz, 3 req/s LRCLIB) to prevent rate limit blocks (HTTP 429).",
-                    "• Dry-run: A preview of tracks and estimated duration will be displayed.",
+                    "• Scope selection: Choose whole library, current search filter, or missing lyrics/tags.",
+                    "• Dry-run & Review: Review tracks with ambiguous matches before applying.",
                 ],
                 footer_lines=["<i>🧭 Home › Songs › Bulk Re-Search</i>"],
             ),
-            reply_markup=build_bulk_research_menu_keyboard(),
+            reply_markup=build_bulk_research_menu_keyboard(has_filter=bool(active_query), query=active_query),
         )
         return
 
@@ -1546,6 +1554,7 @@ async def handle_songs_callback(
         filter_mode = action[len("bulk_plan_") :]
         filter_labels = {
             "all": "All Library Tracks",
+            "search": "Current Search Filter",
             "missing_lyrics": "Tracks Missing Lyrics",
             "missing_mbid": "Tracks Missing MusicBrainz Tags",
         }
@@ -1560,7 +1569,20 @@ async def handle_songs_callback(
             organizer=organizer,
         )
 
-        plan = await bulk_svc.plan_bulk_research(filter_mode=filter_mode)
+        target_track_ids: list[str] | None = None
+        if filter_mode == "search":
+            fsm_data = (await state.get_data()) if state else {}
+            active_query = str(
+                fsm_data.get("search_query") or fsm_data.get("last_search_query") or ""
+            ).strip()
+            if active_query:
+                search_results = await governance_repository.search_library_tracks(active_query)
+                target_track_ids = [t.id for t in search_results]
+                filter_name = f"Current Search ('{active_query[:16]}...')"
+            else:
+                target_track_ids = []
+
+        plan = await bulk_svc.plan_bulk_research(track_ids=target_track_ids, filter_mode=filter_mode)
         est_min = plan.estimated_seconds // 60
         est_sec = plan.estimated_seconds % 60
         time_str = f"{est_min}m {est_sec}s" if est_min > 0 else f"{est_sec}s"
@@ -1576,6 +1598,7 @@ async def handle_songs_callback(
                     f"• Missing MBID Tags: <b>{plan.missing_mbid_count}</b>",
                     f"• Estimated Duration: <b>~{time_str}</b> (at safe throttled speeds)",
                     "• High-confidence matches (&gt;= 98%) and fetched lyrics will be applied automatically.",
+                    "• Ambiguous matches will pause for your interactive review.",
                 ],
                 footer_lines=["<i>🧭 Home › Songs › Bulk Re-Search › Plan</i>"],
             ),
@@ -1595,7 +1618,19 @@ async def handle_songs_callback(
             organizer=organizer,
         )
 
-        plan = await bulk_svc.plan_bulk_research(filter_mode=filter_mode)
+        target_track_ids: list[str] | None = None
+        if filter_mode == "search":
+            fsm_data = (await state.get_data()) if state else {}
+            active_query = str(
+                fsm_data.get("search_query") or fsm_data.get("last_search_query") or ""
+            ).strip()
+            if active_query:
+                search_results = await governance_repository.search_library_tracks(active_query)
+                target_track_ids = [t.id for t in search_results]
+            else:
+                target_track_ids = []
+
+        plan = await bulk_svc.plan_bulk_research(track_ids=target_track_ids, filter_mode=filter_mode)
         await safe_edit_text(
             msg,
             format_loading_card(
@@ -1608,11 +1643,54 @@ async def handle_songs_callback(
         actor_id = current_user.telegram_id if current_user is not None else 0
         actor_name = current_user.display_name if current_user is not None else "Admin"
 
+        last_update_ts = 0.0
+
+        async def _tg_progress_cb(current: int, total: int, track_title: str, phase: str) -> None:
+            nonlocal last_update_ts
+            now = time.monotonic()
+            if now - last_update_ts >= 2.0 or current == total:
+                last_update_ts = now
+                pct = int((current / total) * 100) if total > 0 else 0
+                await safe_edit_text(
+                    msg,
+                    format_loading_card(
+                        "Executing Bulk Re-Search",
+                        f"Processing {current}/{total} ({pct}%)\n{track_title}",
+                        "🧭 Home › Songs › Bulk Re-Search",
+                    ),
+                )
+
         report = await bulk_svc.execute_bulk_research(
             plan,
             actor_id=actor_id,
             actor_name=actor_name,
+            progress_callback=_tg_progress_cb,
         )
+
+        if report.needs_review_count > 0:
+            pending_items = [item for item in report.details if item.get("status") == "needs_review"]
+            if state:
+                await state.update_data(bulk_pending_items=pending_items)
+            await safe_edit_text(
+                msg,
+                format_screen(
+                    title=f"⚠️ Bulk Re-Search: {report.needs_review_count} Track(s) Need Review",
+                    context_lines=[
+                        f"• Total Processed: <b>{report.total_tracks}</b>",
+                        f"• Automatically Applied: <b>{report.applied_count}</b>",
+                        f"• Needs Review / Ambiguous: <b>{report.needs_review_count}</b>",
+                        f"• Skipped / Unchanged: <b>{report.skipped_count}</b>",
+                        f"• Errors / Failed: <b>{report.failed_count}</b>",
+                        f"• Total Duration: <b>{report.elapsed_seconds}s</b>",
+                        "",
+                        "Some tracks had online matches that were ambiguous or had multiple candidates. "
+                        "Tap <b>Review Tracks</b> below to inspect and decide, or apply all.",
+                    ],
+                    footer_lines=["<i>🧭 Home › Songs › Bulk Re-Search › Review</i>"],
+                ),
+                reply_markup=build_bulk_review_overview_keyboard(report.needs_review_count),
+            )
+            return
 
         await safe_edit_text(
             msg,
@@ -2077,10 +2155,24 @@ async def handle_songs_callback(
         )
         meta_svc = _resolve_metadata_service(pipeline, settings)
         lyrics_client = _resolve_lyrics_client(pipeline, settings)
-        seed_meta = (
-            await meta_svc.read_local_metadata(record.storage_path)
-            if record.storage_path.is_file()
-            else TrackMetadata(
+        if record.storage_path.is_file():
+            local_meta = await meta_svc.read_local_metadata(record.storage_path)
+            seed_meta = TrackMetadata(
+                title=local_meta.title if local_meta.title != "Unknown Title" else record.title,
+                artist=local_meta.artist if local_meta.artist != "Unknown Artist" else record.artist,
+                album=local_meta.album if local_meta.album != "Unknown Album" else record.album,
+                album_artist=local_meta.album_artist,
+                year=local_meta.year or record.year,
+                track_number=local_meta.track_number or record.track_number or 1,
+                disc_number=local_meta.disc_number,
+                genre=local_meta.genre,
+                duration_seconds=local_meta.duration_seconds or int(round(record.duration_seconds)),
+                recording_mbid=local_meta.recording_mbid,
+                release_mbid=local_meta.release_mbid,
+                isrc=local_meta.isrc,
+            )
+        else:
+            seed_meta = TrackMetadata(
                 title=record.title,
                 artist=record.artist,
                 album=record.album,
@@ -2088,7 +2180,6 @@ async def handle_songs_callback(
                 track_number=record.track_number or 1,
                 duration_seconds=int(round(record.duration_seconds)),
             )
-        )
         candidates = await meta_svc.find_candidates(seed_meta)
         best = candidates[0].metadata
         fetched_lyrics = await lyrics_client.fetch_lyrics(best)
@@ -2104,7 +2195,7 @@ async def handle_songs_callback(
             changes["artist"] = best.artist
         if best.album != record.album:
             changes["album"] = best.album
-        if best.year != record.year:
+        if best.year is not None and best.year != record.year:
             changes["year"] = best.year
         if (best.track_number or 1) != (record.track_number or 1):
             changes["track_number"] = best.track_number or 1
@@ -2119,7 +2210,7 @@ async def handle_songs_callback(
             "new_title": best.title,
             "new_artist": best.artist,
             "new_album": best.album,
-            "new_year": best.year,
+            "new_year": best.year if best.year is not None else record.year,
             "new_track_number": best.track_number or record.track_number or 1,
             "new_recording_mbid": best.recording_mbid,
             "new_release_mbid": best.release_mbid,
@@ -2557,6 +2648,315 @@ async def handle_song_field_toggle(
     )
 
 
+@songs_router.callback_query(SongsBulkReviewCallback.filter())
+async def handle_bulk_review_callback(
+    callback: CallbackQuery,
+    callback_data: SongsBulkReviewCallback,
+    current_user: UserAccount | None = None,
+    governance_repository: GovernanceRepositoryPort | None = None,
+    organizer: LibraryOrganizer | None = None,
+    state: FSMContext | None = None,
+) -> None:
+    """Manage the interactive review session for tracks needing confirmation after bulk re-search."""
+    await ack_callback(callback)
+    if callback.message is None or governance_repository is None or organizer is None:
+        return
+
+    fsm_data = (await state.get_data()) if state else {}
+    pending_items: list[dict[str, Any]] = list(fsm_data.get("bulk_pending_items") or [])
+
+    action = callback_data.action
+
+    if action == "noop":
+        return
+
+    if action == "list":
+        if not pending_items:
+            await safe_edit_text(
+                callback.message,
+                format_screen(
+                    title="✅ No Pending Reviews",
+                    context_lines=["All bulk research candidates have been resolved or discarded."],
+                    footer_lines=["<i>🧭 Home › Songs › Bulk Review</i>"],
+                ),
+                reply_markup=build_bulk_research_menu_keyboard(),
+            )
+            return
+        await safe_edit_text(
+            callback.message,
+            format_screen(
+                title=f"🎛️ Bulk Review Overview ({len(pending_items)} Pending)",
+                context_lines=[
+                    f"You have <b>{len(pending_items)}</b> track(s) awaiting your decision.",
+                    "Tap <b>Review Tracks</b> to inspect proposed metadata and lyrics track-by-track, "
+                    "or apply/discard all remaining pending changes.",
+                ],
+                footer_lines=["<i>🧭 Home › Songs › Bulk Review</i>"],
+            ),
+            reply_markup=build_bulk_review_overview_keyboard(len(pending_items)),
+        )
+        return
+
+    if action == "discard_all":
+        if state:
+            await state.update_data(bulk_pending_items=[])
+        await safe_edit_text(
+            callback.message,
+            format_screen(
+                title="🗑️ Pending Changes Discarded",
+                context_lines=["All pending bulk research changes have been discarded."],
+                footer_lines=["<i>🧭 Home › Songs › Bulk Re-Search</i>"],
+            ),
+            reply_markup=build_bulk_research_menu_keyboard(),
+        )
+        return
+
+    if action == "apply_all":
+        if not pending_items:
+            return
+        await safe_edit_text(
+            callback.message,
+            format_loading_card(
+                "Applying Pending Changes",
+                f"Writing tags and lyrics for {len(pending_items)} tracks...",
+                "🧭 Home › Songs › Bulk Review",
+            ),
+        )
+        applied_count = 0
+        actor_id = current_user.telegram_id if current_user else 0
+        actor_name = current_user.display_name if current_user else "Admin"
+
+        for item in pending_items:
+            tid = str(item.get("track_id") or "")
+            pm = item.get("proposed_meta") or {}
+            plyrics = item.get("proposed_lyrics")
+            rec = await governance_repository.get_library_track(tid)
+            if rec is None or not rec.storage_path.is_file():
+                continue
+
+            lyrics_obj = None
+            if plyrics and str(plyrics).strip():
+                cleaned = str(plyrics).strip()
+                is_synced = "[" in cleaned and "]" in cleaned
+                lyrics_obj = LyricsData(
+                    synced_lyrics=cleaned if is_synced else None,
+                    plain_lyrics=None if is_synced else cleaned,
+                )
+
+            upd_meta = TrackMetadata(
+                title=str(pm.get("title") or rec.title),
+                artist=str(pm.get("artist") or rec.artist),
+                album=str(pm.get("album") or rec.album),
+                album_artist=str(pm.get("artist") or rec.artist),
+                year=pm.get("year") or rec.year,
+                track_number=pm.get("track_number") or rec.track_number or 1,
+                duration_seconds=int(round(rec.duration_seconds)),
+                recording_mbid=str(pm.get("recording_mbid")) if pm.get("recording_mbid") else None,
+                release_mbid=str(pm.get("release_mbid")) if pm.get("release_mbid") else None,
+            )
+            new_path = await organizer.relocate_and_retag_track(
+                rec.storage_path,
+                upd_meta,
+                lyrics_obj,
+            )
+            final_lyrics = await organizer.read_track_lyrics(new_path)
+            has_lyr = bool(final_lyrics and (final_lyrics.has_synced or final_lyrics.has_any))
+            await governance_repository.update_library_track_full(
+                rec.id,
+                title=upd_meta.title,
+                artist=upd_meta.artist,
+                album=upd_meta.album,
+                year=upd_meta.year,
+                track_number=upd_meta.track_number,
+                storage_path=new_path,
+                has_synced_lyrics=has_lyr,
+                recording_mbid=upd_meta.recording_mbid,
+                release_mbid=upd_meta.release_mbid,
+                modified_by=actor_id,
+            )
+            await governance_repository.append_audit_log(
+                AuditLogEntry(
+                    actor_id=actor_id,
+                    action=AuditAction.BULK_METADATA_ENRICHED,
+                    target_entity=rec.id,
+                    details={
+                        "actor_name": actor_name,
+                        "bulk_review": True,
+                        "old_title": rec.title,
+                        "new_title": upd_meta.title,
+                    },
+                )
+            )
+            applied_count += 1
+
+        if state:
+            await state.update_data(bulk_pending_items=[])
+
+        await safe_edit_text(
+            callback.message,
+            format_screen(
+                title="✅ All Pending Changes Applied",
+                context_lines=[
+                    f"Successfully applied changes to <b>{applied_count}</b> track(s).",
+                    "Audio files, tags, and lyrics sidecars have been updated.",
+                ],
+                footer_lines=["<i>🧭 Home › Songs › Bulk Re-Search</i>"],
+            ),
+            reply_markup=build_bulk_research_menu_keyboard(),
+        )
+        return
+
+    # Single-track review actions: view, apply_one, skip_one, discard_one
+    if not pending_items:
+        await safe_edit_text(
+            callback.message,
+            format_screen(
+                title="✅ All Pending Reviews Completed",
+                context_lines=["There are no more tracks awaiting review."],
+                footer_lines=["<i>🧭 Home › Songs › Bulk Review</i>"],
+            ),
+            reply_markup=build_bulk_research_menu_keyboard(),
+        )
+        return
+
+    curr_idx = max(0, min(callback_data.index, len(pending_items) - 1))
+
+    if action == "skip_one":
+        next_idx = (curr_idx + 1) % len(pending_items)
+        curr_idx = next_idx
+
+    elif action == "discard_one":
+        pending_items.pop(curr_idx)
+        if state:
+            await state.update_data(bulk_pending_items=pending_items)
+        if not pending_items:
+            await safe_edit_text(
+                callback.message,
+                format_screen(
+                    title="✅ All Reviews Completed",
+                    context_lines=["All pending items have been reviewed or discarded."],
+                    footer_lines=["<i>🧭 Home › Songs › Bulk Review</i>"],
+                ),
+                reply_markup=build_bulk_research_menu_keyboard(),
+            )
+            return
+        curr_idx = max(0, min(curr_idx, len(pending_items) - 1))
+
+    elif action == "apply_one":
+        item = pending_items.pop(curr_idx)
+        if state:
+            await state.update_data(bulk_pending_items=pending_items)
+        tid = str(item.get("track_id") or "")
+        pm = item.get("proposed_meta") or {}
+        plyrics = item.get("proposed_lyrics")
+        rec = await governance_repository.get_library_track(tid)
+        if rec is not None and rec.storage_path.is_file():
+            actor_id = current_user.telegram_id if current_user else 0
+            actor_name = current_user.display_name if current_user else "Admin"
+            lyrics_obj = None
+            if plyrics and str(plyrics).strip():
+                cleaned = str(plyrics).strip()
+                is_synced = "[" in cleaned and "]" in cleaned
+                lyrics_obj = LyricsData(
+                    synced_lyrics=cleaned if is_synced else None,
+                    plain_lyrics=None if is_synced else cleaned,
+                )
+
+            upd_meta = TrackMetadata(
+                title=str(pm.get("title") or rec.title),
+                artist=str(pm.get("artist") or rec.artist),
+                album=str(pm.get("album") or rec.album),
+                album_artist=str(pm.get("artist") or rec.artist),
+                year=pm.get("year") or rec.year,
+                track_number=pm.get("track_number") or rec.track_number or 1,
+                duration_seconds=int(round(rec.duration_seconds)),
+                recording_mbid=str(pm.get("recording_mbid")) if pm.get("recording_mbid") else None,
+                release_mbid=str(pm.get("release_mbid")) if pm.get("release_mbid") else None,
+            )
+            new_path = await organizer.relocate_and_retag_track(
+                rec.storage_path,
+                upd_meta,
+                lyrics_obj,
+            )
+            final_lyrics = await organizer.read_track_lyrics(new_path)
+            has_lyr = bool(final_lyrics and (final_lyrics.has_synced or final_lyrics.has_any))
+            await governance_repository.update_library_track_full(
+                rec.id,
+                title=upd_meta.title,
+                artist=upd_meta.artist,
+                album=upd_meta.album,
+                year=upd_meta.year,
+                track_number=upd_meta.track_number,
+                storage_path=new_path,
+                has_synced_lyrics=has_lyr,
+                recording_mbid=upd_meta.recording_mbid,
+                release_mbid=upd_meta.release_mbid,
+                modified_by=actor_id,
+            )
+            await governance_repository.append_audit_log(
+                AuditLogEntry(
+                    actor_id=actor_id,
+                    action=AuditAction.BULK_METADATA_ENRICHED,
+                    target_entity=rec.id,
+                    details={
+                        "actor_name": actor_name,
+                        "bulk_review_single": True,
+                        "title": upd_meta.title,
+                    },
+                )
+            )
+
+        if not pending_items:
+            await safe_edit_text(
+                callback.message,
+                format_screen(
+                    title="✅ All Reviews Completed",
+                    context_lines=["All pending items have been applied."],
+                    footer_lines=["<i>🧭 Home › Songs › Bulk Review</i>"],
+                ),
+                reply_markup=build_bulk_research_menu_keyboard(),
+            )
+            return
+        curr_idx = max(0, min(curr_idx, len(pending_items) - 1))
+
+    # Render track at curr_idx
+    item = pending_items[curr_idx]
+    rec = await governance_repository.get_library_track(str(item.get("track_id") or ""))
+    if rec is None:
+        return
+    pm = item.get("proposed_meta") or {}
+    plyrics = item.get("proposed_lyrics")
+
+    year_diff = f"{rec.year} ➡️ {pm.get('year')}" if pm.get("year") != rec.year else str(rec.year or "N/A")
+    album_diff = f"{rec.album} ➡️ {pm.get('album')}" if pm.get("album") != rec.album else rec.album
+    title_diff = f"{rec.title} ➡️ {pm.get('title')}" if pm.get("title") != rec.title else rec.title
+    artist_diff = f"{rec.artist} ➡️ {pm.get('artist')}" if pm.get("artist") != rec.artist else rec.artist
+
+    lyrics_status = "Unchanged"
+    if plyrics:
+        lyrics_status = "Found online (synced)" if "[" in str(plyrics) else "Found online (plain)"
+
+    await safe_edit_text(
+        callback.message,
+        format_screen(
+            title=f"🎛️ Review Track ({curr_idx + 1} of {len(pending_items)})",
+            context_lines=[
+                f"• <b>Title:</b> <code>{html.escape(title_diff)}</code>",
+                f"• <b>Artist:</b> <code>{html.escape(artist_diff)}</code>",
+                f"• <b>Album:</b> <code>{html.escape(album_diff)}</code>",
+                f"• <b>Year:</b> <code>{html.escape(str(year_diff))}</code>",
+                f"• <b>Lyrics:</b> <code>{html.escape(lyrics_status)}</code>",
+                "",
+                "Choose an action for this track:",
+            ],
+            footer_lines=[
+                f"<i>🧭 Home › Songs › Bulk Review › Track {curr_idx + 1}/{len(pending_items)}</i>"
+            ],
+        ),
+        reply_markup=build_bulk_track_review_keyboard(curr_idx, len(pending_items)),
+    )
+
+
 @songs_router.message(
     SongManagementStates.awaiting_metadata_input,
     _is_non_command_text,
@@ -2814,7 +3214,7 @@ async def handle_custom_research_input(
         changes["artist"] = best.artist
     if best.album != record.album:
         changes["album"] = best.album
-    if best.year != record.year:
+    if best.year is not None and best.year != record.year:
         changes["year"] = best.year
     if (best.track_number or 1) != (record.track_number or 1):
         changes["track_number"] = best.track_number or 1
@@ -2830,7 +3230,7 @@ async def handle_custom_research_input(
         "new_title": best.title,
         "new_artist": best.artist,
         "new_album": best.album,
-        "new_year": best.year,
+        "new_year": best.year if best.year is not None else record.year,
         "new_track_number": best.track_number or record.track_number or 1,
         "new_recording_mbid": best.recording_mbid,
         "new_release_mbid": best.release_mbid,

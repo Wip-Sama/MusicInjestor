@@ -844,6 +844,27 @@ class StubQueuePipeline:
         await self.repo.save_job(job)
         return IngestionResult(job=job)
 
+    async def complete_custom_ingestion(
+        self,
+        job_id: str,
+        metadata: TrackMetadata,
+        *,
+        custom_lyrics: Any = None,
+        custom_cover_bytes: bytes | None = None,
+        custom_cover_mime: str = "image/jpeg",
+        stage_callback: Any = None,
+    ) -> IngestionResult:
+        job = await self.repo.get_job(job_id)
+        if job is None:
+            raise KeyError(job_id)
+        if stage_callback is not None:
+            job.state = JobState.ORGANIZING
+            await stage_callback(job)
+        job.selected_metadata = metadata
+        job.state = JobState.COMPLETED
+        await self.repo.save_job(job)
+        return IngestionResult(job=job, tracks_ingested=1)
+
 
 @pytest.mark.anyio
 async def test_ingest_upload_audio_file(tmp_path: Path) -> None:
@@ -1011,8 +1032,17 @@ async def test_queue_list_and_actions(tmp_path: Path) -> None:
             )
         ],
     )
+    job3 = IngestionJob(
+        job_id="job_q3",
+        source_path=tmp_path / "q3.mp3",
+        original_filename="q3.mp3",
+        state=JobState.AWAITING_CONFIRMATION,
+        user_id=1001,
+        source_type=SourceType.DIRECT_AUDIO,
+    )
     await repo.save_job(job1)
     await repo.save_job(job2)
+    await repo.save_job(job3)
 
     server = BotWebServer(
         bot_token=TEST_BOT_TOKEN,
@@ -1034,7 +1064,7 @@ async def test_queue_list_and_actions(tmp_path: Path) -> None:
             list_resp = await client.get(f"{base_url}/api/v1/app/queue", headers=headers)
             assert list_resp.status_code == 200
             q_data = list_resp.json()
-            assert len(q_data["jobs"]) == 2
+            assert len(q_data["jobs"]) == 3
             assert q_data["can_view_global"] is True
 
             # 2. Pause job_q1
@@ -1081,6 +1111,26 @@ async def test_queue_list_and_actions(tmp_path: Path) -> None:
             )
             assert sc_resp.status_code == 200
             assert sc_resp.json()["job"]["state"] == "COMPLETED"
+
+            # 7. Apply edit with custom metadata on job_q3
+            ae_resp = await client.post(
+                f"{base_url}/api/v1/app/queue/job_q3/action",
+                headers=headers,
+                json={
+                    "action": "apply_edit",
+                    "title": "Custom Edited Song",
+                    "artist": "Custom Artist",
+                    "album": "Custom Album",
+                    "year": 2025,
+                    "track_number": 5,
+                },
+            )
+            assert ae_resp.status_code == 200
+            assert ae_resp.json()["job"]["state"] == "COMPLETED"
+            assert ae_resp.json()["job"]["selected_metadata"]["title"] == "Custom Edited Song"
+            assert ae_resp.json()["job"]["selected_metadata"]["artist"] == "Custom Artist"
+            assert ae_resp.json()["job"]["selected_metadata"]["year"] == 2025
+            assert ae_resp.json()["job"]["selected_metadata"]["track_number"] == 5
     finally:
         await server.stop()
 
@@ -2411,5 +2461,236 @@ async def test_spa_static_and_placeholder_fallback(tmp_path: Path) -> None:
                 assert "Telegram Music Mini App" in resp_ph.text
         finally:
             await server_no_static.stop()
+    finally:
+        await server.stop()
+
+
+@pytest.mark.anyio
+async def test_user_settings_api_endpoints(tmp_path: Path) -> None:
+    """Verify GET and POST /api/v1/app/user/settings round-trip."""
+    server, repo = await _setup_test_server(
+        tmp_path,
+        owner_telegram_ids=(123456,),
+        dev_mode=True,
+    )
+    try:
+        base_url = f"http://127.0.0.1:{server.bound_port}"
+        dev_token = _make_dev_token(123456)
+        headers = {"Authorization": f"tma {dev_token}"}
+
+        async with httpx.AsyncClient() as client:
+            # 1. GET default settings
+            resp = await client.get(f"{base_url}/api/v1/app/user/settings", headers=headers)
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["telegram_id"] == 123456
+            assert data["stream_format"] == "auto"
+            assert data["stream_bitrate"] == 128
+            assert data["auto_lyrics_search"] is True
+
+            # 2. POST updated settings
+            update_payload = {
+                "stream_format": "opus",
+                "stream_bitrate": 160,
+                "auto_lyrics_search": False,
+                "theme": "dark",
+            }
+            post_resp = await client.post(
+                f"{base_url}/api/v1/app/user/settings",
+                headers=headers,
+                json=update_payload,
+            )
+            assert post_resp.status_code == 200
+            updated_data = post_resp.json()
+            assert updated_data["stream_format"] == "opus"
+            assert updated_data["stream_bitrate"] == 160
+            assert updated_data["auto_lyrics_search"] is False
+            assert updated_data["theme"] == "dark"
+
+            # 3. Verify persistence
+            reloaded_resp = await client.get(f"{base_url}/api/v1/app/user/settings", headers=headers)
+            assert reloaded_resp.status_code == 200
+            assert reloaded_resp.json()["stream_format"] == "opus"
+    finally:
+        await server.stop()
+
+
+@pytest.mark.anyio
+async def test_transcoded_stream_format_options(tmp_path: Path) -> None:
+    """Verify audio streaming with format=original, format=opus, and format=mp3."""
+    server, repo = await _setup_test_server(
+        tmp_path,
+        owner_telegram_ids=(123456,),
+        dev_mode=True,
+    )
+    try:
+        base_url = f"http://127.0.0.1:{server.bound_port}"
+        dev_token = _make_dev_token(123456)
+        headers = {"Authorization": f"tma {dev_token}"}
+
+        audio_file = tmp_path / "song.flac"
+        audio_file.write_bytes(b"FLAC_AUDIO_CONTENT_FOR_STREAMING_TEST_12345")
+        track_rec = LibraryTrackRecord(
+            id="trk_fmt_test",
+            job_id="job1",
+            uploaded_by=123456,
+            title="Format Song",
+            artist="Format Artist",
+            album="Format Album",
+            duration_seconds=60,
+            storage_path=audio_file,
+            fingerprint="fp_fmt_test",
+        )
+        await repo.upsert_scanned_library_track(track_rec)
+
+        async with httpx.AsyncClient() as client:
+            # 1. format=original (direct stream without transcoding)
+            resp_orig = await client.get(
+                f"{base_url}/api/v1/app/tracks/trk_fmt_test/audio?format=original",
+                headers=headers,
+            )
+            assert resp_orig.status_code == 200
+            assert resp_orig.content == b"FLAC_AUDIO_CONTENT_FOR_STREAMING_TEST_12345"
+
+            # 2. format=opus with mocked transcoding
+            with (
+                patch("src.bot.webapp_server.is_ffmpeg_available", return_value=True),
+                patch(
+                    "src.bot.webapp_server.async_transcode_audio",
+                    new_callable=AsyncMock,
+                    return_value=b"TRANSCODED_OPUS_DATA",
+                ) as mock_transcode,
+            ):
+                resp_opus = await client.get(
+                    f"{base_url}/api/v1/app/tracks/trk_fmt_test/audio?format=opus&bitrate=96",
+                    headers=headers,
+                )
+                assert resp_opus.status_code == 200
+                assert resp_opus.content == b"TRANSCODED_OPUS_DATA"
+                assert "audio/ogg" in resp_opus.headers["Content-Type"]
+                assert mock_transcode.called
+
+            # 3. format=mp3 with mocked transcoding
+            with (
+                patch("src.bot.webapp_server.is_ffmpeg_available", return_value=True),
+                patch(
+                    "src.bot.webapp_server.async_transcode_audio",
+                    new_callable=AsyncMock,
+                    return_value=b"TRANSCODED_MP3_DATA",
+                ),
+            ):
+                resp_mp3 = await client.get(
+                    f"{base_url}/api/v1/app/tracks/trk_fmt_test/audio?format=mp3&bitrate=320",
+                    headers=headers,
+                )
+                assert resp_mp3.status_code == 200
+                assert resp_mp3.content == b"TRANSCODED_MP3_DATA"
+                assert "audio/mpeg" in resp_mp3.headers["Content-Type"]
+    finally:
+        await server.stop()
+
+
+@pytest.mark.anyio
+async def test_oidc_disconnect_and_override_endpoints(tmp_path: Path) -> None:
+    """Verify self-service OIDC disconnect, admin OIDC disconnect, and admin role override endpoints."""
+    server, repo = await _setup_test_server(
+        tmp_path,
+        owner_telegram_ids=(123456,),
+        dev_mode=True,
+    )
+    try:
+        base_url = f"http://127.0.0.1:{server.bound_port}"
+        admin_token = _make_dev_token(123456)
+        admin_headers = {"Authorization": f"tma {admin_token}"}
+
+        # Create target user with OIDC linked
+        target_id = 998877
+        target_token = _make_dev_token(target_id)
+        target_headers = {"Authorization": f"tma {target_token}"}
+
+        user = UserAccount(
+            telegram_id=target_id,
+            username="target_oidc_user",
+            display_name="Target OIDC",
+            role=UserRole.UPLOADER,
+            authentik_sub="sub-target-998877",
+            authentik_username="target_oidc_user",
+            access_token_encrypted="tok_123",
+        )
+        await repo.upsert_user(user)
+
+        async with httpx.AsyncClient() as client:
+            # 1. GET /api/v1/app/auth/me shows authentik_linked=True and oidc_role_override=False
+            me_resp = await client.get(f"{base_url}/api/v1/app/auth/me", headers=target_headers)
+            assert me_resp.status_code == 200
+            me_data = me_resp.json()
+            assert me_data["authentik_linked"] is True
+            assert me_data["oidc_role_override"] is False
+
+            # 2. Non-admin cannot call admin override endpoint -> 403
+            forbidden_override = await client.post(
+                f"{base_url}/api/v1/app/admin/users/{target_id}/oidc/override",
+                headers=target_headers,
+                json={"override": True},
+            )
+            assert forbidden_override.status_code == 403
+
+            # 3. Admin toggles override on
+            override_resp = await client.post(
+                f"{base_url}/api/v1/app/admin/users/{target_id}/oidc/override",
+                headers=admin_headers,
+                json={"override": True},
+            )
+            assert override_resp.status_code == 200
+            override_data = override_resp.json()
+            assert override_data["success"] is True
+            assert override_data["user"]["oidc_role_override"] is True
+
+            # 4. Admin toggles override off
+            override_off_resp = await client.post(
+                f"{base_url}/api/v1/app/admin/users/{target_id}/oidc/override",
+                headers=admin_headers,
+                json={"override": False},
+            )
+            assert override_off_resp.status_code == 200
+            assert override_off_resp.json()["user"]["oidc_role_override"] is False
+
+            # 5. Non-admin cannot call admin disconnect endpoint -> 403
+            forbidden_disconnect = await client.post(
+                f"{base_url}/api/v1/app/admin/users/{target_id}/oidc/disconnect",
+                headers=target_headers,
+            )
+            assert forbidden_disconnect.status_code == 403
+
+            # 6. User calls self-service disconnect
+            self_disc_resp = await client.post(
+                f"{base_url}/api/v1/app/auth/oidc/disconnect",
+                headers=target_headers,
+            )
+            assert self_disc_resp.status_code == 200
+            self_disc_data = self_disc_resp.json()
+            assert self_disc_data["success"] is True
+            assert self_disc_data["authentik_linked"] is False
+
+            # Calling disconnect again returns 400
+            disc_again_resp = await client.post(
+                f"{base_url}/api/v1/app/auth/oidc/disconnect",
+                headers=target_headers,
+            )
+            assert disc_again_resp.status_code == 400
+
+            # 7. Relink and test admin disconnect
+            user.authentik_sub = "sub-target-998877"
+            user.authentik_username = "target_oidc_user"
+            user.access_token_encrypted = "tok_123"
+            await repo.upsert_user(user)
+            admin_disc_resp = await client.post(
+                f"{base_url}/api/v1/app/admin/users/{target_id}/oidc/disconnect",
+                headers=admin_headers,
+            )
+            assert admin_disc_resp.status_code == 200
+            admin_disc_data = admin_disc_resp.json()
+            assert admin_disc_data["success"] is True
+            assert admin_disc_data["user"]["authentik_linked"] is False
     finally:
         await server.stop()

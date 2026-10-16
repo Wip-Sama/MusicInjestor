@@ -169,6 +169,7 @@ def build_home_menu_inline_keyboard(
     builder.button(text="🟢 Status", callback_data=MenuCallback(action="status").pack())
     if user is not None and has_permission(user, Permission.MANAGE_USERS):
         builder.button(text="👮 Admin Panel", callback_data=AdminActionCallback(action="panel").pack())
+    builder.button(text="⚙️ Settings", callback_data=MenuCallback(action="settings").pack())
     builder.button(text="ℹ️ Help", callback_data=MenuCallback(action="help").pack())
     if web_app_url and web_app_url.strip():
         builder.adjust(1, 2)
@@ -336,7 +337,11 @@ def build_oidc_link_keyboard(
             InlineKeyboardButton(
                 text=f"📋 Copy Subject ({subject[:12]})",
                 copy_text=CopyTextButton(text=subject),
-            )
+            ),
+            InlineKeyboardButton(
+                text="❌ Disconnect SSO",
+                callback_data=AccessReqSimpleCallback(action="oidc_disconnect_self").pack(),
+            ),
         )
     effective_back = back_callback or MenuCallback(action="home").pack()
     append_escape_row(
@@ -774,6 +779,26 @@ def build_user_detail_keyboard(
             callback_data=AdminTargetCallback(action="resync", target_id=target_user.telegram_id).pack(),
         ),
     )
+    if target_user.is_oidc_linked:
+        override_label = (
+            "🔓 Unlock Role (Sync OIDC)" if target_user.oidc_role_override else "🔒 Lock Role (Override OIDC)"
+        )
+        builder.row(
+            InlineKeyboardButton(
+                text=override_label,
+                callback_data=AdminTargetCallback(
+                    action="toggle_override",
+                    target_id=target_user.telegram_id,
+                ).pack(),
+            ),
+            InlineKeyboardButton(
+                text="❌ Disconnect OIDC",
+                callback_data=AdminTargetCallback(
+                    action="oidc_disconnect",
+                    target_id=target_user.telegram_id,
+                ).pack(),
+            ),
+        )
     builder.row(
         InlineKeyboardButton(
             text="📤 User Uploads",

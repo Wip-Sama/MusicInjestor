@@ -20,8 +20,10 @@ from src.bot.routers.commands import (
     handle_menu_navigation_callback,
     handle_queue_command,
     handle_start,
+    render_queue_overview_screen,
 )
 from src.config.settings import AppSettings
+from src.core.bulk_research import BulkResearchProgress, set_active_bulk_research
 from src.core.models import (
     IngestionJob,
     JobState,
@@ -70,6 +72,28 @@ async def test_render_status_card_scenarios(tmp_path: Path) -> None:
 
     card2 = await _render_status_card(user, gov_repo, None, organizer=organizer)
     assert "System &amp; Session Status" in card2
+
+    # Active bulk research rendering in status and queue
+    try:
+        set_active_bulk_research(
+            BulkResearchProgress(
+                total_tracks=10,
+                current_index=3,
+                current_track="Test Artist - Test Title",
+                actor_id=1,
+                actor_name="TestAdmin",
+            )
+        )
+        card3 = await _render_status_card(user, gov_repo, None, organizer=organizer)
+        assert "Bulk Re-Search" in card3
+        assert "3/10" in card3
+
+        text, kb = await render_queue_overview_screen(user, gov_repo)
+        assert "Bulk Re-Search In Progress" in text
+        assert "Test Artist - Test Title" in text
+        assert "TestAdmin" in text
+    finally:
+        set_active_bulk_research(None)
 
 
 def test_parse_fixtags_args() -> None:

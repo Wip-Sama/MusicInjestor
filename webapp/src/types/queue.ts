@@ -64,6 +64,21 @@ export interface QueueJob {
   candidates: CandidateItem[];
 }
 
+export interface ActiveBulkResearch {
+  total_tracks: number;
+  current_index: number;
+  current_track: string;
+  status: string;
+  applied_count: number;
+  needs_review_count: number;
+  skipped_count: number;
+  failed_count: number;
+  actor_id: number;
+  actor_name: string;
+  started_at: number;
+  percent: number;
+}
+
 export interface QueueResponse {
   concurrency_limit: number;
   active_count: number;
@@ -72,6 +87,7 @@ export interface QueueResponse {
   can_view_global: boolean;
   scope: 'mine' | 'global';
   jobs: QueueJob[];
+  active_bulk_research?: ActiveBulkResearch | null;
 }
 
 export interface QueueEvent {
@@ -82,10 +98,12 @@ export interface QueueEvent {
     | 'job_completed'
     | 'job_failed'
     | 'job_state_changed'
+    | 'bulk_research_progress'
     | 'connected';
   job_id?: string;
   user_id?: number;
   state?: string;
   job?: QueueJob;
+  data?: ActiveBulkResearch | null;
 }
 

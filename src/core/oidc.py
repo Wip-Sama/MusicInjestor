@@ -168,6 +168,7 @@ class AuthentikOidcService:
         redirect_uri: str,
         notifier: AdminLogNotifierPort | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
+        role_mapping: dict[str, str] | None = None,
     ) -> None:
         self._repo = repository
         self._secret_key = secret_key
@@ -179,6 +180,7 @@ class AuthentikOidcService:
         self._redirect_uri = redirect_uri
         self._notifier = notifier
         self._transport = transport
+        self._role_mapping = role_mapping
 
     def build_authorization_url(
         self,
@@ -278,8 +280,13 @@ class AuthentikOidcService:
             or user.authentik_username
             or ""
         )
-        raw_groups = claims.get("groups", [])
-        new_groups = tuple(str(g) for g in raw_groups) if isinstance(raw_groups, (list, tuple)) else ()
+        raw_groups = claims.get("groups") or claims.get("roles") or []
+        if isinstance(raw_groups, (list, tuple)):
+            new_groups = tuple(str(g) for g in raw_groups)
+        elif isinstance(raw_groups, str):
+            new_groups = tuple(g.strip() for g in raw_groups.split(",") if g.strip())
+        else:
+            new_groups = ()
         is_active = bool(claims.get("is_active", claims.get("active", True)))
 
         now = datetime.now(UTC)
@@ -297,9 +304,17 @@ class AuthentikOidcService:
             cancelled_jobs = await self._repo.cancel_queued_jobs_for_user(user.telegram_id)
             group_diff = "Account deactivated/disabled in Authentik"
         else:
-            mapped_role = evaluate_oidc_role(new_groups)
+            mapped_role = evaluate_oidc_role(new_groups, self._role_mapping)
             if user.role != UserRole.OWNER:
-                user.role = mapped_role
+                if user.oidc_role_override:
+                    logger.info(
+                        "User %d has oidc_role_override=True; retaining local role %s instead of IDP role %s",
+                        user.telegram_id,
+                        user.role.value,
+                        mapped_role.value,
+                    )
+                else:
+                    user.role = mapped_role
             if user.role == UserRole.GUEST and previous_role != UserRole.GUEST:
                 cancelled_jobs = await self._repo.cancel_queued_jobs_for_user(user.telegram_id)
             group_diff = _describe_group_diff(old_groups, new_groups)
@@ -456,3 +471,33 @@ class AuthentikOidcService:
             return await self.sync_user_claims(user, merged_claims)
 
         return await self.refresh_user_from_idp(user)
+
+    async def unlink_user_oidc(self, user: UserAccount, actor_id: int | None = None) -> UserAccount:
+        """Disconnect and unlink an Authentik OIDC identity from `user`."""
+        old_sub = user.authentik_sub
+        old_username = user.authentik_username
+        user.authentik_sub = None
+        user.authentik_username = None
+        user.authentik_groups = ()
+        user.access_token_encrypted = None
+        user.refresh_token_encrypted = None
+        user.token_expires_at = None
+        user.last_oidc_sync = None
+        user.oidc_role_override = False
+        user.updated_at = datetime.now(UTC)
+        await self._repo.upsert_user(user)
+
+        effective_actor = actor_id or user.telegram_id
+        await self._repo.append_audit_log(
+            AuditLogEntry(
+                actor_id=effective_actor,
+                action=AuditAction.OIDC_UNLINKED,
+                target_entity=f"user:{user.telegram_id}",
+                details={
+                    "previous_authentik_sub": old_sub,
+                    "previous_authentik_username": old_username,
+                    "unlinked_by": effective_actor,
+                },
+            )
+        )
+        return user

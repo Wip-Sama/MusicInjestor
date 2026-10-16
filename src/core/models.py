@@ -84,6 +84,8 @@ class AuditAction(StrEnum):
 
     ROLE_UPDATED = "ROLE_UPDATED"
     OIDC_SYNC = "OIDC_SYNC"
+    OIDC_UNLINKED = "OIDC_UNLINKED"
+    OIDC_OVERRIDE_UPDATED = "OIDC_OVERRIDE_UPDATED"
     ACCESS_REQUESTED = "ACCESS_REQUESTED"
     ACCESS_DENIED = "ACCESS_DENIED"
     USER_BLOCKED = "USER_BLOCKED"
@@ -140,6 +142,7 @@ class UserAccount:
     last_oidc_sync: datetime | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    oidc_role_override: bool = False
 
     @property
     def is_oidc_linked(self) -> bool:
@@ -153,6 +156,17 @@ class UserAccount:
             clean = self.username.strip().lstrip("@")
             return f"@{clean}"
         return self.display_name
+
+
+@dataclass(slots=True)
+class UserPreferences:
+    """User-specific playback, ingestion, and interface preferences."""
+
+    telegram_id: int
+    stream_format: str = "auto"
+    stream_bitrate: int = 128
+    auto_lyrics_search: bool = True
+    theme: str = "system"
 
 
 @dataclass(frozen=True, slots=True)

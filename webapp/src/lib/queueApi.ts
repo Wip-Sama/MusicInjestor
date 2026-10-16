@@ -99,6 +99,24 @@ export async function manualSearch(jobId: string, query: string): Promise<QueueJ
   return executeQueueAction(jobId, { action: 'manual_search', query });
 }
 
+export interface ApplyJobEditPayload {
+  title?: string;
+  artist?: string;
+  album?: string;
+  year?: number | null;
+  track_number?: number | null;
+  recording_mbid?: string | null;
+  release_mbid?: string | null;
+  lyrics?: string | null;
+}
+
+export async function applyJobEdit(
+  jobId: string,
+  payload: ApplyJobEditPayload
+): Promise<QueueJob> {
+  return executeQueueAction(jobId, { action: 'apply_edit', ...payload });
+}
+
 export function connectQueueEvents(
   onEvent: (event: QueueEvent) => void,
   onError?: (err: Event) => void

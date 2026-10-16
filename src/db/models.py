@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS users (
     token_expires_at TIMESTAMP,
     last_oidc_sync TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    oidc_role_override INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -128,6 +129,18 @@ CREATE TABLE IF NOT EXISTS tag_correction_requests (
 );
 """
 
+CREATE_USER_SETTINGS_TABLE = """
+CREATE TABLE IF NOT EXISTS user_settings (
+    telegram_id INTEGER PRIMARY KEY REFERENCES users(telegram_id),
+    stream_format TEXT NOT NULL DEFAULT 'auto',
+    stream_bitrate INTEGER NOT NULL DEFAULT 128,
+    auto_lyrics_search INTEGER NOT NULL DEFAULT 1,
+    theme TEXT NOT NULL DEFAULT 'system',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
 CREATE_USERS_ROLE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
 """
@@ -158,6 +171,7 @@ TABLE_DDL_STATEMENTS: tuple[str, ...] = (
     CREATE_TRACKS_TABLE,
     CREATE_AUDIT_LOGS_TABLE,
     CREATE_TAG_CORRECTION_REQUESTS_TABLE,
+    CREATE_USER_SETTINGS_TABLE,
 )
 
 INDEX_DDL_STATEMENTS: tuple[str, ...] = (
@@ -196,3 +210,5 @@ LIBRARY_TRACKS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("source_chat_id", "INTEGER"),
     ("source_message_id", "INTEGER"),
 )
+
+USERS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (("oidc_role_override", "INTEGER NOT NULL DEFAULT 0"),)

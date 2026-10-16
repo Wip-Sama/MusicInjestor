@@ -13,10 +13,12 @@ from aiogram.types import CallbackQuery, FSInputFile, Message
 from src.bot.keyboards.admin import (
     BTN_MAIN_ADMIN,
     RESERVED_MENU_BUTTONS,
+    MenuCallback,
     build_admin_dashboard_keyboard,
     build_admin_subscreen_keyboard,
     build_back_to_home_keyboard,
     build_main_menu_keyboard,
+    build_oidc_link_keyboard,
     build_queued_job_keyboard,
     build_tag_correction_review_keyboard,
     build_user_detail_keyboard,
@@ -24,7 +26,11 @@ from src.bot.keyboards.admin import (
     build_user_uploads_keyboard,
 )
 from src.bot.keyboards.verification import build_verification_keyboard
-from src.bot.routers.commands import render_queue_overview_screen
+from src.bot.routers.commands import (
+    render_queue_overview_screen,
+    render_sso_card,
+    resolve_oidc_url,
+)
 from src.bot.routers.files import format_ingestion_summary
 from src.bot.states import AdminStates, IngestionStates
 from src.bot.ui import (
@@ -74,7 +80,7 @@ def parse_access_request_callback(data: str) -> tuple[str, int | None, UserRole 
         raise ValueError(msg)
 
     action = parts[1]
-    if action in {"request", "oidc_disabled"}:
+    if action in {"request", "oidc_disabled", "oidc_disconnect_self"}:
         return action, None, None
     if action == "deny" and len(parts) == 3:
         return action, int(parts[2]), None
@@ -112,6 +118,8 @@ def parse_admin_callback(data: str) -> tuple[str, int | None, UserRole | None]:
             "user",
             "block",
             "resync",
+            "toggle_override",
+            "oidc_disconnect",
             "tag_approve",
             "tag_reject",
             "user_uploads",
@@ -379,8 +387,12 @@ async def handle_access_request_callback(
     callback: CallbackQuery,
     current_user: UserAccount | None = None,
     governance_service: GovernanceService | None = None,
+    oidc_service: AuthentikOidcService | None = None,
+    settings: AppSettings | None = None,
 ) -> None:
-    """Process guest `[ 🙋 Request Access ]` clicks and Admin Channel `[ Approve / Deny ]` actions."""
+    """Process guest `[ 🙋 Request Access ]` clicks, OIDC self-disconnect,
+    and Admin Channel `[ Approve / Deny ]` actions.
+    """
     if not callback.data or current_user is None or governance_service is None:
         await ack_callback(callback, "Action unavailable.", show_alert=True)
         return
@@ -393,6 +405,28 @@ async def handle_access_request_callback(
             "ℹ️ Authentik OIDC SSO is not enabled in .env (OIDC_ENABLED=false).",
             show_alert=True,
         )
+        return
+
+    if action == "oidc_disconnect_self":
+        if not current_user.is_oidc_linked:
+            await ack_callback(callback, "No linked Authentik SSO account.", show_alert=True)
+            return
+        updated = await governance_service.unlink_user_oidc(
+            actor=current_user,
+            target_telegram_id=current_user.telegram_id,
+        )
+        await ack_callback(callback, "✅ Authentik SSO account disconnected.", show_alert=True)
+        if callback.message:
+            oidc_url = resolve_oidc_url(updated, oidc_service, settings)
+            await safe_edit_text(
+                callback.message,
+                render_sso_card(updated),
+                reply_markup=build_oidc_link_keyboard(
+                    oidc_url,
+                    subject=updated.authentik_sub,
+                    back_callback=MenuCallback(action="home").pack(),
+                ),
+            )
         return
 
     if action == "request":
@@ -1060,6 +1094,84 @@ async def handle_admin_dashboard_callback(
                 changes_count=len(user_logs),
             ),
             reply_markup=build_user_detail_keyboard(outcome.user, back_callback=back_cb),
+        )
+        return
+
+    if action == "toggle_override" and target_id is not None and governance_service is not None:
+        target_user = await governance_repository.get_user(target_id)
+        if target_user is None:
+            await ack_callback(callback, "User not found.", show_alert=True)
+            return
+        new_override = not target_user.oidc_role_override
+        try:
+            updated = await governance_service.set_user_oidc_override(
+                actor=current_user,
+                target_telegram_id=target_id,
+                override=new_override,
+            )
+        except PermissionDeniedError as exc:
+            await ack_callback(callback, str(exc), show_alert=True)
+            return
+        status_msg = (
+            "🔒 Role locked locally (OIDC override active)."
+            if new_override
+            else "🔓 Role unlocked (synced with OIDC)."
+        )
+        await ack_callback(callback, status_msg)
+        albums_count, tracks_count = await governance_repository.count_user_uploads(target_id)
+        user_logs = await governance_repository.list_user_audit_logs(target_id, limit=100)
+        back_cb = await resolve_back_callback(
+            state,
+            msg,
+            f"admin:user:{target_id}",
+            default_back="admin:users",
+        )
+        await safe_edit_text(
+            msg,
+            format_user_detail_card(
+                updated,
+                albums_count,
+                tracks_count,
+                changes_count=len(user_logs),
+            ),
+            reply_markup=build_user_detail_keyboard(updated, back_callback=back_cb),
+        )
+        return
+
+    if action == "oidc_disconnect" and target_id is not None and governance_service is not None:
+        target_user = await governance_repository.get_user(target_id)
+        if target_user is None:
+            await ack_callback(callback, "User not found.", show_alert=True)
+            return
+        if not target_user.is_oidc_linked:
+            await ack_callback(callback, "User is not linked to Authentik OIDC.", show_alert=True)
+            return
+        try:
+            updated = await governance_service.unlink_user_oidc(
+                actor=current_user,
+                target_telegram_id=target_id,
+            )
+        except PermissionDeniedError as exc:
+            await ack_callback(callback, str(exc), show_alert=True)
+            return
+        await ack_callback(callback, "Authentik OIDC account unlinked.")
+        albums_count, tracks_count = await governance_repository.count_user_uploads(target_id)
+        user_logs = await governance_repository.list_user_audit_logs(target_id, limit=100)
+        back_cb = await resolve_back_callback(
+            state,
+            msg,
+            f"admin:user:{target_id}",
+            default_back="admin:users",
+        )
+        await safe_edit_text(
+            msg,
+            format_user_detail_card(
+                updated,
+                albums_count,
+                tracks_count,
+                changes_count=len(user_logs),
+            ),
+            reply_markup=build_user_detail_keyboard(updated, back_callback=back_cb),
         )
         return
 

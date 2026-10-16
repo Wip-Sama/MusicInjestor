@@ -1,5 +1,6 @@
 """Standard Telegram command, bottom-menu, Help guide topics, and root `menu:*` callback handlers."""
 
+import contextlib
 import html
 
 from aiogram import F, Router
@@ -25,7 +26,11 @@ from src.bot.keyboards.admin import (
     build_queued_job_keyboard,
     build_tag_correction_review_keyboard,
 )
-from src.bot.keyboards.songs import build_song_action_keyboard
+from src.bot.keyboards.songs import (
+    SettingsCallback,
+    build_song_action_keyboard,
+    build_user_settings_keyboard,
+)
 from src.bot.routers.songs import format_song_detail_card
 from src.bot.ui import (
     ack_callback,
@@ -40,8 +45,9 @@ from src.core.audit import (
     format_guest_access_denied_card,
     format_job_inspector_card,
 )
+from src.core.bulk_research import get_active_bulk_research
 from src.core.exceptions import PermissionDeniedError
-from src.core.models import JobState, Permission, UserAccount, UserRole
+from src.core.models import JobState, Permission, UserAccount, UserPreferences, UserRole
 from src.core.oidc import AuthentikOidcService
 from src.core.organizer import LibraryOrganizer
 from src.core.pipeline import IngestionPipeline
@@ -52,7 +58,7 @@ from src.core.rbac import GovernanceService, has_permission
 commands_router = Router(name="commands")
 
 
-def _resolve_oidc_url(
+def resolve_oidc_url(
     user: UserAccount | None,
     oidc_service: AuthentikOidcService | None,
     settings: AppSettings | None,
@@ -62,6 +68,9 @@ def _resolve_oidc_url(
         url, _ = oidc_service.build_authorization_url(user.telegram_id)
         return url
     return None
+
+
+_resolve_oidc_url = resolve_oidc_url
 
 
 def _render_home_card(current_user: UserAccount | None) -> str:
@@ -235,23 +244,35 @@ async def _render_status_card(
         if organizer is not None and organizer.is_reconciling
         else "🟢 Ready"
     )
+    context_lines = [
+        f"• Assigned Role: <code>{current_user.role.value}</code>",
+        f"• Authentik OIDC: {oidc_label}",
+        f"• Queue Concurrency: <code>{concurrency}</code>",
+        f"• Global Queue: <code>{len(active_jobs)}</code> Active | <code>{len(queued_jobs)}</code> Queued",
+        f"• Library Sync: {sync_status}",
+    ]
+    bulk_progress = get_active_bulk_research()
+    if bulk_progress is not None:
+        curr_track = (
+            f" (<code>{html.escape(bulk_progress.current_track)}</code>)"
+            if bulk_progress.current_track
+            else ""
+        )
+        context_lines.append(
+            f"• Bulk Re-Search: 🟡 Running [<code>{bulk_progress.current_index}/"
+            f"{bulk_progress.total_tracks}</code> • "
+            f"<code>{bulk_progress.percent}%</code>]{curr_track}"
+        )
     return format_screen(
         title="🟢 System &amp; Session Status",
-        context_lines=[
-            f"• Assigned Role: <code>{current_user.role.value}</code>",
-            f"• Authentik OIDC: {oidc_label}",
-            f"• Queue Concurrency: <code>{concurrency}</code>",
-            f"• Global Queue: <code>{len(active_jobs)}</code> Active | "
-            f"<code>{len(queued_jobs)}</code> Queued",
-            f"• Library Sync: {sync_status}",
-        ],
+        context_lines=context_lines,
         footer_lines=[
             f"<i>Your Telegram ID:</i> <code>{current_user.telegram_id}</code> • <i>🧭 Home › Status</i>"
         ],
     )
 
 
-def _render_sso_card(current_user: UserAccount) -> str:
+def render_sso_card(current_user: UserAccount) -> str:
     """Format the 3-tier HTML Authentik OIDC Single Sign-On screen."""
     oidc_ident = html.escape(current_user.authentik_username or current_user.authentik_sub or "")
     linked_status = f"Linked as <code>{oidc_ident}</code>" if current_user.is_oidc_linked else "Not Linked"
@@ -262,6 +283,41 @@ def _render_sso_card(current_user: UserAccount) -> str:
             f"• Current Role: <code>{current_user.role.value}</code>",
         ],
         footer_lines=[f"<i>Telegram ID:</i> <code>{current_user.telegram_id}</code> • <i>🧭 Home › SSO</i>"],
+    )
+
+
+_render_sso_card = render_sso_card
+
+
+def _render_settings_card(prefs: UserPreferences, current_user: UserAccount | None = None) -> str:
+    """Format user streaming and audio preferences card."""
+    fmt_labels = {
+        "auto": "Auto (Opus 192k / Direct for Web-safe)",
+        "original": "Direct / Original (Lossless, no transcode)",
+        "opus": "Opus (Low bandwidth, high fidelity)",
+        "mp3": "MP3 (Universal compatibility)",
+    }
+    fmt_text = fmt_labels.get(prefs.stream_format, prefs.stream_format)
+    lyr_status = "Enabled" if prefs.auto_lyrics_search else "Disabled"
+    context = [
+        f"• <b>Streaming Format:</b> <code>{html.escape(fmt_text)}</code>",
+        f"• <b>Transcoding Bitrate:</b> <code>{prefs.stream_bitrate} kbps</code>",
+        f"• <b>Auto-Search Online Lyrics:</b> <code>{lyr_status}</code>",
+    ]
+    if current_user is not None and current_user.is_oidc_linked:
+        ident = html.escape(current_user.authentik_username or current_user.authentik_sub or "")
+        context.append(f"• <b>Authentik SSO:</b> Linked as <code>{ident}</code>")
+    context.extend(
+        [
+            "",
+            "Choose your preferred streaming format and quality below. "
+            "Settings apply across both Telegram and the Web Mini App.",
+        ]
+    )
+    return format_screen(
+        title="⚙️ User Streaming &amp; Audio Preferences",
+        context_lines=context,
+        footer_lines=["<i>🧭 Home › Settings</i>"],
     )
 
 
@@ -297,8 +353,9 @@ async def render_queue_overview_screen(
         for j in all_active_jobs
         if j.state not in paused_states and (can_view_global or j.user_id == current_user.telegram_id)
     ]
+    bulk_progress = get_active_bulk_research()
 
-    if not queued_jobs and not paused_jobs and not running_jobs:
+    if not queued_jobs and not paused_jobs and not running_jobs and bulk_progress is None:
         text = format_screen(
             title="✅ Ingestion Queue Empty",
             context_lines=[f"<code>{len(all_active_jobs)}</code> active job(s) in flight."],
@@ -314,11 +371,25 @@ async def render_queue_overview_screen(
         )
         return text, kb
 
-    lines: list[str] = [
+    lines: list[str] = []
+    if bulk_progress is not None:
+        curr_track = (
+            f" — <i>{html.escape(bulk_progress.current_track)}</i>" if bulk_progress.current_track else ""
+        )
+        lines.append(
+            f"⚡ <b>Bulk Re-Search In Progress:</b> "
+            f"<code>[{bulk_progress.current_index}/{bulk_progress.total_tracks}]</code> "
+            f"(<code>{bulk_progress.percent}%</code>){curr_track}"
+        )
+        if bulk_progress.actor_name:
+            lines.append(f"   <i>Initiated by:</i> <code>{html.escape(bulk_progress.actor_name)}</code>")
+        lines.append("")
+
+    lines.append(
         f"• Running: <code>{len(running_jobs)}</code> | "
         f"Paused / Review: <code>{len(paused_jobs)}</code> | "
-        f"Queued: <code>{len(queued_jobs)}</code>",
-    ]
+        f"Queued: <code>{len(queued_jobs)}</code>"
+    )
     for job in running_jobs[:4]:
         fname = html.escape(job.original_filename or job.source_path.name)
         lines.append(
@@ -339,6 +410,8 @@ async def render_queue_overview_screen(
     )
     if has_disambiguation and not queued_jobs:
         title = f"⚠️ {len(paused_jobs)} Job(s) Awaiting Disambiguation / Review"
+    elif not running_jobs and not paused_jobs and not queued_jobs and bulk_progress is not None:
+        title = f"⚡ Ingestion Queue (Bulk Re-Search {bulk_progress.percent}%)"
     else:
         title = (
             f"⏳ Ingestion Queue ({len(running_jobs)} active, "
@@ -585,6 +658,84 @@ async def handle_sso_command(
     )
 
 
+@commands_router.message(Command("settings"))
+async def handle_settings_command(
+    message: Message,
+    current_user: UserAccount | None = None,
+    governance_repository: GovernanceRepositoryPort | None = None,
+    state: FSMContext | None = None,
+) -> None:
+    """Display and manage user streaming transcode preferences and audio options."""
+    await reset_fsm_state(state)
+    back_cb = await resolve_back_callback(
+        state,
+        None,
+        "menu:settings",
+        default_back="menu:home",
+        reset_to_home=True,
+    )
+    if current_user is None or governance_repository is None:
+        return
+    prefs = await governance_repository.get_user_preferences(current_user.telegram_id)
+    await safe_answer(
+        message,
+        _render_settings_card(prefs, current_user),
+        reply_markup=build_user_settings_keyboard(prefs, user=current_user, back_callback=back_cb),
+    )
+
+
+@commands_router.callback_query(SettingsCallback.filter())
+async def handle_settings_callback(
+    callback: CallbackQuery,
+    callback_data: SettingsCallback,
+    current_user: UserAccount | None = None,
+    governance_repository: GovernanceRepositoryPort | None = None,
+    governance_service: GovernanceService | None = None,
+    state: FSMContext | None = None,
+) -> None:
+    """Mutate user streaming and audio preferences in-place upon tapping setting buttons."""
+    if current_user is None or governance_repository is None or callback.message is None:
+        await ack_callback(callback)
+        return
+    prefs = await governance_repository.get_user_preferences(current_user.telegram_id)
+    if callback_data.action == "fmt":
+        await ack_callback(callback)
+        prefs.stream_format = callback_data.value
+        await governance_repository.update_user_preferences(prefs)
+    elif callback_data.action == "br":
+        await ack_callback(callback)
+        with contextlib.suppress(ValueError):
+            prefs.stream_bitrate = int(callback_data.value)
+        await governance_repository.update_user_preferences(prefs)
+    elif callback_data.action == "lyrics":
+        await ack_callback(callback)
+        prefs.auto_lyrics_search = not prefs.auto_lyrics_search
+        await governance_repository.update_user_preferences(prefs)
+    elif callback_data.action == "oidc" and callback_data.value == "disconnect":
+        if governance_service is not None and current_user.is_oidc_linked:
+            current_user = await governance_service.unlink_user_oidc(
+                actor=current_user,
+                target_telegram_id=current_user.telegram_id,
+            )
+            await ack_callback(callback, "✅ Authentik SSO account disconnected.", show_alert=True)
+        else:
+            await ack_callback(callback)
+    else:
+        await ack_callback(callback)
+
+    back_cb = await resolve_back_callback(
+        state,
+        callback.message,
+        "menu:settings",
+        default_back="menu:home",
+    )
+    await safe_edit_text(
+        callback.message,
+        _render_settings_card(prefs, current_user),
+        reply_markup=build_user_settings_keyboard(prefs, user=current_user, back_callback=back_cb),
+    )
+
+
 @commands_router.callback_query(F.data.startswith("menu:"))
 async def handle_menu_navigation_callback(
     callback: CallbackQuery,
@@ -651,6 +802,21 @@ async def handle_menu_navigation_callback(
                 subject=current_user.authentik_sub,
                 back_callback=back_cb,
             ),
+        )
+        return
+
+    if action == "settings" and current_user is not None and governance_repository is not None:
+        back_cb = await resolve_back_callback(
+            state,
+            callback.message,
+            "menu:settings",
+            default_back="menu:home",
+        )
+        prefs = await governance_repository.get_user_preferences(current_user.telegram_id)
+        await safe_edit_text(
+            callback.message,
+            _render_settings_card(prefs, current_user),
+            reply_markup=build_user_settings_keyboard(prefs, user=current_user, back_callback=back_cb),
         )
         return
 

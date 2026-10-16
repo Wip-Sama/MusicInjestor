@@ -5,7 +5,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.core.bulk_research import BulkResearchPlan, BulkResearchService
+from src.core.bulk_research import (
+    BulkResearchPlan,
+    BulkResearchProgress,
+    BulkResearchService,
+    get_active_bulk_research,
+)
 from src.core.models import (
     LibraryTrackRecord,
     LyricsData,
@@ -246,3 +251,74 @@ async def test_bulk_research_cancel_and_errors(tmp_path: Path) -> None:
     cancelled_report = await service.execute_bulk_research(plan)
     # Cancelled before processing
     assert cancelled_report.applied_count == 0
+
+
+@pytest.mark.anyio
+async def test_bulk_research_active_progress_tracking(tmp_path: Path) -> None:
+    """Verify that active bulk research progress is set during execution and reset after completion."""
+    progress = BulkResearchProgress(total_tracks=10, current_index=5)
+    assert progress.percent == 50
+
+    repo = AsyncMock()
+    metadata_svc = AsyncMock()
+    lyrics_client = AsyncMock()
+    organizer = AsyncMock()
+
+    f1 = tmp_path / "track1.mp3"
+    f1.write_bytes(b"DATA")
+    t1 = LibraryTrackRecord(
+        id="trk_1",
+        job_id="job_1",
+        uploaded_by=123,
+        storage_path=f1,
+        fingerprint="fp1",
+        duration_seconds=180,
+        artist="Artist",
+        album="Album",
+        title="Title",
+    )
+    repo.get_library_track.return_value = t1
+    metadata_svc.read_local_metadata.return_value = TrackMetadata(
+        title="Title", artist="Artist", album="Album", duration_seconds=180
+    )
+    metadata_svc.find_candidates.return_value = []
+    lyrics_client.fetch_lyrics.return_value = None
+
+    service = BulkResearchService(
+        catalog_repository=repo,
+        metadata_service=metadata_svc,
+        lyrics_client=lyrics_client,
+        organizer=organizer,
+    )
+
+    plan = BulkResearchPlan(
+        track_ids=["trk_1"],
+        total_tracks=1,
+        missing_lyrics_count=0,
+        missing_mbid_count=0,
+        estimated_seconds=1,
+    )
+
+    observed_active: list[BulkResearchProgress | None] = []
+
+    def _progress_cb(current: int, total: int, label: str, phase: str) -> None:
+        observed_active.append(get_active_bulk_research())
+
+    # Pre-condition: idle
+    assert get_active_bulk_research() is None
+
+    await service.execute_bulk_research(
+        plan,
+        actor_id=456,
+        actor_name="TestAdmin",
+        progress_callback=_progress_cb,
+    )
+
+    # Post-condition: guaranteed cleanup back to None
+    assert get_active_bulk_research() is None
+    assert len(observed_active) > 0
+    first = observed_active[0]
+    assert first is not None
+    assert first.actor_id == 456
+    assert first.actor_name == "TestAdmin"
+    assert first.total_tracks == 1

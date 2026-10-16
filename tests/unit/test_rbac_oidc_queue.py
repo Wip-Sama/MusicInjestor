@@ -33,6 +33,7 @@ from src.core.exceptions import (
 )
 from src.core.models import (
     AudioFingerprint,
+    AuditAction,
     IngestionJob,
     JobState,
     MetadataCandidate,
@@ -139,6 +140,17 @@ def test_evaluate_oidc_role_mapping() -> None:
     assert evaluate_oidc_role(["music-admins", "music-uploaders"]) == UserRole.ADMIN
     assert evaluate_oidc_role(["unrelated-group"]) == UserRole.GUEST
     assert evaluate_oidc_role(()) == UserRole.GUEST
+
+    # Custom role mapping dictionary
+    custom_map = {
+        "infra-team": "ADMIN",
+        "dj-team": "MODERATOR",
+        "streamers": "LISTENER",
+    }
+    assert evaluate_oidc_role(["streamers"], role_mapping=custom_map) == UserRole.LISTENER
+    assert evaluate_oidc_role(["streamers", "dj-team"], role_mapping=custom_map) == UserRole.MODERATOR
+    assert evaluate_oidc_role(["dj-team", "infra-team"], role_mapping=custom_map) == UserRole.ADMIN
+    assert evaluate_oidc_role(["music-admins"], role_mapping=custom_map) == UserRole.GUEST
 
 
 def test_state_nonce_and_token_encryption_roundtrip() -> None:
@@ -333,6 +345,127 @@ def test_authentik_oidc_pairing_sync_demotion_and_webhook(tmp_path: Path) -> Non
                 payload={"event_type": "user_updated", "sub": "c849bf3c"},
                 provided_secret="wrong-secret",
             )
+
+    asyncio.run(_scenario())
+
+
+def test_oidc_unlink_override_and_sync_retention(tmp_path: Path) -> None:
+    """Verify manual role overrides prevent OIDC overwrite, override toggle, and unlinking."""
+    db_manager = SqliteDatabaseManager(tmp_path / "oidc_override.db")
+    repo = SqliteCatalogRepository(db_manager)
+    notifier = TelegramAdminLogNotifier(admin_log_channel_id=-100123)
+    gov = GovernanceService(repository=repo, notifier=notifier, owner_telegram_ids=(10000001,))
+
+    secret = "secret-key-32-chars-for-test!!"
+    custom_mapping = {"music-djs": "UPLOADER"}
+
+    current_groups: list[str] = ["music-djs"]
+
+    def _mock_idp(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/token/"):
+            return httpx.Response(status_code=200, json={"access_token": "tok", "expires_in": 3600})
+        if request.url.path.endswith("/userinfo/"):
+            return httpx.Response(
+                status_code=200,
+                json={
+                    "sub": "sub-12345",
+                    "preferred_username": "dj_user",
+                    "groups": current_groups,
+                    "is_active": True,
+                },
+            )
+        return httpx.Response(status_code=404)
+
+    oidc = AuthentikOidcService(
+        repository=repo,
+        secret_key=secret,
+        authorize_url="https://auth.example.com/application/o/authorize",
+        token_url="https://auth.example.com/application/o/token",
+        userinfo_url="https://auth.example.com/application/o/userinfo",
+        client_id="client",
+        client_secret="secret",
+        redirect_uri="http://localhost:8080/callback",
+        notifier=notifier,
+        role_mapping=custom_mapping,
+        transport=httpx.MockTransport(_mock_idp),
+    )
+
+    async def _scenario() -> None:
+        await db_manager.initialize()
+        owner = await gov.ensure_user(10000001, "Owner", "owner")
+        user = await gov.ensure_user(20000002, "DJ User", "dj_user")
+
+        # Link OIDC
+        user.authentik_sub = "sub-12345"
+        user.authentik_username = "dj_user"
+        user.authentik_groups = ("music-djs",)
+        user.access_token_encrypted = "acc"
+        await repo.upsert_user(user)
+        loaded_user = await repo.get_user(user.telegram_id)
+        assert loaded_user is not None
+        assert loaded_user.is_oidc_linked is True
+        assert loaded_user.oidc_role_override is False
+
+        # 1. Sync claims: maps to UPLOADER based on custom_mapping
+        outcome = await oidc.sync_user_claims(loaded_user, {"sub": "sub-12345", "groups": ["music-djs"]})
+        assert outcome.new_role == UserRole.UPLOADER
+        loaded_user = await repo.get_user(user.telegram_id)
+        assert loaded_user is not None
+        assert loaded_user.role == UserRole.UPLOADER
+
+        # 2. Admin manually changes role to MODERATOR -> automatically sets oidc_role_override = True
+        promoted = await gov.change_user_role(
+            actor=owner,
+            target_telegram_id=loaded_user.telegram_id,
+            new_role=UserRole.MODERATOR,
+            reason="Promoted by Admin",
+        )
+        assert promoted.role == UserRole.MODERATOR
+        assert promoted.oidc_role_override is True
+
+        # 3. IDP sync runs again with only 'music-djs' (which would normally demote to UPLOADER)
+        # Because oidc_role_override is True, local role MODERATOR is retained!
+        sync_outcome = await oidc.sync_user_claims(promoted, {"sub": "sub-12345", "groups": ["music-djs"]})
+        assert sync_outcome.new_role == UserRole.MODERATOR
+        rechecked = await repo.get_user(user.telegram_id)
+        assert rechecked is not None
+        assert rechecked.role == UserRole.MODERATOR
+
+        # 4. Admin toggles override off -> IDP sync will now apply
+        unlocked = await gov.set_user_oidc_override(
+            actor=owner,
+            target_telegram_id=user.telegram_id,
+            override=False,
+        )
+        assert unlocked.oidc_role_override is False
+
+        # Now sync demotes back to UPLOADER
+        sync_outcome2 = await oidc.sync_user_claims(unlocked, {"sub": "sub-12345", "groups": ["music-djs"]})
+        assert sync_outcome2.new_role == UserRole.UPLOADER
+
+        # 5. Admin unlinks OIDC via gov.unlink_user_oidc
+        unlinked = await gov.unlink_user_oidc(actor=owner, target_telegram_id=user.telegram_id)
+        assert unlinked.is_oidc_linked is False
+        assert unlinked.authentik_sub is None
+        assert unlinked.authentik_username is None
+
+        # Verify audit log recorded OIDC_UNLINKED
+        logs = await repo.list_audit_logs(limit=10)
+        assert any(entry.action == AuditAction.OIDC_UNLINKED for entry in logs)
+
+        # 6. Self-service unlink via oidc_service.unlink_user_oidc
+        # Relink first
+        user.authentik_sub = "sub-12345"
+        user.authentik_username = "dj_user"
+        user.authentik_groups = ("music-djs",)
+        user.access_token_encrypted = "acc"
+        await repo.upsert_user(user)
+        relinked_user = await repo.get_user(user.telegram_id)
+        assert relinked_user is not None
+        assert relinked_user.is_oidc_linked is True
+        self_unlinked = await oidc.unlink_user_oidc(relinked_user)
+        assert self_unlinked.is_oidc_linked is False
+        assert self_unlinked.authentik_sub is None
 
     asyncio.run(_scenario())
 

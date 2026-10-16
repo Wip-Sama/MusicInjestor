@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ExternalLink, Check, Search, AlertTriangle, Loader2 } from 'lucide-react';
+import { ExternalLink, Check, Search, AlertTriangle, Loader2, Edit3 } from 'lucide-react';
 import { CandidateItem } from '../../types/queue';
 
 interface DisambiguationCardProps {
@@ -7,6 +7,7 @@ interface DisambiguationCardProps {
   candidates: CandidateItem[];
   onSelect: (index: number) => Promise<void>;
   onManualSearch: (query: string) => Promise<void>;
+  onOpenEdit?: (candidate?: CandidateItem) => void;
   disabled?: boolean;
   isReadOnly?: boolean;
 }
@@ -16,6 +17,7 @@ export const DisambiguationCard: React.FC<DisambiguationCardProps> = ({
   candidates,
   onSelect,
   onManualSearch,
+  onOpenEdit,
   disabled = false,
   isReadOnly = false,
 }) => {
@@ -71,23 +73,46 @@ export const DisambiguationCard: React.FC<DisambiguationCardProps> = ({
           </span>
         </div>
         {!isReadOnly && (
-          <button
-            onClick={() => setShowSearchBox(!showSearchBox)}
-            style={{
-              background: 'none',
-              border: 'none',
-              color: 'var(--tg-theme-button-color, #0a84ff)',
-              fontSize: '12px',
-              cursor: 'pointer',
-              padding: '2px 6px',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '4px',
-            }}
-          >
-            <Search size={12} />
-            <span>{showSearchBox ? 'Close Search' : 'Manual Search'}</span>
-          </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            {onOpenEdit && (
+              <button
+                type="button"
+                onClick={() => onOpenEdit()}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  color: 'var(--tg-theme-button-color, #0a84ff)',
+                  fontSize: '12px',
+                  cursor: 'pointer',
+                  padding: '2px 4px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '4px',
+                }}
+              >
+                <Edit3 size={12} />
+                <span>Edit Tags</span>
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => setShowSearchBox(!showSearchBox)}
+              style={{
+                background: 'none',
+                border: 'none',
+                color: 'var(--tg-theme-button-color, #0a84ff)',
+                fontSize: '12px',
+                cursor: 'pointer',
+                padding: '2px 4px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '4px',
+              }}
+            >
+              <Search size={12} />
+              <span>{showSearchBox ? 'Close Search' : 'Manual Search'}</span>
+            </button>
+          </div>
         )}
       </div>
 
@@ -214,37 +239,66 @@ export const DisambiguationCard: React.FC<DisambiguationCardProps> = ({
               </div>
 
               {!isReadOnly && (
-                <button
-                  onClick={() => handleSelectClick(idx)}
-                  disabled={disabled || submitting}
-                  style={{
-                    backgroundColor: 'var(--tg-theme-button-color, #0a84ff)',
-                    color: '#ffffff',
-                    border: 'none',
-                    borderRadius: '6px',
-                    padding: '6px 10px',
-                    fontSize: '12px',
-                    fontWeight: 600,
-                    cursor: disabled || submitting ? 'not-allowed' : 'pointer',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    gap: '6px',
-                    marginTop: '2px',
-                  }}
-                >
-                  {isSelected ? (
-                    <>
-                      <Loader2 size={13} className="spin" />
-                      <span>Confirming...</span>
-                    </>
-                  ) : (
-                    <>
-                      <Check size={13} />
-                      <span>Select This Release</span>
-                    </>
+                <div style={{ display: 'flex', gap: '6px', marginTop: '2px' }}>
+                  <button
+                    type="button"
+                    onClick={() => handleSelectClick(idx)}
+                    disabled={disabled || submitting}
+                    style={{
+                      flex: 1,
+                      backgroundColor: 'var(--tg-theme-button-color, #0a84ff)',
+                      color: '#ffffff',
+                      border: 'none',
+                      borderRadius: '6px',
+                      padding: '6px 10px',
+                      fontSize: '12px',
+                      fontWeight: 600,
+                      cursor: disabled || submitting ? 'not-allowed' : 'pointer',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: '6px',
+                    }}
+                  >
+                    {isSelected ? (
+                      <>
+                        <Loader2 size={13} className="spin" />
+                        <span>Confirming...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Check size={13} />
+                        <span>Select This Release</span>
+                      </>
+                    )}
+                  </button>
+                  {onOpenEdit && (
+                    <button
+                      type="button"
+                      onClick={() => onOpenEdit(cand)}
+                      disabled={disabled || submitting}
+                      style={{
+                        backgroundColor: 'var(--tg-theme-bg-color, #1c1c1e)',
+                        border: '1px solid var(--tg-theme-subtitle-text-color, #3a3a3c)',
+                        color: 'var(--tg-theme-text-color, #ffffff)',
+                        borderRadius: '6px',
+                        padding: '6px 10px',
+                        fontSize: '12px',
+                        fontWeight: 600,
+                        cursor: disabled || submitting ? 'not-allowed' : 'pointer',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        gap: '4px',
+                        whiteSpace: 'nowrap',
+                      }}
+                      title="Edit tags before confirming"
+                    >
+                      <Edit3 size={12} />
+                      <span>Edit &amp; Ingest</span>
+                    </button>
                   )}
-                </button>
+                </div>
               )}
             </div>
           );

@@ -15,6 +15,7 @@ from src.bot.routers.verification import (
     format_job_edit_dry_run_card,
     handle_job_cover_input,
     handle_job_lyrics_input,
+    handle_job_metadata_input,
     handle_manual_search_query,
     handle_verification_callback,
     parse_verification_callback,
@@ -484,3 +485,94 @@ async def test_verification_callback_field_manual_prompts_and_manual_search(tmp_
     await handle_job_cover_input(msg_doc_cov, state=state, current_user=user, pipeline=pipeline)
     data2 = await state.get_data()
     assert data2["job_edit_proposal"]["new_cover_mime"] == "image/png"
+
+
+@pytest.mark.anyio
+async def test_verification_callback_link_search_and_input(tmp_path: Path) -> None:
+    """Verify link search action prompt and metadata resolution from URL input."""
+    storage = MemoryStorage()
+    key = StorageKey(bot_id=1, chat_id=100, user_id=100)
+    state = FSMContext(storage=storage, key=key)
+
+    dummy_audio = tmp_path / "track.flac"
+    dummy_audio.write_bytes(b"FLAC")
+    cand = MetadataCandidate(
+        metadata=TrackMetadata(
+            title="Link Song",
+            artist="Link Artist",
+            album="Link Album",
+            year=2024,
+            track_number=3,
+            recording_mbid="rec-1234",
+            release_mbid="rel-5678",
+        ),
+        confidence=0.98,
+    )
+    job = IngestionJob(
+        job_id="job_link",
+        source_path=dummy_audio,
+        user_id=100,
+        candidates=[cand],
+    )
+
+    pipeline = MagicMock()
+    pipeline.get_job = AsyncMock(return_value=job)
+    organizer = MagicMock()
+    organizer.build_target_audio_path = MagicMock(return_value=tmp_path / "out.flac")
+    pipeline.organizer = organizer
+
+    lyrics_client = MagicMock()
+    lyrics_client.fetch_lyrics = AsyncMock(return_value=LyricsData(synced_lyrics="[00:02.00] Link Synced"))
+    pipeline._lyrics = lyrics_client
+
+    user = UserAccount(telegram_id=100, display_name="Test", role=UserRole.UPLOADER)
+    msg = MagicMock(spec=Message)
+    msg.edit_text = AsyncMock()
+    msg.answer = AsyncMock()
+    cb = MagicMock(spec=CallbackQuery)
+    cb.message = msg
+    cb.from_user = User(id=100, is_bot=False, first_name="Test")
+    cb.answer = AsyncMock()
+
+    # 1. Trigger verify:link_search:job_link
+    cb.data = "verify:link_search:job_link"
+    await handle_verification_callback(cb, state=state, current_user=user, pipeline=pipeline)
+    assert await state.get_state() == IngestionStates.awaiting_job_metadata_input
+    data = await state.get_data()
+    assert data.get("job_edit_field") == "link"
+
+    # 2. Provide a valid MusicBrainz URL
+    res = IngestionResult(job=job, requires_user_confirmation=True)
+    pipeline.search_manual_candidates = AsyncMock(return_value=res)
+
+    msg_link = MagicMock(spec=Message)
+    msg_link.text = "https://musicbrainz.org/release/12345678-1234-1234-1234-123456789abc"
+    msg_link.from_user = User(id=100, is_bot=False, first_name="Test")
+    msg_link.answer = AsyncMock()
+
+    await handle_job_metadata_input(msg_link, state=state, current_user=user, pipeline=pipeline)
+    assert pipeline.search_manual_candidates.called
+    updated_data = await state.get_data()
+    proposal = updated_data["job_edit_proposal"]
+    assert proposal["new_title"] == "Link Song"
+    assert proposal["new_artist"] == "Link Artist"
+    assert proposal["new_album"] == "Link Album"
+    assert proposal["new_year"] == 2024
+    assert proposal["new_track_number"] == 3
+    assert proposal["new_lyrics"] == "[00:02.00] Link Synced"
+    assert msg_link.answer.called
+
+    # 3. No matches found for link input
+    empty_job = IngestionJob(job_id="job_link", source_path=dummy_audio, user_id=100, candidates=[])
+    res_empty = IngestionResult(job=empty_job, requires_user_confirmation=True)
+    pipeline.search_manual_candidates = AsyncMock(return_value=res_empty)
+    await state.update_data(job_edit_field="link")
+
+    msg_none = MagicMock(spec=Message)
+    msg_none.text = "https://musicbrainz.org/release/00000000-0000-0000-0000-000000000000"
+    msg_none.from_user = User(id=100, is_bot=False, first_name="Test")
+    msg_none.answer = AsyncMock()
+
+    await handle_job_metadata_input(msg_none, state=state, current_user=user, pipeline=pipeline)
+    call_args = msg_none.answer.call_args[0][0]
+    assert "No Matches Found" in call_args

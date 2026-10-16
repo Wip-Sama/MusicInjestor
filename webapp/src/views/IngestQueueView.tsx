@@ -8,9 +8,11 @@ import {
   History,
   ListFilter,
   Lock,
+  Sparkles,
 } from 'lucide-react';
 import { FileDropzone } from '../components/ingest/FileDropzone';
 import { JobCard } from '../components/queue/JobCard';
+import { JobEditModal } from '../components/queue/JobEditModal';
 import {
   fetchQueue,
   pauseJob,
@@ -20,7 +22,7 @@ import {
   manualSearch,
   connectQueueEvents,
 } from '../lib/queueApi';
-import { QueueJob, QueueResponse, QueueEvent } from '../types/queue';
+import { QueueJob, QueueResponse, QueueEvent, ActiveBulkResearch, CandidateItem } from '../types/queue';
 import { UserProfile, canSubmitIngestion } from '../lib/auth';
 
 interface IngestQueueViewProps {
@@ -31,16 +33,22 @@ export const IngestQueueView: React.FC<IngestQueueViewProps> = ({ profile }) => 
   const canViewGlobal = profile?.role === 'MODERATOR' || profile?.role === 'ADMIN' || profile?.role === 'OWNER';
 
   const [queueData, setQueueData] = useState<QueueResponse | null>(null);
+  const [bulkResearch, setBulkResearch] = useState<ActiveBulkResearch | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'mine' | 'global'>('mine');
   const [filterMode, setFilterMode] = useState<'active' | 'all'>('active');
   const [sseConnected, setSseConnected] = useState<boolean>(false);
+  const [editingJob, setEditingJob] = useState<QueueJob | null>(null);
+  const [editingCandidate, setEditingCandidate] = useState<CandidateItem | null>(null);
 
   const loadQueue = useCallback(async () => {
     try {
       const data = await fetchQueue(activeTab === 'mine');
       setQueueData(data);
+      if (data.active_bulk_research !== undefined) {
+        setBulkResearch(data.active_bulk_research);
+      }
       setError(null);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Failed to load queue';
@@ -61,6 +69,11 @@ export const IngestQueueView: React.FC<IngestQueueViewProps> = ({ profile }) => 
       (event: QueueEvent) => {
         if (event.type === 'connected') {
           setSseConnected(true);
+          return;
+        }
+
+        if (event.type === 'bulk_research_progress') {
+          setBulkResearch(event.data || null);
           return;
         }
 
@@ -94,7 +107,7 @@ export const IngestQueueView: React.FC<IngestQueueViewProps> = ({ profile }) => 
     };
   }, [loadQueue]);
 
-  const hasActiveJobs = (queueData?.jobs || []).some(
+  const hasActiveJobs = Boolean(bulkResearch) || (queueData?.jobs || []).some(
     (j) =>
       j.state === 'QUEUED' ||
       j.state === 'PROCESSING' ||
@@ -190,6 +203,22 @@ export const IngestQueueView: React.FC<IngestQueueViewProps> = ({ profile }) => 
     }
   };
 
+  const handleOpenEdit = (job: QueueJob, candidate?: CandidateItem) => {
+    setEditingJob(job);
+    setEditingCandidate(candidate || null);
+  };
+
+  const handleJobUpdated = (updatedJob: QueueJob) => {
+    setQueueData((prev) => {
+      if (!prev) return null;
+      return {
+        ...prev,
+        jobs: prev.jobs.map((j) => (j.job_id === updatedJob.job_id ? updatedJob : j)),
+      };
+    });
+    loadQueue();
+  };
+
   const allJobs = queueData?.jobs || [];
   const filteredJobs = allJobs.filter((job) => {
     if (filterMode === 'active') {
@@ -239,6 +268,86 @@ export const IngestQueueView: React.FC<IngestQueueViewProps> = ({ profile }) => 
             }}
           >
             Your account role is <strong>{profile?.role || 'GUEST'}</strong>. Submitting audio tracks and archives requires <strong>UPLOADER</strong> permission.
+          </div>
+        </div>
+      )}
+
+      {/* Active Bulk Re-Search Live Banner */}
+      {bulkResearch && (
+        <div
+          style={{
+            backgroundColor: 'rgba(255, 159, 10, 0.12)',
+            border: '1px solid rgba(255, 159, 10, 0.35)',
+            borderRadius: '12px',
+            padding: '12px 14px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '8px',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <Sparkles size={16} color="#ff9f0a" />
+              <span style={{ fontSize: '13px', fontWeight: 700, color: '#ff9f0a' }}>
+                Bulk Re-Search In Progress
+              </span>
+            </div>
+            <span
+              style={{
+                fontSize: '11px',
+                fontWeight: 700,
+                color: '#ff9f0a',
+                backgroundColor: 'rgba(255, 159, 10, 0.2)',
+                padding: '2px 8px',
+                borderRadius: '10px',
+              }}
+            >
+              {bulkResearch.percent}% ({bulkResearch.current_index}/{bulkResearch.total_tracks})
+            </span>
+          </div>
+
+          {/* Progress track */}
+          <div
+            style={{
+              width: '100%',
+              height: '6px',
+              backgroundColor: 'rgba(255, 255, 255, 0.08)',
+              borderRadius: '3px',
+              overflow: 'hidden',
+            }}
+          >
+            <div
+              style={{
+                width: `${bulkResearch.percent}%`,
+                height: '100%',
+                backgroundColor: '#ff9f0a',
+                transition: 'width 0.3s ease',
+              }}
+            />
+          </div>
+
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              fontSize: '11px',
+              color: 'var(--tg-theme-subtitle-text-color, #8e8e93)',
+            }}
+          >
+            <span
+              style={{
+                maxWidth: '75%',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              {bulkResearch.current_track || 'Analyzing library tracks...'}
+            </span>
+            {bulkResearch.actor_name && (
+              <span>By {bulkResearch.actor_name}</span>
+            )}
           </div>
         </div>
       )}
@@ -428,6 +537,7 @@ export const IngestQueueView: React.FC<IngestQueueViewProps> = ({ profile }) => 
               onCancel={handleCancel}
               onSelectCandidate={handleSelectCandidate}
               onManualSearch={handleManualSearch}
+              onOpenEdit={handleOpenEdit}
             />
           ))
         ) : (
@@ -450,6 +560,18 @@ export const IngestQueueView: React.FC<IngestQueueViewProps> = ({ profile }) => 
           </div>
         )}
       </div>
+
+      {/* Tag Editor Modal for Queued & Disambiguation Jobs */}
+      <JobEditModal
+        isOpen={Boolean(editingJob)}
+        job={editingJob}
+        initialCandidate={editingCandidate}
+        onClose={() => {
+          setEditingJob(null);
+          setEditingCandidate(null);
+        }}
+        onJobUpdated={handleJobUpdated}
+      />
     </div>
   );
 };

@@ -9,8 +9,9 @@ import {
   Copy,
   Check,
   FolderCheck,
+  Edit3,
 } from 'lucide-react';
-import { QueueJob } from '../../types/queue';
+import { QueueJob, CandidateItem } from '../../types/queue';
 import { UserProfile, canResolveOthersJobs } from '../../lib/auth';
 import { StageVisualizer } from './StageVisualizer';
 import { DisambiguationCard } from './DisambiguationCard';
@@ -22,6 +23,7 @@ interface JobCardProps {
   onCancel: (jobId: string) => Promise<void>;
   onSelectCandidate: (jobId: string, candidateIndex: number) => Promise<void>;
   onManualSearch: (jobId: string, query: string) => Promise<void>;
+  onOpenEdit?: (job: QueueJob, candidate?: CandidateItem) => void;
   profile?: UserProfile | null;
 }
 
@@ -40,6 +42,7 @@ export const JobCard: React.FC<JobCardProps> = ({
   onCancel,
   onSelectCandidate,
   onManualSearch,
+  onOpenEdit,
   profile,
 }) => {
   const [copied, setCopied] = useState<boolean>(false);
@@ -205,6 +208,7 @@ export const JobCard: React.FC<JobCardProps> = ({
           candidates={job.candidates}
           onSelect={(idx) => onSelectCandidate(job.job_id, idx)}
           onManualSearch={(query) => onManualSearch(job.job_id, query)}
+          onOpenEdit={(cand) => onOpenEdit?.(job, cand)}
           disabled={actionLoading}
           isReadOnly={!canControl}
         />
@@ -255,6 +259,31 @@ export const JobCard: React.FC<JobCardProps> = ({
       {/* Job Control Action Buttons */}
       {canControl && (isQueued || isPending || isPaused || isAwaiting) && (
         <div style={{ display: 'flex', gap: '6px', justifyContent: 'flex-end', paddingTop: '2px' }}>
+          {/* Edit Tags Button */}
+          {onOpenEdit && (
+            <button
+              type="button"
+              onClick={() => onOpenEdit(job)}
+              disabled={actionLoading}
+              style={{
+                backgroundColor: 'var(--tg-theme-secondary-bg-color, #2c2c2e)',
+                color: 'var(--tg-theme-text-color, #ffffff)',
+                border: '1px solid var(--tg-theme-subtitle-text-color, #3a3a3c)',
+                borderRadius: '6px',
+                padding: '5px 10px',
+                fontSize: '11px',
+                fontWeight: 600,
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '4px',
+              }}
+            >
+              <Edit3 size={12} />
+              <span>Edit Tags</span>
+            </button>
+          )}
+
           {/* Pause Button */}
           {(isQueued || isPending) && (
             <button

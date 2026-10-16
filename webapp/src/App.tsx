@@ -18,12 +18,14 @@ import {
   Shield,
   ShieldAlert,
   Clock,
+  SlidersHorizontal,
 } from 'lucide-react';
 import { AudioPlayerProvider, useAudioPlayer } from './context/AudioPlayerContext';
 import { MiniPlayer } from './components/player/MiniPlayer';
 import { FullscreenPlayer } from './components/player/FullscreenPlayer';
 import { SyncedLyrics } from './components/player/SyncedLyrics';
 import { QueueDrawer } from './components/player/QueueDrawer';
+import { SettingsModal } from './components/settings/SettingsModal';
 import { CatalogView } from './views/CatalogView';
 import { IngestQueueView } from './views/IngestQueueView';
 import { GovernanceView } from './views/GovernanceView';
@@ -43,6 +45,7 @@ const AppContent: React.FC = () => {
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<TabType>('catalog');
+  const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
   const handledDeepLinkRef = useRef<boolean>(false);
 
   useEffect(() => {
@@ -273,11 +276,33 @@ const GuestCatalogLockedCard: React.FC<{ profile: UserProfile }> = ({ profile: _
               Self-Hosted Telegram Music System
             </Subheadline>
           </div>
-          {profile && (
-            <Badge mode={getRoleBadgeMode(profile.role)} type="number">
-              {profile.role}
-            </Badge>
-          )}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            {profile && (
+              <button
+                onClick={() => setIsSettingsOpen(true)}
+                title="Audio &amp; Playback Settings"
+                style={{
+                  background: 'var(--tg-theme-secondary-bg-color, #2c2c2e)',
+                  border: 'none',
+                  borderRadius: '50%',
+                  width: '32px',
+                  height: '32px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  color: 'var(--tg-theme-text-color, #fff)',
+                  cursor: 'pointer',
+                }}
+              >
+                <SlidersHorizontal size={15} />
+              </button>
+            )}
+            {profile && (
+              <Badge mode={getRoleBadgeMode(profile.role)} type="number">
+                {profile.role}
+              </Badge>
+            )}
+          </div>
         </div>
 
         {/* Navigation Segmented Tabs */}
@@ -456,6 +481,33 @@ const GuestCatalogLockedCard: React.FC<{ profile: UserProfile }> = ({ profile: _
               )}
             </Card>
 
+            {/* User Settings & Preferences Card */}
+            <Card
+              onClick={() => setIsSettingsOpen(true)}
+              style={{
+                padding: '16px',
+                backgroundColor: 'var(--tg-theme-secondary-bg-color, #2c2c2e)',
+                borderRadius: '12px',
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <SlidersHorizontal size={20} color="var(--tg-theme-button-color, #0a84ff)" />
+                <div>
+                  <Subheadline level="1" weight="2">Audio &amp; Streaming Preferences</Subheadline>
+                  <Caption style={{ color: 'var(--tg-theme-subtitle-text-color, #8e8e93)' }}>
+                    Transcoding format, streaming bitrates &amp; auto-lyrics
+                  </Caption>
+                </div>
+              </div>
+              <div style={{ color: 'var(--tg-theme-button-color, #0a84ff)', fontWeight: 600, fontSize: '13px' }}>
+                Configure
+              </div>
+            </Card>
+
             {/* Granted Permissions Card */}
             <Card style={{ padding: '16px', backgroundColor: 'var(--tg-theme-secondary-bg-color, #2c2c2e)', borderRadius: '12px' }}>
               <Subheadline level="1" weight="2" style={{ marginBottom: '8px' }}>
@@ -481,6 +533,13 @@ const GuestCatalogLockedCard: React.FC<{ profile: UserProfile }> = ({ profile: _
           </div>
         )}
       </div>
+
+      {/* Settings Modal */}
+      <SettingsModal
+        isOpen={isSettingsOpen}
+        onClose={() => setIsSettingsOpen(false)}
+        profile={profile}
+      />
 
       {/* Global Floating Player Components (only if authorized to view catalog) */}
       {profile && canViewCatalog(profile) && (

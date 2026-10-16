@@ -20,7 +20,11 @@ from mutagen.mp4 import MP4Cover
 
 from src.bot.auth import TelegramInitDataValidationError, validate_telegram_init_data
 from src.bot.oidc_server import OidcCallbackCoordinator
-from src.core.bulk_research import BulkResearchService
+from src.core.bulk_research import (
+    BulkResearchProgress,
+    BulkResearchService,
+    get_active_bulk_research,
+)
 from src.core.exceptions import OidcAuthenticationError, PermissionDeniedError
 from src.core.extractor import SUPPORTED_ARCHIVE_EXTENSIONS, SUPPORTED_AUDIO_EXTENSIONS
 from src.core.lyrics import LrclibLyricsClient
@@ -35,6 +39,7 @@ from src.core.models import (
     Permission,
     TrackMetadata,
     UserAccount,
+    UserPreferences,
     UserRole,
 )
 from src.core.organizer import LibraryOrganizer
@@ -77,6 +82,26 @@ class QueueEventBus:
         for sub in list(self._subscribers):
             with contextlib.suppress(Exception):
                 sub.put_nowait(event)
+
+
+def serialize_bulk_progress(progress: BulkResearchProgress | None) -> dict[str, Any] | None:
+    """Serialize an active BulkResearchProgress snapshot into a JSON-safe dictionary for Mini App clients."""
+    if progress is None:
+        return None
+    return {
+        "total_tracks": progress.total_tracks,
+        "current_index": progress.current_index,
+        "current_track": progress.current_track,
+        "status": progress.status,
+        "actor_id": progress.actor_id,
+        "actor_name": progress.actor_name,
+        "started_at": progress.started_at,
+        "applied_count": progress.applied_count,
+        "needs_review_count": progress.needs_review_count,
+        "failed_count": progress.failed_count,
+        "skipped_count": progress.skipped_count,
+        "percent": progress.percent,
+    }
 
 
 def serialize_job(job: IngestionJob, queue_position: int = 0) -> dict[str, Any]:
@@ -403,8 +428,9 @@ def build_webapp_api(
             "role": user.role.value,
             "display_name": user.display_name,
             "username": user.username,
-            "authentik_linked": bool(user.authentik_username),
+            "authentik_linked": user.is_oidc_linked,
             "authentik_username": user.authentik_username,
+            "oidc_role_override": user.oidc_role_override,
             "permissions": permissions,
             "is_owner": is_owner,
             "start_param": validated_data.get("start_param", ""),
@@ -412,6 +438,112 @@ def build_webapp_api(
         return web.json_response(response_payload)
 
     app.router.add_get("/api/v1/app/auth/me", handle_get_me)
+
+    async def handle_post_auth_oidc_disconnect(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        if governance_service is None:
+            return web.json_response({"error": "Governance service unavailable."}, status=503)
+        if not user.is_oidc_linked:
+            return web.json_response({"error": "Account is not linked to Authentik OIDC."}, status=400)
+        updated = await governance_service.unlink_user_oidc(
+            actor=user,
+            target_telegram_id=user.telegram_id,
+        )
+        return web.json_response(
+            {
+                "success": True,
+                "message": "Authentik OIDC account unlinked successfully.",
+                "telegram_id": updated.telegram_id,
+                "authentik_linked": updated.is_oidc_linked,
+            }
+        )
+
+    app.router.add_post("/api/v1/app/auth/oidc/disconnect", handle_post_auth_oidc_disconnect)
+
+    # 2.05 User Settings & Preferences
+    async def handle_get_user_settings(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        if governance_service is None:
+            raise web.HTTPServiceUnavailable(
+                text=json.dumps({"error": "Governance service unavailable."}),
+                content_type="application/json",
+            )
+        prefs = await governance_service._repo.get_user_preferences(user.telegram_id)
+        return web.json_response(
+            {
+                "telegram_id": prefs.telegram_id,
+                "stream_format": prefs.stream_format,
+                "stream_bitrate": prefs.stream_bitrate,
+                "auto_lyrics_search": prefs.auto_lyrics_search,
+                "theme": prefs.theme,
+            }
+        )
+
+    async def handle_update_user_settings(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        if governance_service is None:
+            raise web.HTTPServiceUnavailable(
+                text=json.dumps({"error": "Governance service unavailable."}),
+                content_type="application/json",
+            )
+        try:
+            body = await request.json()
+        except Exception as exc:
+            raise web.HTTPBadRequest(
+                text=json.dumps({"error": "Invalid JSON body."}),
+                content_type="application/json",
+            ) from exc
+
+        current = await governance_service._repo.get_user_preferences(user.telegram_id)
+        new_format = str(body.get("stream_format") or current.stream_format).strip().lower()
+        if new_format not in {"auto", "original", "opus", "mp3"}:
+            new_format = current.stream_format
+
+        new_bitrate = current.stream_bitrate
+        with contextlib.suppress(Exception):
+            raw_br = int(body.get("stream_bitrate", current.stream_bitrate))
+            if raw_br in {64, 96, 128, 160, 192, 256, 320}:
+                new_bitrate = raw_br
+
+        new_auto_lyrics = (
+            bool(body["auto_lyrics_search"]) if "auto_lyrics_search" in body else current.auto_lyrics_search
+        )
+        new_theme = str(body.get("theme") or current.theme).strip().lower()
+        if new_theme not in {"system", "dark", "light"}:
+            new_theme = current.theme
+
+        updated = UserPreferences(
+            telegram_id=user.telegram_id,
+            stream_format=new_format,
+            stream_bitrate=new_bitrate,
+            auto_lyrics_search=new_auto_lyrics,
+            theme=new_theme,
+        )
+        saved = await governance_service._repo.update_user_preferences(updated)
+        return web.json_response(
+            {
+                "telegram_id": saved.telegram_id,
+                "stream_format": saved.stream_format,
+                "stream_bitrate": saved.stream_bitrate,
+                "auto_lyrics_search": saved.auto_lyrics_search,
+                "theme": saved.theme,
+            }
+        )
+
+    app.router.add_get("/api/v1/app/user/settings", handle_get_user_settings)
+    app.router.add_post("/api/v1/app/user/settings", handle_update_user_settings)
 
     # 2.1 Catalog track list with search, sorting & pagination
     async def handle_get_tracks(request: web.Request) -> web.Response:
@@ -637,8 +769,17 @@ def build_webapp_api(
         with contextlib.suppress(Exception):
             bitrate_kbps = int(request.query.get("bitrate", "128"))
 
-        # On-the-fly server-side transcoding in RAM for heavy FLAC tracks or when requested
-        want_transcode = req_format in {"opus", "mp3"} or (req_format == "auto" and ext == ".flac")
+        if req_format == "auto" and governance_service and user:
+            with contextlib.suppress(Exception):
+                user_prefs = await governance_service._repo.get_user_preferences(user.telegram_id)
+                if user_prefs.stream_format != "auto":
+                    req_format = user_prefs.stream_format
+                    bitrate_kbps = user_prefs.stream_bitrate
+
+        want_transcode = False
+        if req_format not in {"original", "direct", "raw"}:
+            want_transcode = req_format in {"opus", "mp3"} or (req_format == "auto" and ext == ".flac")
+
         if want_transcode and is_ffmpeg_available():
             target_fmt = "mp3" if req_format == "mp3" else "opus"
             target_mime = "audio/mpeg" if target_fmt == "mp3" else "audio/ogg; codecs=opus"
@@ -813,10 +954,15 @@ def build_webapp_api(
             proposal_data.get("artist") or proposal_data.get("new_artist") or record.artist
         ).strip()
         new_album = str(proposal_data.get("album") or proposal_data.get("new_album") or record.album).strip()
-        raw_year = proposal_data.get("year") if "year" in proposal_data else proposal_data.get("new_year")
-        try:
-            new_year = int(raw_year) if raw_year is not None and str(raw_year).strip() else None
-        except ValueError, TypeError:
+        if action_type in {"lyrics", "cover"}:
+            new_year = record.year
+        elif "year" in proposal_data or "new_year" in proposal_data:
+            raw_year = proposal_data.get("year") if "year" in proposal_data else proposal_data.get("new_year")
+            try:
+                new_year = int(raw_year) if raw_year is not None and str(raw_year).strip() else None
+            except ValueError, TypeError:
+                new_year = record.year
+        else:
             new_year = record.year
         raw_trk = (
             proposal_data.get("track_number")
@@ -1612,11 +1758,35 @@ def build_webapp_api(
             auto_apply=auto_apply,
         )
 
-        report = await bulk_service.execute_bulk_research(
-            plan,
-            actor_id=user.telegram_id,
-            actor_name=user.display_name,
-        )
+        bus: QueueEventBus | None = app.get("event_bus")
+
+        async def _on_bulk_progress(current: int, total: int, label: str, status: str) -> None:
+            active_info = get_active_bulk_research()
+            if active_info and bus:
+                await bus.publish(
+                    {
+                        "type": "bulk_research_progress",
+                        "data": serialize_bulk_progress(active_info),
+                        "bulk_research": serialize_bulk_progress(active_info),
+                    }
+                )
+
+        try:
+            report = await bulk_service.execute_bulk_research(
+                plan,
+                actor_id=user.telegram_id,
+                actor_name=user.display_name,
+                progress_callback=_on_bulk_progress,
+            )
+        finally:
+            if bus:
+                await bus.publish(
+                    {
+                        "type": "bulk_research_progress",
+                        "data": None,
+                        "bulk_research": None,
+                    }
+                )
 
         return web.json_response(
             {
@@ -1801,6 +1971,7 @@ def build_webapp_api(
             "paused_count": len(paused_jobs),
             "can_view_global": can_view_global,
             "scope": "mine" if scope_mine else "global",
+            "active_bulk_research": serialize_bulk_progress(get_active_bulk_research()),
             "jobs": [serialize_job(j, pos_map.get(j.job_id, 0)) for j in combined_jobs],
         }
         return web.Response(
@@ -2021,6 +2192,132 @@ def build_webapp_api(
                 status=200,
             )
 
+        elif action in {"apply_edit", "apply_custom_metadata"}:
+            if pipeline is None:
+                raise web.HTTPServiceUnavailable(
+                    text=json.dumps({"error": "Ingestion pipeline unavailable."}),
+                    content_type="application/json",
+                )
+            is_owner = job.user_id is not None and job.user_id == user.telegram_id
+            if is_owner:
+                require_permission(user, Permission.RESOLVE_OWN_DISAMBIGUATION)
+            else:
+                require_permission(user, Permission.RESOLVE_OTHERS_JOBS)
+
+            seed_meta = job.selected_metadata or (
+                job.candidates[0].metadata
+                if job.candidates
+                else TrackMetadata(title="Unknown Title", artist="Unknown Artist", album="Unknown Album")
+            )
+            title = str(data.get("title") or seed_meta.title).strip()
+            artist = str(data.get("artist") or seed_meta.artist).strip()
+            album = str(data.get("album") or seed_meta.album).strip()
+            raw_yr = data.get("year")
+            year = int(raw_yr) if raw_yr is not None and str(raw_yr).strip().isdigit() else seed_meta.year
+            raw_trk = data.get("track_number")
+            track_number = (
+                int(raw_trk)
+                if raw_trk is not None and str(raw_trk).strip().isdigit()
+                else (seed_meta.track_number or 1)
+            )
+            rec_mbid = (
+                str(data.get("recording_mbid")).strip()
+                if data.get("recording_mbid")
+                else seed_meta.recording_mbid
+            )
+            rel_mbid = (
+                str(data.get("release_mbid")).strip() if data.get("release_mbid") else seed_meta.release_mbid
+            )
+
+            custom_meta = TrackMetadata(
+                title=title or "Unknown Title",
+                artist=artist or "Unknown Artist",
+                album=album or "Unknown Album",
+                album_artist=artist or "Unknown Artist",
+                year=year,
+                track_number=track_number,
+                duration_seconds=seed_meta.duration_seconds,
+                recording_mbid=rec_mbid,
+                release_mbid=rel_mbid,
+            )
+
+            lyrics_obj: LyricsData | None = None
+            raw_lyr = data.get("lyrics")
+            if isinstance(raw_lyr, str) and raw_lyr.strip():
+                clean_lyr = raw_lyr.strip()
+                is_synced = "[" in clean_lyr and "]" in clean_lyr
+                lyrics_obj = LyricsData(
+                    synced_lyrics=clean_lyr if is_synced else None,
+                    plain_lyrics=None if is_synced else clean_lyr,
+                )
+
+            cover_bytes: bytes | None = None
+            cover_b64 = data.get("cover_base64")
+            if isinstance(cover_b64, str) and cover_b64.strip():
+                try:
+                    cover_bytes = base64.b64decode(cover_b64.strip())
+                except Exception as b64_err:
+                    logger.debug("Failed to decode cover_base64 for job %s: %s", job.job_id, b64_err)
+            cover_mime = str(data.get("cover_mime") or "image/jpeg")
+
+            async def _publish_custom_stage(staged_job: IngestionJob) -> None:
+                await bus.publish(
+                    {
+                        "type": "stage_changed",
+                        "job_id": staged_job.job_id,
+                        "user_id": staged_job.user_id,
+                        "state": staged_job.state.value,
+                        "stage": staged_job.state.value,
+                        "processed_tracks": staged_job.processed_tracks,
+                        "total_tracks": staged_job.total_tracks,
+                        "job": serialize_job(staged_job),
+                    }
+                )
+
+            try:
+                result = await pipeline.complete_custom_ingestion(
+                    job_id=job.job_id,
+                    metadata=custom_meta,
+                    custom_lyrics=lyrics_obj,
+                    custom_cover_bytes=cover_bytes,
+                    custom_cover_mime=cover_mime,
+                    stage_callback=_publish_custom_stage,
+                )
+            except Exception as exc:
+                logger.error("Custom ingestion failed for job %s: %s", job.job_id, exc, exc_info=True)
+                failed_job = await catalog_repository.get_job(job.job_id) or job
+                await bus.publish(
+                    {
+                        "type": "job_failed",
+                        "job_id": job.job_id,
+                        "user_id": job.user_id,
+                        "state": JobState.FAILED.value,
+                        "error": str(exc),
+                        "job": serialize_job(failed_job),
+                    }
+                )
+                raise web.HTTPInternalServerError(
+                    text=json.dumps({"error": f"Custom ingestion failed: {exc}"}),
+                    content_type="application/json",
+                ) from exc
+
+            if queue_worker is not None:
+                await queue_worker.record_confirmed_completion(result)
+            await bus.publish(
+                {
+                    "type": "job_completed",
+                    "job_id": result.job.job_id,
+                    "user_id": result.job.user_id,
+                    "state": result.job.state.value,
+                    "job": serialize_job(result.job),
+                }
+            )
+            return web.Response(
+                text=json.dumps({"success": True, "job": serialize_job(result.job)}),
+                content_type="application/json",
+                status=200,
+            )
+
         else:
             raise web.HTTPBadRequest(
                 text=json.dumps({"error": f"Unknown action '{action}'."}),
@@ -2140,7 +2437,10 @@ def build_webapp_api(
             "display_name": target_user.display_name,
             "username": target_user.username,
             "is_blocked": target_user.is_blocked,
+            "authentik_linked": target_user.is_oidc_linked,
             "authentik_username": target_user.authentik_username,
+            "authentik_groups": list(target_user.authentik_groups),
+            "oidc_role_override": target_user.oidc_role_override,
             "created_at": target_user.created_at.isoformat() if target_user.created_at else None,
             "updated_at": target_user.updated_at.isoformat() if target_user.updated_at else None,
             "uploads_count": {
@@ -2282,6 +2582,103 @@ def build_webapp_api(
         return web.json_response({"user": serialize_admin_user(updated_user, uploads)})
 
     app.router.add_post("/api/v1/app/admin/users/{user_id}/block", handle_post_admin_user_block)
+
+    async def handle_post_admin_user_oidc_disconnect(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        try:
+            require_permission(user, Permission.MANAGE_USERS)
+        except PermissionDeniedError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
+
+        raw_user_id = request.match_info.get("user_id", "").strip()
+        try:
+            target_telegram_id = int(raw_user_id)
+        except ValueError:
+            return web.json_response({"error": "Invalid user_id parameter."}, status=400)
+
+        if governance_service is None:
+            return web.json_response({"error": "Governance service unavailable."}, status=503)
+
+        try:
+            updated = await governance_service.unlink_user_oidc(
+                actor=user,
+                target_telegram_id=target_telegram_id,
+            )
+        except KeyError as exc:
+            return web.json_response({"error": str(exc)}, status=404)
+        except PermissionDeniedError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
+
+        repo = getattr(governance_service, "_repo", None)
+        uploads = await repo.count_user_uploads(target_telegram_id) if repo else (0, 0)
+        return web.json_response(
+            {
+                "success": True,
+                "message": "User Authentik OIDC account unlinked.",
+                "user": serialize_admin_user(updated, uploads),
+            }
+        )
+
+    app.router.add_post(
+        "/api/v1/app/admin/users/{user_id}/oidc/disconnect",
+        handle_post_admin_user_oidc_disconnect,
+    )
+
+    async def handle_post_admin_user_oidc_override(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        try:
+            require_permission(user, Permission.MANAGE_USERS)
+        except PermissionDeniedError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
+
+        raw_user_id = request.match_info.get("user_id", "").strip()
+        try:
+            target_telegram_id = int(raw_user_id)
+        except ValueError:
+            return web.json_response({"error": "Invalid user_id parameter."}, status=400)
+
+        if governance_service is None:
+            return web.json_response({"error": "Governance service unavailable."}, status=503)
+
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({"error": "Malformed JSON payload."}, status=400)
+
+        override = bool(data.get("override", True))
+        try:
+            updated = await governance_service.set_user_oidc_override(
+                actor=user,
+                target_telegram_id=target_telegram_id,
+                override=override,
+            )
+        except KeyError as exc:
+            return web.json_response({"error": str(exc)}, status=404)
+        except PermissionDeniedError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
+
+        repo = getattr(governance_service, "_repo", None)
+        uploads = await repo.count_user_uploads(target_telegram_id) if repo else (0, 0)
+        return web.json_response(
+            {
+                "success": True,
+                "message": f"OIDC role override set to {override}.",
+                "user": serialize_admin_user(updated, uploads),
+            }
+        )
+
+    app.router.add_post(
+        "/api/v1/app/admin/users/{user_id}/oidc/override",
+        handle_post_admin_user_oidc_override,
+    )
 
     async def handle_get_admin_access_requests(request: web.Request) -> web.Response:
         user, _ = await authenticate_tma_request(

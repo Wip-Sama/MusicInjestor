@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
 import { hapticFeedback } from '@telegram-apps/sdk-react';
-import { getRawInitData } from '../lib/auth';
+import { getRawInitData, apiFetch } from '../lib/auth';
 import { TrackItem } from '../types/music';
 
 export type RepeatMode = 'off' | 'all' | 'one';
@@ -18,6 +18,9 @@ interface AudioPlayerContextType {
   isPlayerOpen: boolean;
   isLyricsOpen: boolean;
   isQueueOpen: boolean;
+  streamFormat: string;
+  streamBitrate: number;
+  autoLyricsSearch: boolean;
   playTrack: (track: TrackItem, queueContext?: TrackItem[]) => void;
   togglePlay: () => void;
   seekTo: (seconds: number) => void;
@@ -29,6 +32,12 @@ interface AudioPlayerContextType {
   setIsLyricsOpen: (open: boolean) => void;
   setIsQueueOpen: (open: boolean) => void;
   updateTrackData: (updated: TrackItem) => void;
+  switchStreamQuality: (format: string, bitrate: number) => void;
+  updateUserSettings: (settings: {
+    stream_format?: string;
+    stream_bitrate?: number;
+    auto_lyrics_search?: boolean;
+  }) => Promise<void>;
 }
 
 const AudioPlayerContext = createContext<AudioPlayerContextType | null>(null);
@@ -49,6 +58,40 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
   const [isPlayerOpen, setIsPlayerOpen] = useState<boolean>(false);
   const [isLyricsOpen, setIsLyricsOpen] = useState<boolean>(false);
   const [isQueueOpen, setIsQueueOpen] = useState<boolean>(false);
+
+  const [streamFormat, setStreamFormat] = useState<string>('auto');
+  const [streamBitrate, setStreamBitrate] = useState<number>(192);
+  const [autoLyricsSearch, setAutoLyricsSearch] = useState<boolean>(true);
+
+  // Fetch persisted user streaming & audio preferences on mount
+  useEffect(() => {
+    apiFetch('/api/v1/app/user/settings')
+      .then((res) => {
+        if (res.ok) return res.json();
+        throw new Error('Failed to load user preferences');
+      })
+      .then((data) => {
+        if (data.stream_format) setStreamFormat(data.stream_format);
+        if (data.stream_bitrate) setStreamBitrate(data.stream_bitrate);
+        if (typeof data.auto_lyrics_search === 'boolean') {
+          setAutoLyricsSearch(data.auto_lyrics_search);
+        }
+      })
+      .catch((err) => {
+        console.warn('Could not load user streaming preferences:', err);
+      });
+  }, []);
+
+  const buildAudioUrl = (track: TrackItem, format: string, bitrate: number) => {
+    const rawInit = getRawInitData();
+    const sep = track.audio_url.includes('?') ? '&' : '?';
+    const params = new URLSearchParams();
+    if (rawInit) params.set('tgWebAppData', rawInit);
+    if (format && format !== 'auto') params.set('format', format);
+    if (bitrate && format !== 'original') params.set('bitrate', bitrate.toString());
+    const queryStr = params.toString();
+    return queryStr ? `${track.audio_url}${sep}${queryStr}` : track.audio_url;
+  };
 
   // Trigger haptic vibration if running inside Telegram
   const triggerHaptic = () => {
@@ -169,16 +212,82 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }
 
     setCurrentTrack(track);
-    const rawInit = getRawInitData();
-    const sep = track.audio_url.includes('?') ? '&' : '?';
-    const audioSrc = rawInit
-      ? `${track.audio_url}${sep}tgWebAppData=${encodeURIComponent(rawInit)}`
-      : track.audio_url;
+    const audioSrc = buildAudioUrl(track, streamFormat, streamBitrate);
     audio.src = audioSrc;
     audio.play().catch((err) => {
       console.warn('Audio playback failed or was prevented by browser policy:', err);
       setIsPlaying(false);
     });
+  };
+
+  const switchStreamQuality = (format: string, bitrate: number) => {
+    triggerHaptic();
+    setStreamFormat(format);
+    setStreamBitrate(bitrate);
+
+    apiFetch('/api/v1/app/user/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        stream_format: format,
+        stream_bitrate: bitrate,
+        auto_lyrics_search: autoLyricsSearch,
+      }),
+    }).catch((err) => console.warn('Failed to persist stream quality:', err));
+
+    const audio = audioRef.current;
+    if (audio && currentTrack) {
+      const curTime = audio.currentTime;
+      const wasPlaying = !audio.paused;
+      const newUrl = buildAudioUrl(currentTrack, format, bitrate);
+      audio.src = newUrl;
+      audio.currentTime = curTime;
+      if (wasPlaying) {
+        audio.play().catch(console.error);
+      }
+    }
+  };
+
+  const updateUserSettings = async (settings: {
+    stream_format?: string;
+    stream_bitrate?: number;
+    auto_lyrics_search?: boolean;
+  }) => {
+    triggerHaptic();
+    const newFormat = settings.stream_format ?? streamFormat;
+    const newBitrate = settings.stream_bitrate ?? streamBitrate;
+    const newLyrics = settings.auto_lyrics_search ?? autoLyricsSearch;
+
+    setStreamFormat(newFormat);
+    setStreamBitrate(newBitrate);
+    setAutoLyricsSearch(newLyrics);
+
+    try {
+      await apiFetch('/api/v1/app/user/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          stream_format: newFormat,
+          stream_bitrate: newBitrate,
+          auto_lyrics_search: newLyrics,
+        }),
+      });
+    } catch (err) {
+      console.warn('Failed to save user settings:', err);
+    }
+
+    if (newFormat !== streamFormat || newBitrate !== streamBitrate) {
+      const audio = audioRef.current;
+      if (audio && currentTrack) {
+        const curTime = audio.currentTime;
+        const wasPlaying = !audio.paused;
+        audio.src = buildAudioUrl(currentTrack, newFormat, newBitrate);
+        audio.currentTime = curTime;
+        if (wasPlaying) {
+          audio.play().catch(console.error);
+        }
+      }
+    }
   };
 
   const togglePlay = () => {
@@ -298,6 +407,9 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
         isPlayerOpen,
         isLyricsOpen,
         isQueueOpen,
+        streamFormat,
+        streamBitrate,
+        autoLyricsSearch,
         playTrack,
         togglePlay,
         seekTo,
@@ -309,6 +421,8 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
         setIsLyricsOpen,
         setIsQueueOpen,
         updateTrackData,
+        switchStreamQuality,
+        updateUserSettings,
       }}
     >
       {children}

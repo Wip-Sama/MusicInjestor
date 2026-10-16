@@ -6,7 +6,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from src.config.settings import AppSettings, load_settings
+from src.config.settings import AppSettings, _parse_role_mapping, load_settings
 
 
 def test_default_settings_and_url_normalization() -> None:
@@ -143,3 +143,50 @@ def test_ensure_directories_creates_paths(sample_settings: AppSettings) -> None:
     assert sample_settings.storage_scratch_dir.is_dir()
     assert sample_settings.storage_library_dir.is_dir()
     assert sample_settings.database_path.parent.is_dir()
+
+
+def test_parse_role_mapping() -> None:
+    """Verify role mapping parsing handles dicts, JSON strings, and comma-separated pairs."""
+    # Dict input
+    assert _parse_role_mapping({"music-admins": "ADMIN", "music-dj": "MODERATOR"}) == {
+        "music-admins": "ADMIN",
+        "music-dj": "MODERATOR",
+    }
+
+    # JSON string input
+    json_str = '{"admins": "ADMIN", "vip-listeners": "LISTENER"}'
+    assert _parse_role_mapping(json_str) == {
+        "admins": "ADMIN",
+        "vip-listeners": "LISTENER",
+    }
+
+    # Comma-separated pairs with '=' and ':'
+    comma_str = "music-admins=ADMIN, music-mods:MODERATOR, music-uploaders=UPLOADER"
+    assert _parse_role_mapping(comma_str) == {
+        "music-admins": "ADMIN",
+        "music-mods": "MODERATOR",
+        "music-uploaders": "UPLOADER",
+    }
+
+    # Empty and invalid cases
+    assert _parse_role_mapping("") == {}
+    assert _parse_role_mapping(None) == {}
+    assert _parse_role_mapping("invalid_entry_without_delimiter, valid=ADMIN") == {"valid": "ADMIN"}
+
+
+def test_load_settings_oidc_role_mapping(tmp_path: Path) -> None:
+    """Verify OIDC_ROLE_MAPPING is correctly loaded from environment and yaml."""
+    dotenv_file = tmp_path / ".env"
+    dotenv_file.write_text(
+        "OIDC_ROLE_MAPPING=authentik-admins=ADMIN,authentik-curators=UPLOADER\n",
+        encoding="utf-8",
+    )
+    loaded = load_settings(
+        dotenv_path=dotenv_file,
+        environ={},
+        yaml_path=tmp_path / "missing.yaml",
+    )
+    assert loaded.oidc_role_mapping == {
+        "authentik-admins": "ADMIN",
+        "authentik-curators": "UPLOADER",
+    }

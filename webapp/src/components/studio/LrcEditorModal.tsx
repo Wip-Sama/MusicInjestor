@@ -168,6 +168,7 @@ export const LrcEditorModal: React.FC<LrcEditorModalProps> = ({
         body: JSON.stringify({
           action_type: 'lyrics',
           lyrics: finalLrc,
+          year: track.year,
         }),
       });
 
@@ -233,6 +234,7 @@ export const LrcEditorModal: React.FC<LrcEditorModalProps> = ({
         body: JSON.stringify({
           action_type: 'lyrics',
           lyrics: lyricsText.trim(),
+          year: track.year,
         }),
       });
       if (!propRes.ok) {

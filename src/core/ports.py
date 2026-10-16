@@ -18,6 +18,7 @@ from src.core.models import (
     TagCorrectionStatus,
     TrackMetadata,
     UserAccount,
+    UserPreferences,
     UserRole,
 )
 
@@ -80,6 +81,14 @@ class GovernanceRepositoryPort(Protocol):
 
     async def count_user_uploads(self, telegram_id: int) -> tuple[int, int]:
         """Return `(albums_count, tracks_count)` uploaded by the given user."""
+        ...
+
+    async def get_user_preferences(self, telegram_id: int) -> UserPreferences:
+        """Retrieve user preferences, creating defaults if not yet configured."""
+        ...
+
+    async def update_user_preferences(self, preferences: UserPreferences) -> UserPreferences:
+        """Insert or update user preferences in persistent storage."""
         ...
 
     async def create_access_request(self, telegram_id: int) -> AccessRequestRecord:

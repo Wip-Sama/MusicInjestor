@@ -3,6 +3,7 @@
 import contextlib
 import html
 import logging
+from collections.abc import Mapping
 from pathlib import Path
 
 import httpx
@@ -40,7 +41,7 @@ from src.bot.ui import (
 )
 from src.config.settings import AppSettings
 from src.core.exceptions import PermissionDeniedError
-from src.core.metadata import normalize_primary_artist
+from src.core.metadata import _MB_URL_RE, normalize_primary_artist
 from src.core.models import (
     IngestionJob,
     IngestionResult,
@@ -189,7 +190,7 @@ def _parse_job_metadata_input(
 
 def format_job_edit_dry_run_card(
     job: IngestionJob,
-    proposal: dict[str, object],
+    proposal: Mapping[str, object],
     organizer: LibraryOrganizer,
 ) -> str:
     """Render the full-pipeline Dry-Run Preview & Tag Editor card for a queued/verification job."""
@@ -463,6 +464,7 @@ async def handle_verification_callback(
                 f"artist: {proposal.get('new_artist')} | title: {proposal.get('new_title')} "
                 f"| album: {proposal.get('new_album')}",
             ),
+            "link": ("MusicBrainz URL, MBID, or Query", "https://musicbrainz.org/release/..."),
         }
         label, current_val = field_labels.get(field_name, ("Value", str(proposal.get("new_title") or "")))
         await safe_edit_text(
@@ -660,6 +662,41 @@ async def handle_verification_callback(
             msg,
             format_job_edit_dry_run_card(target_job, proposal, organizer),
             reply_markup=build_job_edit_keyboard(job_id),
+        )
+        return
+
+    if action == "link_search":
+        if target_job is None:
+            await ack_callback(callback, "Job not found.", show_alert=True)
+            return
+        await ack_callback(callback)
+        fsm_data = await _read_fsm_dict(state)
+        proposal = _ensure_job_proposal(target_job, fsm_data.get("job_edit_proposal"))
+        if state is not None:
+            await state.set_state(IngestionStates.awaiting_job_metadata_input)
+            await state.update_data(
+                job_id=job_id,
+                job_edit_field="link",
+                job_edit_proposal=proposal,
+            )
+        await safe_edit_text(
+            msg,
+            format_screen(
+                title="🔗 Search Metadata by Link or Query",
+                context_lines=[
+                    "Reply with any of the following to update tags &amp; lyrics:",
+                    "• MusicBrainz URL (<code>https://musicbrainz.org/release/...</code>)",
+                    "• Recording URL (<code>https://musicbrainz.org/recording/...</code>)",
+                    "• <code>Artist - Title</code> or <code>Artist - Title | Album</code>",
+                    "• <code>isrc:JPD731600777</code> or MBID UUID",
+                    "Resolved metadata &amp; lyrics will be loaded directly into your Tag Editor.",
+                ],
+                footer_lines=[
+                    f"<i>Job ID:</i> <code>{html.escape(job_id)}</code> • "
+                    "<i>🧭 Home › Queue › Tag Editor › Link Search</i>"
+                ],
+            ),
+            reply_markup=build_job_input_cancel_keyboard(job_id),
         )
         return
 
@@ -922,7 +959,71 @@ async def handle_job_metadata_input(
         return
 
     proposal = _ensure_job_proposal(target_job, data.get("job_edit_proposal"))
-    proposal = _parse_job_metadata_input(message.text or "", target_field, proposal)
+    raw_text = (message.text or "").strip()
+    is_link_target = target_field == "link"
+    is_mb_link = bool(_MB_URL_RE.search(raw_text))
+
+    if is_link_target or is_mb_link:
+        await send_chat_action_safe(message)
+        try:
+            result = await pipeline.search_manual_candidates(job_id, raw_text)
+            if result.job.candidates:
+                best = result.job.candidates[0].metadata
+                proposal["new_title"] = best.title
+                proposal["new_artist"] = best.artist
+                proposal["new_album"] = best.album
+                proposal["new_year"] = best.year
+                proposal["new_track_number"] = best.track_number or proposal.get("new_track_number") or 1
+                proposal["new_recording_mbid"] = best.recording_mbid
+                proposal["new_release_mbid"] = best.release_mbid
+                target_job.candidates = result.job.candidates
+                target_job.selected_metadata = best
+
+                lyrics_client = _resolve_lyrics_client(pipeline, settings)
+                try:
+                    fetched_lyrics = await lyrics_client.fetch_lyrics(best)
+                    if fetched_lyrics is not None:
+                        proposal["new_lyrics"] = fetched_lyrics.synced_lyrics or fetched_lyrics.plain_lyrics
+                except Exception as lex:
+                    logger.debug("Lyrics fetch during link search failed: %s", lex)
+
+                await state.update_data(job_edit_field="multi", job_edit_proposal=proposal)
+                organizer = _resolve_organizer(pipeline, settings)
+                await message.answer(
+                    format_job_edit_dry_run_card(target_job, proposal, organizer),
+                    reply_markup=build_job_edit_keyboard(job_id),
+                )
+                return
+            if is_link_target:
+                await message.answer(
+                    format_screen(
+                        title="⚠️ No Matches Found",
+                        context_lines=[
+                            f"No MusicBrainz matches were found for:\n<code>{html.escape(raw_text)}</code>",
+                            "Please check the URL or try searching with <code>Artist - Title</code>.",
+                        ],
+                        footer_lines=[f"<i>Job ID:</i> <code>{html.escape(job_id)}</code>"],
+                    ),
+                    reply_markup=build_job_input_cancel_keyboard(job_id),
+                )
+                return
+        except Exception as exc:
+            logger.warning("Link search failed for job %s: %s", job_id, exc)
+            if is_link_target:
+                await message.answer(
+                    format_screen(
+                        title="⚠️ Search Error",
+                        context_lines=[
+                            f"Failed to lookup metadata: <code>{html.escape(str(exc))}</code>",
+                            "Please try again or tap Back.",
+                        ],
+                        footer_lines=[f"<i>Job ID:</i> <code>{html.escape(job_id)}</code>"],
+                    ),
+                    reply_markup=build_job_input_cancel_keyboard(job_id),
+                )
+                return
+
+    proposal = _parse_job_metadata_input(raw_text, target_field, proposal)
     await state.update_data(job_edit_field="multi", job_edit_proposal=proposal)
     organizer = _resolve_organizer(pipeline, settings)
     await message.answer(

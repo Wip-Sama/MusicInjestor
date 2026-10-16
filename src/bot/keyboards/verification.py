@@ -119,12 +119,22 @@ def build_job_edit_keyboard(
     )
     builder.row(
         InlineKeyboardButton(
-            text="📥 Get Queued File",
-            callback_data=QueueJobCallback(action="get_file", job_id=job_id).pack(),
+            text="🔗 Search by Link",
+            callback_data=VerifyActionCallback(action="link_search", job_id=job_id).pack(),
         ),
         InlineKeyboardButton(
             text="⚡ Auto Re-Search",
             callback_data=VerifyActionCallback(action="auto_enrich", job_id=job_id).pack(),
+        ),
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="📥 Get Queued File",
+            callback_data=QueueJobCallback(action="get_file", job_id=job_id).pack(),
+        ),
+        InlineKeyboardButton(
+            text="✏️ Edit Multiple Fields",
+            callback_data=VerifyFieldCallback(job_id=job_id, field="multi").pack(),
         ),
     )
     builder.row(
@@ -151,10 +161,6 @@ def build_job_edit_keyboard(
         InlineKeyboardButton(
             text="🔢 Edit Track #",
             callback_data=VerifyFieldCallback(job_id=job_id, field="track").pack(),
-        ),
-        InlineKeyboardButton(
-            text="✏️ Edit Multiple Fields",
-            callback_data=VerifyFieldCallback(job_id=job_id, field="multi").pack(),
         ),
     )
     builder.row(

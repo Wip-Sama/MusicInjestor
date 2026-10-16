@@ -117,18 +117,37 @@ def require_permission(user: UserAccount, permission: Permission) -> None:
         raise PermissionDeniedError(msg)
 
 
-def evaluate_oidc_role(groups: tuple[str, ...] | list[str]) -> UserRole:
+DEFAULT_OIDC_ROLE_MAPPING: dict[str, str] = {
+    "music-admins": "ADMIN",
+    "music-moderators": "MODERATOR",
+    "music-uploaders": "UPLOADER",
+    "music-listeners": "LISTENER",
+    "music-viewers": "LISTENER",
+}
+
+
+def evaluate_oidc_role(
+    groups: tuple[str, ...] | list[str],
+    role_mapping: dict[str, str] | None = None,
+) -> UserRole:
     """Map Authentik OIDC group claims to the highest matching `UserRole` (Specification Section 2.2)."""
+    mapping = role_mapping if role_mapping else DEFAULT_OIDC_ROLE_MAPPING
     group_set = {g.strip() for g in groups if g.strip()}
-    if "music-admins" in group_set:
-        return UserRole.ADMIN
-    if "music-moderators" in group_set:
-        return UserRole.MODERATOR
-    if "music-uploaders" in group_set:
-        return UserRole.UPLOADER
-    if "music-listeners" in group_set or "music-viewers" in group_set:
-        return UserRole.LISTENER
-    return UserRole.GUEST
+
+    lookup: dict[str, UserRole] = {}
+    for grp, role_name in mapping.items():
+        clean_grp = grp.strip().lower()
+        clean_role = role_name.strip().upper()
+        if clean_grp and clean_role in UserRole.__members__:
+            lookup[clean_grp] = UserRole(clean_role)
+
+    highest_role = UserRole.GUEST
+    for g in group_set:
+        mapped = lookup.get(g.lower())
+        if mapped is not None and mapped.rank > highest_role.rank:
+            highest_role = mapped
+
+    return highest_role
 
 
 def next_promotion_role(current: UserRole) -> UserRole | None:
@@ -315,6 +334,7 @@ class GovernanceService:
         target_telegram_id: int,
         new_role: UserRole,
         reason: str = "Admin Dashboard Role Update",
+        override_oidc: bool = True,
     ) -> UserAccount:
         """Promote or demote a user, cancelling queued jobs if demoted to GUEST."""
         require_permission(actor, Permission.MANAGE_USERS)
@@ -331,6 +351,8 @@ class GovernanceService:
 
         previous_role = target_user.role
         target_user.role = new_role
+        if target_user.is_oidc_linked and override_oidc:
+            target_user.oidc_role_override = True
         target_user.updated_at = datetime.now(UTC)
         await self._repo.upsert_user(target_user)
 
@@ -359,6 +381,7 @@ class GovernanceService:
                     "new_role": new_role.value,
                     "reason": reason,
                     "cancelled_jobs": cancelled_count,
+                    "oidc_role_override": target_user.oidc_role_override,
                 },
             )
         )
@@ -370,6 +393,83 @@ class GovernanceService:
                 new_role=new_role,
                 reason=reason,
             )
+        return target_user
+
+    async def set_user_oidc_override(
+        self,
+        actor: UserAccount,
+        target_telegram_id: int,
+        override: bool,
+    ) -> UserAccount:
+        """Toggle local RBAC override over Authentik OIDC group synchronization."""
+        require_permission(actor, Permission.MANAGE_USERS)
+        target_user = await self._repo.get_user(target_telegram_id)
+        if target_user is None:
+            msg = f"User {target_telegram_id} not found"
+            raise KeyError(msg)
+
+        if target_user.role == UserRole.OWNER and actor.role != UserRole.OWNER:
+            raise PermissionDeniedError("Only an OWNER can modify another OWNER account.")
+
+        target_user.oidc_role_override = override
+        target_user.updated_at = datetime.now(UTC)
+        await self._repo.upsert_user(target_user)
+
+        await self._repo.append_audit_log(
+            AuditLogEntry(
+                actor_id=actor.telegram_id,
+                action=AuditAction.OIDC_OVERRIDE_UPDATED,
+                target_entity=f"user:{target_user.telegram_id}",
+                details={
+                    "oidc_role_override": override,
+                    "current_role": target_user.role.value,
+                },
+            )
+        )
+        return target_user
+
+    async def unlink_user_oidc(
+        self,
+        actor: UserAccount,
+        target_telegram_id: int,
+    ) -> UserAccount:
+        """Disconnect/unlink an Authentik OIDC identity for a user.
+
+        Can be executed by the user themselves or by an administrator with MANAGE_USERS permission.
+        """
+        if actor.telegram_id != target_telegram_id:
+            require_permission(actor, Permission.MANAGE_USERS)
+
+        target_user = await self._repo.get_user(target_telegram_id)
+        if target_user is None:
+            msg = f"User {target_telegram_id} not found"
+            raise KeyError(msg)
+
+        old_sub = target_user.authentik_sub
+        old_username = target_user.authentik_username
+        target_user.authentik_sub = None
+        target_user.authentik_username = None
+        target_user.authentik_groups = ()
+        target_user.access_token_encrypted = None
+        target_user.refresh_token_encrypted = None
+        target_user.token_expires_at = None
+        target_user.last_oidc_sync = None
+        target_user.oidc_role_override = False
+        target_user.updated_at = datetime.now(UTC)
+        await self._repo.upsert_user(target_user)
+
+        await self._repo.append_audit_log(
+            AuditLogEntry(
+                actor_id=actor.telegram_id,
+                action=AuditAction.OIDC_UNLINKED,
+                target_entity=f"user:{target_user.telegram_id}",
+                details={
+                    "previous_authentik_sub": old_sub,
+                    "previous_authentik_username": old_username,
+                    "unlinked_by": actor.telegram_id,
+                },
+            )
+        )
         return target_user
 
     async def set_user_blocked(

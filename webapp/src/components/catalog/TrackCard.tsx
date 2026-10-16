@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useRef } from 'react';
 import { Play, Volume2, Sliders } from 'lucide-react';
 import { useAudioPlayer } from '../../context/AudioPlayerContext';
 import { formatTime } from '../../lib/lrc';
@@ -8,14 +8,82 @@ interface TrackCardProps {
   track: TrackItem;
   allTracks: TrackItem[];
   onEdit?: (track: TrackItem) => void;
+  isSelectMode?: boolean;
+  isSelected?: boolean;
+  onToggleSelect?: (trackId: string) => void;
+  onLongPress?: (track: TrackItem) => void;
 }
 
-export const TrackCard: React.FC<TrackCardProps> = ({ track, allTracks, onEdit }) => {
+export const TrackCard: React.FC<TrackCardProps> = ({
+  track,
+  allTracks,
+  onEdit,
+  isSelectMode = false,
+  isSelected = false,
+  onToggleSelect,
+  onLongPress,
+}) => {
   const { currentTrack, isPlaying, playTrack, togglePlay } = useAudioPlayer();
   const isCurrent = currentTrack?.id === track.id;
 
+  const timerRef = useRef<number | null>(null);
+  const startPosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const didLongPressRef = useRef<boolean>(false);
+
+  const clearTimer = () => {
+    if (timerRef.current !== null) {
+      window.clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+  };
+
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    if (isSelectMode || !onLongPress) return;
+
+    didLongPressRef.current = false;
+    startPosRef.current = { x: e.clientX, y: e.clientY };
+    clearTimer();
+
+    timerRef.current = window.setTimeout(() => {
+      didLongPressRef.current = true;
+      timerRef.current = null;
+      try {
+        const tg = (window as unknown as { Telegram?: { WebApp?: { HapticFeedback?: { impactOccurred: (style: string) => void } } } }).Telegram;
+        tg?.WebApp?.HapticFeedback?.impactOccurred('medium');
+      } catch {
+        // ignore
+      }
+      onLongPress(track);
+    }, 450);
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (timerRef.current !== null) {
+      const dx = e.clientX - startPosRef.current.x;
+      const dy = e.clientY - startPosRef.current.y;
+      if (Math.hypot(dx, dy) > 8) {
+        clearTimer();
+      }
+    }
+  };
+
+  const handlePointerUp = () => {
+    clearTimer();
+  };
+
+  const handlePointerCancel = () => {
+    clearTimer();
+  };
+
   const handleClick = () => {
-    if (isCurrent) {
+    if (didLongPressRef.current) {
+      didLongPressRef.current = false;
+      return;
+    }
+    if (isSelectMode) {
+      onToggleSelect?.(track.id);
+    } else if (isCurrent) {
       togglePlay();
     } else {
       playTrack(track, allTracks);
@@ -30,18 +98,61 @@ export const TrackCard: React.FC<TrackCardProps> = ({ track, allTracks, onEdit }
   return (
     <div
       onClick={handleClick}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      onPointerCancel={handlePointerCancel}
+      onContextMenu={(e) => {
+        if (didLongPressRef.current) {
+          e.preventDefault();
+        }
+      }}
       style={{
         display: 'flex',
         alignItems: 'center',
         gap: '12px',
         padding: '10px 14px',
         borderRadius: '12px',
-        backgroundColor: isCurrent ? 'var(--tg-theme-secondary-bg-color, #2c2c2e)' : 'transparent',
-        border: isCurrent ? '1px solid var(--tg-theme-button-color, #0a84ff)' : '1px solid transparent',
+        backgroundColor: isSelected
+          ? 'rgba(10, 132, 255, 0.12)'
+          : isCurrent
+          ? 'var(--tg-theme-secondary-bg-color, #2c2c2e)'
+          : 'transparent',
+        border: isSelected || isCurrent
+          ? '1px solid var(--tg-theme-button-color, #0a84ff)'
+          : '1px solid transparent',
         cursor: 'pointer',
         transition: 'background-color 0.15s ease',
+        userSelect: 'none',
+        WebkitUserSelect: 'none',
+        WebkitTouchCallout: 'none',
       }}
     >
+      {/* Checkbox indicator in Selection Mode */}
+      {isSelectMode && (
+        <div
+          style={{
+            width: '22px',
+            height: '22px',
+            borderRadius: '50%',
+            border: isSelected
+              ? 'none'
+              : '2px solid var(--tg-theme-subtitle-text-color, #8e8e93)',
+            backgroundColor: isSelected
+              ? 'var(--tg-theme-button-color, #0a84ff)'
+              : 'transparent',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            flexShrink: 0,
+            color: '#fff',
+            fontSize: '12px',
+            fontWeight: 700,
+          }}
+        >
+          {isSelected && '✓'}
+        </div>
+      )}
       {/* Cover Image Thumbnail with play overlay */}
       <div
         style={{

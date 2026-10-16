@@ -86,6 +86,11 @@ def test_parse_access_request_and_admin_callback_errors():
 
     assert parse_access_request_callback("access_req:request") == ("request", None, None)
     assert parse_access_request_callback("access_req:oidc_disabled") == ("oidc_disabled", None, None)
+    assert parse_access_request_callback("access_req:oidc_disconnect_self") == (
+        "oidc_disconnect_self",
+        None,
+        None,
+    )
     assert parse_access_request_callback("access_req:deny:42") == ("deny", 42, None)
     assert parse_access_request_callback("access_req:approve:42:UPLOADER") == (
         "approve",
@@ -103,6 +108,8 @@ def test_parse_access_request_and_admin_callback_errors():
     assert parse_admin_callback("admin:resolve_job:job123") == ("resolve_job", None, None)
     assert parse_admin_callback("admin:user:123") == ("user", 123, None)
     assert parse_admin_callback("admin:promote:123:MODERATOR") == ("promote", 123, UserRole.MODERATOR)
+    assert parse_admin_callback("admin:toggle_override:123") == ("toggle_override", 123, None)
+    assert parse_admin_callback("admin:oidc_disconnect:123") == ("oidc_disconnect", 123, None)
 
 
 @pytest.mark.anyio
@@ -280,6 +287,23 @@ async def test_handle_access_request_callback_branches():
     gov_service.deny_access_request.return_value = req_mock
     await handle_access_request_callback(cb, current_user=admin, governance_service=gov_service)
     assert "Denied" in cb.message.edit_text.call_args[0][0]
+
+    # oidc_disconnect_self - not linked
+    cb = _make_callback("access_req:oidc_disconnect_self")
+    unlinked_user = UserAccount(telegram_id=10, display_name="User", role=UserRole.GUEST)
+    await handle_access_request_callback(cb, current_user=unlinked_user, governance_service=gov_service)
+    assert "no linked" in cb.answer.call_args[0][0].lower()
+
+    # oidc_disconnect_self - linked
+    linked_user = UserAccount(
+        telegram_id=10, display_name="User", role=UserRole.UPLOADER, authentik_sub="sub_123"
+    )
+    gov_service.unlink_user_oidc.return_value = unlinked_user
+    await handle_access_request_callback(cb, current_user=linked_user, governance_service=gov_service)
+    gov_service.unlink_user_oidc.assert_awaited_with(
+        actor=linked_user, target_telegram_id=linked_user.telegram_id
+    )
+    assert "disconnected" in cb.answer.call_args[0][0].lower()
 
 
 @pytest.mark.anyio
@@ -467,6 +491,22 @@ async def test_handle_admin_dashboard_callback_actions(tmp_path: Path):
         cb, current_user=admin, governance_repository=gov_repo, oidc_service=oidc_service
     )
     assert "OIDC synchronized" in cb.answer.call_args[0][0]
+
+    cb = _make_callback("admin:toggle_override:10")
+    gov_service.set_user_oidc_override.return_value = outcome.user
+    await handle_admin_dashboard_callback(
+        cb, current_user=admin, governance_service=gov_service, governance_repository=gov_repo
+    )
+    gov_service.set_user_oidc_override.assert_awaited()
+    assert "override" in cb.answer.call_args[0][0].lower()
+
+    cb = _make_callback("admin:oidc_disconnect:10")
+    gov_service.unlink_user_oidc.return_value = outcome.user
+    await handle_admin_dashboard_callback(
+        cb, current_user=admin, governance_service=gov_service, governance_repository=gov_repo
+    )
+    gov_service.unlink_user_oidc.assert_awaited()
+    assert "unlinked" in cb.answer.call_args[0][0].lower()
 
     cb = _make_callback("admin:sync_all")
     oidc_service.sync_all_linked_users.return_value = [outcome]

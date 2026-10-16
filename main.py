@@ -240,6 +240,7 @@ async def run_app(settings: AppSettings | None = None) -> None:
         client_secret=resolved_settings.oidc_client_secret,
         redirect_uri=resolved_settings.oidc_redirect_uri,
         notifier=notifier,
+        role_mapping=resolved_settings.oidc_role_mapping,
     )
     queue_worker = IngestionQueueWorker(
         pipeline=pipeline,

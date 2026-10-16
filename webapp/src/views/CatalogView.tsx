@@ -1,7 +1,8 @@
-import React, { useEffect, useState } from 'react';
-import { Search, SlidersHorizontal, Music2, RefreshCw } from 'lucide-react';
+import React, { useEffect, useState, useCallback } from 'react';
+import { Search, SlidersHorizontal, Music2, RefreshCw, Sparkles } from 'lucide-react';
 import { TrackCard } from '../components/catalog/TrackCard';
 import { SongStudioModal } from '../components/studio/SongStudioModal';
+import { BulkResearchModal } from '../components/bulk/BulkResearchModal';
 import { useAudioPlayer } from '../context/AudioPlayerContext';
 import { apiFetch, UserProfile, canSubmitIngestion } from '../lib/auth';
 import { TrackItem, TracksResponse } from '../types/music';
@@ -21,6 +22,12 @@ export const CatalogView: React.FC<CatalogViewProps> = ({ profile }) => {
   const [sortBy, setSortBy] = useState<string>('recent');
   const [page, setPage] = useState<number>(1);
   const [editingTrack, setEditingTrack] = useState<TrackItem | null>(null);
+
+  // Multi-selection & Bulk check states
+  const [isSelectMode, setIsSelectMode] = useState<boolean>(false);
+  const [selectedTrackIds, setSelectedTrackIds] = useState<Set<string>>(new Set());
+  const [isBulkModalOpen, setIsBulkModalOpen] = useState<boolean>(false);
+
   const perPage = 30;
 
   // Debounce search query by 300ms
@@ -32,8 +39,7 @@ export const CatalogView: React.FC<CatalogViewProps> = ({ profile }) => {
     return () => clearTimeout(handler);
   }, [searchQuery]);
 
-  // Fetch catalog tracks
-  useEffect(() => {
+  const loadTracks = useCallback(() => {
     setLoading(true);
     const params = new URLSearchParams({
       page: page.toString(),
@@ -56,6 +62,10 @@ export const CatalogView: React.FC<CatalogViewProps> = ({ profile }) => {
         setLoading(false);
       });
   }, [debouncedQuery, sortBy, page]);
+
+  useEffect(() => {
+    loadTracks();
+  }, [loadTracks]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
@@ -125,6 +135,87 @@ export const CatalogView: React.FC<CatalogViewProps> = ({ profile }) => {
         </div>
       </div>
 
+      {/* Multi-Selection Control Bar */}
+      {isSelectMode && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            backgroundColor: 'var(--tg-theme-secondary-bg-color, #2c2c2e)',
+            borderRadius: '12px',
+            padding: '10px 14px',
+            border: '1px solid var(--tg-theme-button-color, #0a84ff)',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span style={{ fontSize: '13px', fontWeight: 700, color: 'var(--tg-theme-text-color, #fff)' }}>
+              {selectedTrackIds.size} Selected
+            </span>
+            <button
+              onClick={() => {
+                if (selectedTrackIds.size === tracks.length) {
+                  setSelectedTrackIds(new Set());
+                } else {
+                  setSelectedTrackIds(new Set(tracks.map((t) => t.id)));
+                }
+              }}
+              style={{
+                background: 'transparent',
+                border: 'none',
+                color: 'var(--tg-theme-button-color, #0a84ff)',
+                fontSize: '12px',
+                fontWeight: 600,
+                cursor: 'pointer',
+              }}
+            >
+              {selectedTrackIds.size === tracks.length ? 'Deselect All' : 'Select Page'}
+            </button>
+          </div>
+
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <button
+              disabled={selectedTrackIds.size === 0}
+              onClick={() => setIsBulkModalOpen(true)}
+              style={{
+                padding: '6px 12px',
+                borderRadius: '8px',
+                border: 'none',
+                backgroundColor: selectedTrackIds.size === 0 ? 'rgba(255,255,255,0.1)' : 'var(--tg-theme-button-color, #0a84ff)',
+                color: selectedTrackIds.size === 0 ? '#666' : '#fff',
+                fontSize: '12px',
+                fontWeight: 700,
+                cursor: selectedTrackIds.size === 0 ? 'not-allowed' : 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '4px',
+              }}
+            >
+              <Sparkles size={14} />
+              <span>Bulk Check ({selectedTrackIds.size})</span>
+            </button>
+
+            <button
+              onClick={() => {
+                setIsSelectMode(false);
+                setSelectedTrackIds(new Set());
+              }}
+              style={{
+                padding: '6px 10px',
+                borderRadius: '8px',
+                border: '1px solid rgba(255, 255, 255, 0.1)',
+                backgroundColor: 'transparent',
+                color: 'var(--tg-theme-subtitle-text-color, #8e8e93)',
+                fontSize: '12px',
+                cursor: 'pointer',
+              }}
+            >
+              Exit
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Track count indicator */}
       <div
         style={{
@@ -179,6 +270,23 @@ export const CatalogView: React.FC<CatalogViewProps> = ({ profile }) => {
               track={track}
               allTracks={tracks}
               onEdit={canEdit ? (t) => setEditingTrack(t) : undefined}
+              isSelectMode={isSelectMode}
+              isSelected={selectedTrackIds.has(track.id)}
+              onToggleSelect={(trackId) => {
+                setSelectedTrackIds((prev) => {
+                  const next = new Set(prev);
+                  if (next.has(trackId)) {
+                    next.delete(trackId);
+                  } else {
+                    next.add(trackId);
+                  }
+                  return next;
+                });
+              }}
+              onLongPress={canEdit ? (t) => {
+                setIsSelectMode(true);
+                setSelectedTrackIds(new Set([t.id]));
+              } : undefined}
             />
           ))}
         </div>
@@ -239,6 +347,20 @@ export const CatalogView: React.FC<CatalogViewProps> = ({ profile }) => {
             prev.map((t) => (t.id === updatedTrack.id ? updatedTrack : t))
           );
           updateTrackData(updatedTrack);
+        }}
+      />
+
+      {/* Bulk Operations Modal */}
+      <BulkResearchModal
+        isOpen={isBulkModalOpen}
+        onClose={() => setIsBulkModalOpen(false)}
+        selectedTrackIds={Array.from(selectedTrackIds)}
+        searchQuery={debouncedQuery}
+        totalCatalogTracks={total}
+        onBulkCompleted={() => {
+          setSelectedTrackIds(new Set());
+          setIsSelectMode(false);
+          loadTracks();
         }}
       />
     </div>

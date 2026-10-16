@@ -325,14 +325,18 @@ def format_user_detail_card(
         else "Not Linked"
     )
     blocked_badge = " (🚫 BLOCKED)" if user.is_blocked else ""
+    override_badge = " [🔒 Overridden]" if user.oidc_role_override else ""
     changes_line = (
         f"\n• Recorded Actions / Edits: <code>{changes_count}</code>" if changes_count is not None else ""
     )
+    override_status = "🔒 Active (Local Lock)" if user.oidc_role_override else "🔓 Inactive (IDP Synced)"
+    override_line = f"\n• OIDC Role Override: <code>{override_status}</code>" if user.is_oidc_linked else ""
     return (
         f"<b>👤 Managing User: {html.escape(user.mention_handle)}</b>\n"
         "<blockquote>"
-        f"• Current Role: <code>{user.role.value}</code>{blocked_badge}\n"
-        f"• Authentik Status: {oidc_status}\n"
+        f"• Current Role: <code>{user.role.value}</code>{blocked_badge}{override_badge}\n"
+        f"• Authentik Status: {oidc_status}"
+        f"{override_line}\n"
         f"• Total Uploads: {albums_count} albums ({tracks_count} tracks)"
         f"{changes_line}"
         "</blockquote>\n"

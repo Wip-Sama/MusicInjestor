@@ -51,6 +51,44 @@ class BulkResearchReport:
         return self.applied_count > 0 or self.needs_review_count > 0
 
 
+@dataclass
+class BulkResearchProgress:
+    """Live snapshot of an actively running bulk re-search job."""
+
+    total_tracks: int
+    current_index: int = 0
+    current_track: str = ""
+    status: str = "running"
+    actor_id: int = 0
+    actor_name: str = "System"
+    started_at: float = field(default_factory=time.time)
+    applied_count: int = 0
+    needs_review_count: int = 0
+    skipped_count: int = 0
+    failed_count: int = 0
+
+    @property
+    def percent(self) -> int:
+        """Percentage of tracks processed so far (0..100)."""
+        if self.total_tracks <= 0:
+            return 0
+        return min(100, int((self.current_index / self.total_tracks) * 100))
+
+
+_active_bulk_research: BulkResearchProgress | None = None
+
+
+def get_active_bulk_research() -> BulkResearchProgress | None:
+    """Return the currently executing bulk research job progress, or None if idle."""
+    return _active_bulk_research
+
+
+def set_active_bulk_research(progress: BulkResearchProgress | None) -> None:
+    """Set or clear the active bulk research job progress."""
+    global _active_bulk_research
+    _active_bulk_research = progress
+
+
 class BulkResearchService:
     """Orchestrates planned bulk metadata and lyrics re-search with polite API throttling."""
 
@@ -138,167 +176,220 @@ class BulkResearchService:
         start_time = time.monotonic()
         report = BulkResearchReport(total_tracks=len(plan.track_ids))
 
-        for idx, track_id in enumerate(plan.track_ids, start=1):
-            if self._cancel_requested:
-                logger.info("Bulk research cancelled cooperatively at track %d/%d", idx, len(plan.track_ids))
-                break
+        active_progress = BulkResearchProgress(
+            total_tracks=len(plan.track_ids),
+            current_index=0,
+            current_track="Initializing...",
+            status="running",
+            actor_id=actor_id or 0,
+            actor_name=actor_name,
+            started_at=time.time(),
+        )
+        set_active_bulk_research(active_progress)
 
-            record = await self._repo.get_library_track(track_id)
-            if record is None or not record.storage_path.is_file():
-                report.skipped_count += 1
-                continue
+        try:
+            for idx, track_id in enumerate(plan.track_ids, start=1):
+                if self._cancel_requested:
+                    logger.info(
+                        "Bulk research cancelled cooperatively at track %d/%d",
+                        idx,
+                        len(plan.track_ids),
+                    )
+                    active_progress.status = "cancelled"
+                    break
 
-            track_label = f"{record.artist} - {record.title}"
-            if progress_callback:
-                try:
-                    res = progress_callback(idx, len(plan.track_ids), track_label, "searching")
-                    if asyncio.iscoroutine(res):
-                        await res
-                except Exception as exc:
-                    logger.debug("Progress callback error: %s", exc)
-
-            try:
-                base_meta = TrackMetadata(
-                    title=record.title,
-                    artist=record.artist,
-                    album=record.album,
-                    year=record.year,
-                    track_number=record.track_number or 1,
-                    duration_seconds=int(round(record.duration_seconds)),
-                )
-
-                best_meta = base_meta
-                if plan.search_metadata:
-                    seed_meta = await self._metadata.read_local_metadata(record.storage_path)
-                    candidates = await self._metadata.find_candidates(seed_meta)
-                    if candidates:
-                        best_meta = candidates[0].metadata
-
-                fetched_lyrics_text: str | None = None
-                if plan.search_lyrics:
-                    fetched_lrc = await self._lyrics.fetch_lyrics(best_meta)
-                    if fetched_lrc is not None:
-                        fetched_lyrics_text = fetched_lrc.synced_lyrics or fetched_lrc.plain_lyrics
-
-                has_meta_change = (
-                    best_meta.title != record.title
-                    or best_meta.artist != record.artist
-                    or best_meta.album != record.album
-                    or best_meta.year != record.year
-                )
-                has_lyrics_change = fetched_lyrics_text is not None and not record.has_synced_lyrics
-
-                if not has_meta_change and not has_lyrics_change:
+                record = await self._repo.get_library_track(track_id)
+                if record is None or not record.storage_path.is_file():
                     report.skipped_count += 1
+                    continue
+
+                track_label = f"{record.artist} - {record.title}"
+                active_progress.current_index = idx
+                active_progress.current_track = track_label
+                active_progress.applied_count = report.applied_count
+                active_progress.needs_review_count = report.needs_review_count
+                active_progress.skipped_count = report.skipped_count
+                active_progress.failed_count = report.failed_count
+
+                if progress_callback:
+                    try:
+                        res = progress_callback(idx, len(plan.track_ids), track_label, "searching")
+                        if asyncio.iscoroutine(res):
+                            await res
+                    except Exception as exc:
+                        logger.debug("Progress callback error: %s", exc)
+
+                try:
+                    base_meta = TrackMetadata(
+                        title=record.title,
+                        artist=record.artist,
+                        album=record.album,
+                        year=record.year,
+                        track_number=record.track_number or 1,
+                        duration_seconds=int(round(record.duration_seconds)),
+                    )
+
+                    best_meta = base_meta
+                    if plan.search_metadata:
+                        seed_meta = await self._metadata.read_local_metadata(record.storage_path)
+                        candidates = await self._metadata.find_candidates(seed_meta)
+                        if candidates:
+                            best_meta = candidates[0].metadata
+
+                    fetched_lyrics_text: str | None = None
+                    if plan.search_lyrics:
+                        fetched_lrc = await self._lyrics.fetch_lyrics(best_meta)
+                        if fetched_lrc is not None:
+                            fetched_lyrics_text = fetched_lrc.synced_lyrics or fetched_lrc.plain_lyrics
+
+                    effective_year = best_meta.year or record.year
+                    effective_meta = (
+                        TrackMetadata(
+                            title=best_meta.title,
+                            artist=best_meta.artist,
+                            album=best_meta.album,
+                            album_artist=best_meta.album_artist,
+                            year=effective_year,
+                            track_number=best_meta.track_number,
+                            disc_number=best_meta.disc_number,
+                            genre=best_meta.genre,
+                            duration_seconds=best_meta.duration_seconds,
+                            recording_mbid=best_meta.recording_mbid,
+                            release_mbid=best_meta.release_mbid,
+                            isrc=best_meta.isrc,
+                        )
+                        if best_meta.year is None
+                        else best_meta
+                    )
+                    has_meta_change = (
+                        effective_meta.title != record.title
+                        or effective_meta.artist != record.artist
+                        or effective_meta.album != record.album
+                        or (effective_meta.year is not None and effective_meta.year != record.year)
+                    )
+                    has_lyrics_change = fetched_lyrics_text is not None and not record.has_synced_lyrics
+
+                    if not has_meta_change and not has_lyrics_change:
+                        report.skipped_count += 1
+                        report.details.append(
+                            {
+                                "track_id": record.id,
+                                "title": record.title,
+                                "status": "unchanged",
+                            }
+                        )
+                        continue
+
+                    if plan.auto_apply:
+                        # Apply changes to audio file and sidecars
+                        new_path = record.storage_path
+                        if has_meta_change:
+                            new_path = await self._organizer.relocate_and_retag_track(
+                                current_path=record.storage_path,
+                                metadata=effective_meta,
+                            )
+
+                        if fetched_lyrics_text:
+                            await self._organizer.update_track_lyrics(new_path, fetched_lyrics_text)
+
+                        # Update SQLite catalog
+                        updated_record = LibraryTrackRecord(
+                            id=record.id,
+                            job_id=record.job_id,
+                            uploaded_by=record.uploaded_by,
+                            storage_path=new_path,
+                            fingerprint=record.fingerprint,
+                            duration_seconds=record.duration_seconds,
+                            artist=effective_meta.artist,
+                            album=effective_meta.album,
+                            title=effective_meta.title,
+                            year=effective_meta.year,
+                            track_number=effective_meta.track_number or record.track_number,
+                            has_synced_lyrics=bool(fetched_lyrics_text or record.has_synced_lyrics),
+                            ingested_at=record.ingested_at,
+                            updated_at=record.updated_at,
+                            modified_by=actor_id,
+                            modification_count=record.modification_count + 1,
+                        )
+                        await self._repo.upsert_scanned_library_track(updated_record)
+
+                        # Record audit entry
+                        await self._repo.append_audit_log(
+                            AuditLogEntry(
+                                actor_id=actor_id or 0,
+                                action=AuditAction.BULK_METADATA_ENRICHED,
+                                target_entity=record.id,
+                                details={
+                                    "actor_name": actor_name,
+                                    "old_title": record.title,
+                                    "new_title": best_meta.title,
+                                    "old_artist": record.artist,
+                                    "new_artist": best_meta.artist,
+                                    "lyrics_added": bool(fetched_lyrics_text),
+                                },
+                            )
+                        )
+                        report.applied_count += 1
+                        report.details.append(
+                            {
+                                "track_id": record.id,
+                                "title": best_meta.title,
+                                "status": "applied",
+                            }
+                        )
+                    else:
+                        report.needs_review_count += 1
+                        report.details.append(
+                            {
+                                "track_id": record.id,
+                                "title": effective_meta.title,
+                                "status": "needs_review",
+                                "proposed_meta": {
+                                    "title": effective_meta.title,
+                                    "artist": effective_meta.artist,
+                                    "album": effective_meta.album,
+                                    "year": effective_meta.year,
+                                    "track_number": effective_meta.track_number or record.track_number or 1,
+                                    "recording_mbid": effective_meta.recording_mbid,
+                                    "release_mbid": effective_meta.release_mbid,
+                                },
+                                "proposed_lyrics": fetched_lyrics_text,
+                            }
+                        )
+                except Exception as exc:
+                    logger.warning("Bulk research failed for %s: %s", record.id, exc)
+                    report.failed_count += 1
                     report.details.append(
                         {
                             "track_id": record.id,
                             "title": record.title,
-                            "status": "unchanged",
+                            "status": "error",
+                            "error": str(exc),
                         }
                     )
-                    continue
 
-                if plan.auto_apply:
-                    # Apply changes to audio file and sidecars
-                    new_path = record.storage_path
-                    if has_meta_change:
-                        new_path = await self._organizer.relocate_and_retag_track(
-                            current_path=record.storage_path,
-                            metadata=best_meta,
-                        )
-
-                    if fetched_lyrics_text:
-                        await self._organizer.update_track_lyrics(new_path, fetched_lyrics_text)
-
-                    # Update SQLite catalog
-                    updated_record = LibraryTrackRecord(
-                        id=record.id,
-                        job_id=record.job_id,
-                        uploaded_by=record.uploaded_by,
-                        storage_path=new_path,
-                        fingerprint=record.fingerprint,
-                        duration_seconds=record.duration_seconds,
-                        artist=best_meta.artist,
-                        album=best_meta.album,
-                        title=best_meta.title,
-                        year=best_meta.year,
-                        track_number=best_meta.track_number or record.track_number,
-                        has_synced_lyrics=bool(fetched_lyrics_text or record.has_synced_lyrics),
-                        ingested_at=record.ingested_at,
-                        updated_at=record.updated_at,
-                        modified_by=actor_id,
-                        modification_count=record.modification_count + 1,
+            report.elapsed_seconds = round(time.monotonic() - start_time, 2)
+            if progress_callback:
+                try:
+                    res = progress_callback(
+                        len(plan.track_ids),
+                        len(plan.track_ids),
+                        "All done",
+                        "completed",
                     )
-                    await self._repo.upsert_scanned_library_track(updated_record)
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception:
+                    pass
 
-                    # Record audit entry
-                    await self._repo.append_audit_log(
-                        AuditLogEntry(
-                            actor_id=actor_id or 0,
-                            action=AuditAction.BULK_METADATA_ENRICHED,
-                            target_entity=record.id,
-                            details={
-                                "actor_name": actor_name,
-                                "old_title": record.title,
-                                "new_title": best_meta.title,
-                                "old_artist": record.artist,
-                                "new_artist": best_meta.artist,
-                                "lyrics_added": bool(fetched_lyrics_text),
-                            },
-                        )
-                    )
-                    report.applied_count += 1
-                    report.details.append(
-                        {
-                            "track_id": record.id,
-                            "title": best_meta.title,
-                            "status": "applied",
-                        }
-                    )
-                else:
-                    report.needs_review_count += 1
-                    report.details.append(
-                        {
-                            "track_id": record.id,
-                            "title": best_meta.title,
-                            "status": "needs_review",
-                            "proposed_meta": best_meta,
-                            "proposed_lyrics": fetched_lyrics_text,
-                        }
-                    )
-            except Exception as exc:
-                logger.warning("Bulk research failed for %s: %s", record.id, exc)
-                report.failed_count += 1
-                report.details.append(
-                    {
-                        "track_id": record.id,
-                        "title": record.title,
-                        "status": "error",
-                        "error": str(exc),
-                    }
-                )
-
-        report.elapsed_seconds = round(time.monotonic() - start_time, 2)
-        if progress_callback:
-            try:
-                res = progress_callback(
-                    len(plan.track_ids),
-                    len(plan.track_ids),
-                    "All done",
-                    "completed",
-                )
-                if asyncio.iscoroutine(res):
-                    await res
-            except Exception:
-                pass
-
-        logger.info(
-            "Bulk research finished: %d applied, %d needs review, %d skipped, %d failed in %.2fs",
-            report.applied_count,
-            report.needs_review_count,
-            report.skipped_count,
-            report.failed_count,
-            report.elapsed_seconds,
-        )
-        return report
+            logger.info(
+                "Bulk research finished: %d applied, %d needs review, %d skipped, %d failed in %.2fs",
+                report.applied_count,
+                report.needs_review_count,
+                report.skipped_count,
+                report.failed_count,
+                report.elapsed_seconds,
+            )
+            return report
+        finally:
+            set_active_bulk_research(None)
