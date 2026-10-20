@@ -1,5 +1,5 @@
 import React, { useRef } from 'react';
-import { Play, Volume2, Sliders } from 'lucide-react';
+import { Play, Volume2, Sliders, Bell } from 'lucide-react';
 import { useAudioPlayer } from '../../context/AudioPlayerContext';
 import { formatTime } from '../../lib/lrc';
 import { TrackItem } from '../../types/music';
@@ -23,7 +23,8 @@ export const TrackCard: React.FC<TrackCardProps> = ({
   onToggleSelect,
   onLongPress,
 }) => {
-  const { currentTrack, isPlaying, playTrack, togglePlay } = useAudioPlayer();
+  const { currentTrack, isPlaying, playTrack, togglePlay, isArtistFollowed, toggleFollowArtist } =
+    useAudioPlayer();
   const isCurrent = currentTrack?.id === track.id;
 
   const timerRef = useRef<number | null>(null);
@@ -282,6 +283,36 @@ export const TrackCard: React.FC<TrackCardProps> = ({
             </span>
           </div>
         </div>
+
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            toggleFollowArtist(track.artist);
+          }}
+          title={
+            isArtistFollowed(track.artist)
+              ? `Unfollow ${track.artist}`
+              : `Follow ${track.artist} on Release Radar`
+          }
+          style={{
+            background: isArtistFollowed(track.artist)
+              ? 'rgba(48, 209, 88, 0.15)'
+              : 'rgba(255, 255, 255, 0.06)',
+            border: 'none',
+            borderRadius: '8px',
+            padding: '6px',
+            color: isArtistFollowed(track.artist)
+              ? '#30d158'
+              : 'var(--tg-theme-subtitle-text-color, #8e8e93)',
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            transition: 'all 0.15s ease',
+          }}
+        >
+          <Bell size={15} fill={isArtistFollowed(track.artist) ? 'currentColor' : 'none'} />
+        </button>
 
         {onEdit && (
           <button

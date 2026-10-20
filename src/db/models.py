@@ -141,6 +141,46 @@ CREATE TABLE IF NOT EXISTS user_settings (
 );
 """
 
+CREATE_ARTIST_FOLLOWS_TABLE = """
+CREATE TABLE IF NOT EXISTS artist_follows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_id INTEGER NOT NULL REFERENCES users(telegram_id),
+    artist_name TEXT NOT NULL,
+    provider_artist_id TEXT,
+    notify_telegram INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+CREATE_DISCOVERED_RELEASES_TABLE = """
+CREATE TABLE IF NOT EXISTS discovered_releases (
+    id TEXT PRIMARY KEY,
+    artist_name TEXT NOT NULL,
+    title TEXT NOT NULL,
+    release_type TEXT NOT NULL DEFAULT 'album',
+    release_date TEXT NOT NULL DEFAULT '',
+    cover_url TEXT,
+    preview_url TEXT,
+    external_url TEXT,
+    provider TEXT NOT NULL DEFAULT 'deezer',
+    provider_release_id TEXT NOT NULL DEFAULT '',
+    track_count INTEGER NOT NULL DEFAULT 1,
+    in_library INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+CREATE_RELEASE_NOTIFICATIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS release_notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_id INTEGER NOT NULL REFERENCES users(telegram_id),
+    release_id TEXT NOT NULL REFERENCES discovered_releases(id),
+    is_read INTEGER NOT NULL DEFAULT 0,
+    delivered_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
 CREATE_USERS_ROLE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
 """
@@ -163,6 +203,26 @@ ON catalog_tracks (recording_mbid)
 WHERE recording_mbid IS NOT NULL;
 """
 
+CREATE_ARTIST_FOLLOWS_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_artist_follows_user_artist
+ON artist_follows(telegram_id, LOWER(artist_name));
+"""
+
+CREATE_DISCOVERED_RELEASES_ARTIST_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_discovered_releases_artist
+ON discovered_releases(artist_name);
+"""
+
+CREATE_DISCOVERED_RELEASES_DATE_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_discovered_releases_date
+ON discovered_releases(release_date DESC);
+"""
+
+CREATE_RELEASE_NOTIFICATIONS_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_release_notifications_user_release
+ON release_notifications(telegram_id, release_id);
+"""
+
 TABLE_DDL_STATEMENTS: tuple[str, ...] = (
     CREATE_USERS_TABLE,
     CREATE_ACCESS_REQUESTS_TABLE,
@@ -172,6 +232,9 @@ TABLE_DDL_STATEMENTS: tuple[str, ...] = (
     CREATE_AUDIT_LOGS_TABLE,
     CREATE_TAG_CORRECTION_REQUESTS_TABLE,
     CREATE_USER_SETTINGS_TABLE,
+    CREATE_ARTIST_FOLLOWS_TABLE,
+    CREATE_DISCOVERED_RELEASES_TABLE,
+    CREATE_RELEASE_NOTIFICATIONS_TABLE,
 )
 
 INDEX_DDL_STATEMENTS: tuple[str, ...] = (
@@ -180,6 +243,10 @@ INDEX_DDL_STATEMENTS: tuple[str, ...] = (
     CREATE_LIBRARY_TRACKS_FP_INDEX,
     CREATE_AUDIT_CREATED_INDEX,
     CREATE_TRACKS_MBID_INDEX,
+    CREATE_ARTIST_FOLLOWS_INDEX,
+    CREATE_DISCOVERED_RELEASES_ARTIST_INDEX,
+    CREATE_DISCOVERED_RELEASES_DATE_INDEX,
+    CREATE_RELEASE_NOTIFICATIONS_INDEX,
 )
 
 ALL_SCHEMA_STATEMENTS: tuple[str, ...] = (

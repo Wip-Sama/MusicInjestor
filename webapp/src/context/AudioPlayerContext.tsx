@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { hapticFeedback } from '@telegram-apps/sdk-react';
 import { getRawInitData, apiFetch } from '../lib/auth';
 import { TrackItem } from '../types/music';
@@ -21,6 +21,10 @@ interface AudioPlayerContextType {
   streamFormat: string;
   streamBitrate: number;
   autoLyricsSearch: boolean;
+  followedArtists: Set<string>;
+  isArtistFollowed: (artistName: string) => boolean;
+  toggleFollowArtist: (artistName: string) => Promise<boolean>;
+  refreshFollows: () => Promise<void>;
   playTrack: (track: TrackItem, queueContext?: TrackItem[]) => void;
   togglePlay: () => void;
   seekTo: (seconds: number) => void;
@@ -62,6 +66,92 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
   const [streamFormat, setStreamFormat] = useState<string>('auto');
   const [streamBitrate, setStreamBitrate] = useState<number>(192);
   const [autoLyricsSearch, setAutoLyricsSearch] = useState<boolean>(true);
+
+  const [followedArtists, setFollowedArtists] = useState<Set<string>>(new Set());
+
+  // Fetch followed artists on mount for instant synchronous follow status checks
+  const refreshFollows = useCallback(async () => {
+    try {
+      const res = await apiFetch('/api/v1/app/radar/follows');
+      if (res.ok) {
+        const data = await res.json();
+        const names = new Set<string>(
+          (data.items || []).map((item: { artist_name: string }) => item.artist_name.trim().toLowerCase())
+        );
+        setFollowedArtists(names);
+      }
+    } catch {
+      // ignore guest / network errors
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshFollows();
+  }, [refreshFollows]);
+
+  const isArtistFollowed = useCallback(
+    (artistName: string): boolean => {
+      if (!artistName) return false;
+      return followedArtists.has(artistName.trim().toLowerCase());
+    },
+    [followedArtists]
+  );
+
+  const toggleFollowArtist = useCallback(
+    async (artistName: string): Promise<boolean> => {
+      const trimmed = artistName.trim();
+      if (!trimmed) return false;
+      const key = trimmed.toLowerCase();
+      const current = followedArtists.has(key);
+      const nextFollow = !current;
+
+      // Haptic feedback
+      try {
+        if (hapticFeedback.impactOccurred.isAvailable()) {
+          hapticFeedback.impactOccurred('medium');
+        }
+      } catch {
+        // ignore outside Telegram
+      }
+
+      // Optimistic update
+      setFollowedArtists((prev) => {
+        const next = new Set(prev);
+        if (nextFollow) {
+          next.add(key);
+        } else {
+          next.delete(key);
+        }
+        return next;
+      });
+
+      try {
+        const res = await apiFetch('/api/v1/app/radar/follow', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ artist_name: trimmed, follow: nextFollow }),
+        });
+        if (!res.ok) {
+          throw new Error('Follow toggle failed');
+        }
+        return nextFollow;
+      } catch (err) {
+        console.warn('Failed to update artist follow:', err);
+        // Rollback
+        setFollowedArtists((prev) => {
+          const next = new Set(prev);
+          if (current) {
+            next.add(key);
+          } else {
+            next.delete(key);
+          }
+          return next;
+        });
+        return current;
+      }
+    },
+    [followedArtists]
+  );
 
   // Fetch persisted user streaming & audio preferences on mount
   useEffect(() => {
@@ -410,6 +500,10 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
         streamFormat,
         streamBitrate,
         autoLyricsSearch,
+        followedArtists,
+        isArtistFollowed,
+        toggleFollowArtist,
+        refreshFollows,
         playTrack,
         togglePlay,
         seekTo,

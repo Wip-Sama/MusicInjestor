@@ -9,11 +9,14 @@ from src.core.models import (
     AccessRequestStatus,
     AudioFingerprint,
     AuditLogEntry,
+    DiscoveredRelease,
     DuplicateCheckResult,
+    FollowedArtist,
     IngestionJob,
     LibraryTrackRecord,
     LyricsData,
     MetadataCandidate,
+    ReleaseNotification,
     TagCorrectionRequest,
     TagCorrectionStatus,
     TrackMetadata,
@@ -292,6 +295,71 @@ class GovernanceRepositoryPort(Protocol):
         """Delete all library track records and return the number of deleted tracks."""
         ...
 
+    async def follow_artist(
+        self,
+        telegram_id: int,
+        artist_name: str,
+        provider_artist_id: str | None = None,
+    ) -> FollowedArtist:
+        """Follow an artist for a user to receive release notifications."""
+        ...
+
+    async def unfollow_artist(self, telegram_id: int, artist_name: str) -> bool:
+        """Unfollow an artist for a user."""
+        ...
+
+    async def list_user_followed_artists(self, telegram_id: int) -> list[FollowedArtist]:
+        """List all artists followed by a specific user."""
+        ...
+
+    async def is_artist_followed(self, telegram_id: int, artist_name: str) -> bool:
+        """Check whether a user follows an artist."""
+        ...
+
+    async def list_all_monitored_artists(self) -> list[str]:
+        """Return the union of distinct artists in library_tracks and followed artists."""
+        ...
+
+    async def upsert_discovered_releases(
+        self,
+        releases: Sequence[DiscoveredRelease],
+    ) -> list[DiscoveredRelease]:
+        """Persist newly discovered artist releases into the database."""
+        ...
+
+    async def list_discovered_releases(
+        self,
+        artist_name: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[DiscoveredRelease]:
+        """List discovered releases ordered by release_date descending."""
+        ...
+
+    async def get_discovered_release(self, release_id: str) -> DiscoveredRelease | None:
+        """Retrieve a discovered release by its ID."""
+        ...
+
+    async def create_release_notifications(
+        self,
+        notifications: Sequence[ReleaseNotification],
+    ) -> None:
+        """Persist release notifications for followers."""
+        ...
+
+    async def list_user_release_notifications(
+        self,
+        telegram_id: int,
+        unread_only: bool = False,
+        limit: int = 50,
+    ) -> list[tuple[ReleaseNotification, DiscoveredRelease]]:
+        """List release notifications for a user joined with the discovered release."""
+        ...
+
+    async def mark_notification_read(self, telegram_id: int, notification_id: int) -> bool:
+        """Mark a release notification as read."""
+        ...
+
 
 @runtime_checkable
 class AdminLogNotifierPort(Protocol):
@@ -414,4 +482,29 @@ class StorageOrganizerPort(Protocol):
         lyrics: LyricsData | None = None,
     ) -> Path:
         """Write metadata tags, optionally write `.lrc` sidecar, and move track to target storage."""
+        ...
+
+
+@runtime_checkable
+class ReleaseRadarProviderPort(Protocol):
+    """External music provider port for discography lookup, release detection, and audio preview URLs."""
+
+    async def search_artist(self, artist_name: str) -> str | None:
+        """Look up the provider's canonical artist identifier by name."""
+        ...
+
+    async def get_artist_recent_releases(
+        self,
+        provider_artist_id: str,
+        artist_name: str,
+        limit: int = 25,
+    ) -> list[DiscoveredRelease]:
+        """Fetch recent releases (albums/singles/EPs) ordered by release date descending."""
+        ...
+
+    async def get_release_preview_track(
+        self,
+        provider_release_id: str,
+    ) -> tuple[str, str] | None:
+        """Fetch `(track_title, preview_mp3_url)` for a release."""
         ...

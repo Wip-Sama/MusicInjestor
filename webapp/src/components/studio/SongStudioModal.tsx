@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
-import { X, Music2, Image, Mic2, Sliders } from 'lucide-react';
+import { X, Music2, Image, Mic2, Sliders, Bell, Check } from 'lucide-react';
 import { hapticFeedback } from '@telegram-apps/sdk-react';
+import { useAudioPlayer } from '../../context/AudioPlayerContext';
 import { apiFetch } from '../../lib/auth';
 import { TrackItem } from '../../types/music';
 import { ProposalResponse } from '../../types/studio';
@@ -28,6 +29,7 @@ export const SongStudioModal: React.FC<SongStudioModalProps> = ({
   const [pendingProposal, setPendingProposal] = useState<ProposalResponse | null>(null);
   const [isApplying, setIsApplying] = useState<boolean>(false);
   const [applyError, setApplyError] = useState<string | null>(null);
+  const { isArtistFollowed, toggleFollowArtist } = useAudioPlayer();
 
   if (!isOpen || !track) return null;
 
@@ -129,6 +131,9 @@ export const SongStudioModal: React.FC<SongStudioModalProps> = ({
                 </div>
                 <div
                   style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '6px',
                     fontSize: '12px',
                     color: 'var(--tg-theme-subtitle-text-color, #8e8e93)',
                     maxWidth: '300px',
@@ -137,7 +142,32 @@ export const SongStudioModal: React.FC<SongStudioModalProps> = ({
                     textOverflow: 'ellipsis',
                   }}
                 >
-                  {track.title} • {track.artist}
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {track.title} • {track.artist}
+                  </span>
+                  <button
+                    onClick={() => toggleFollowArtist(track.artist)}
+                    title={isArtistFollowed(track.artist) ? `Unfollow ${track.artist}` : `Follow ${track.artist}`}
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '3px',
+                      padding: '1px 6px',
+                      borderRadius: '10px',
+                      border: 'none',
+                      fontSize: '10px',
+                      fontWeight: 600,
+                      backgroundColor: isArtistFollowed(track.artist)
+                        ? 'rgba(48, 209, 88, 0.15)'
+                        : 'rgba(255, 255, 255, 0.1)',
+                      color: isArtistFollowed(track.artist) ? '#30d158' : 'var(--tg-theme-button-color, #0a84ff)',
+                      cursor: 'pointer',
+                      flexShrink: 0,
+                    }}
+                  >
+                    {isArtistFollowed(track.artist) ? <Check size={10} strokeWidth={2.5} /> : <Bell size={10} />}
+                    <span>{isArtistFollowed(track.artist) ? 'Following' : 'Follow'}</span>
+                  </button>
                 </div>
               </div>
             </div>

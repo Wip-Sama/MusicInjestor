@@ -1,5 +1,6 @@
 """Comprehensive unit tests covering songs router handlers, callbacks, FSM flows, and dry-run editing."""
 
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -9,7 +10,7 @@ from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, Chat, Document, Message, PhotoSize, User
 
-from src.bot.keyboards.songs import SongsToggleFieldCallback
+from src.bot.keyboards.songs import SongsToggleFieldCallback, SongsTrackCallback
 from src.bot.routers.songs import (
     _can_access_songs,
     _can_edit_songs,
@@ -27,6 +28,7 @@ from src.bot.routers.songs import (
 )
 from src.bot.states import SongManagementStates
 from src.core.models import (
+    DiscoveredRelease,
     IngestionJob,
     LibraryRescanReport,
     LibraryTrackRecord,
@@ -638,3 +640,46 @@ async def test_handle_custom_research_input(tmp_path: Path):
     await handle_custom_research_input(msg, state, governance_repository=gov_repo, pipeline=pipeline)
     msg.answer.assert_awaited()
     assert "Dry-Run Preview" in msg.answer.call_args[0][0]
+
+
+@pytest.mark.anyio
+async def test_handle_song_action_radar_artist(tmp_path: Path):
+    gov_repo = AsyncMock()
+    track = replace(_make_track("trk_radar", tmp_path), artist="Saori Hayami")
+    gov_repo.get_library_track.return_value = track
+    gov_repo.is_artist_followed.return_value = False
+
+    cb = _make_callback("songs:radar_artist:trk_radar")
+    cb.data = SongsTrackCallback(action="radar_artist", track_id="trk_radar").pack()
+    cb.message.edit_text = AsyncMock()
+    state = _make_context(cb.bot)
+    user = UserAccount(telegram_id=12345, display_name="Test", role=UserRole.LISTENER)
+
+    # 1. When no releases exist on radar yet -> displays artist follow screen with Follow button
+    gov_repo.list_discovered_releases.return_value = []
+    await handle_songs_callback(
+        cb,
+        state,
+        current_user=user,
+        governance_repository=gov_repo,
+    )
+    cb.message.edit_text.assert_awaited()
+    assert "Saori Hayami" in cb.message.edit_text.call_args[0][0]
+    assert "Not Following" in cb.message.edit_text.call_args[0][0]
+
+    # 2. When releases exist on radar -> displays release detail card
+    release = DiscoveredRelease(
+        id="deezer_99",
+        artist_name="Saori Hayami",
+        title="Orange Mint",
+        release_type="single",
+        release_date="2024-01-01",
+    )
+    gov_repo.list_discovered_releases.return_value = [release]
+    await handle_songs_callback(
+        cb,
+        state,
+        current_user=user,
+        governance_repository=gov_repo,
+    )
+    assert "Orange Mint" in cb.message.edit_text.call_args[0][0]

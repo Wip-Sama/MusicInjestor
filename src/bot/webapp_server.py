@@ -46,6 +46,7 @@ from src.core.organizer import LibraryOrganizer
 from src.core.pipeline import IngestionPipeline
 from src.core.ports import GovernanceRepositoryPort
 from src.core.queue import IngestionQueueWorker
+from src.core.radar import ReleaseRadarService
 from src.core.rbac import (
     ROLE_PERMISSIONS,
     GovernanceService,
@@ -348,6 +349,7 @@ def build_webapp_api(
     pipeline: IngestionPipeline | None = None,
     scratch_dir: Path | None = None,
     event_bus: QueueEventBus | None = None,
+    radar_service: ReleaseRadarService | None = None,
 ) -> web.Application:
     """Construct an `aiohttp.web.Application` exposing TMA API, OIDC callbacks, and static assets."""
     app = web.Application()
@@ -2853,6 +2855,143 @@ def build_webapp_api(
         app.router.add_get("/api/v1/auth/callback", oauth_callback_handler)
         app.router.add_post("/api/v1/webhooks/authentik", authentik_webhook_handler)
 
+    # 3.1 Release Radar & Artist Monitoring Endpoints
+    async def handle_get_radar_releases(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        if catalog_repository is None:
+            return web.json_response({"error": "Repository unavailable"}, status=503)
+
+        artist_filter = request.query.get("artist", "").strip() or None
+        followed_only = request.query.get("followed_only", "").lower() in {"1", "true", "yes"}
+        try:
+            page = max(1, int(request.query.get("page", 1)))
+            per_page = max(1, min(100, int(request.query.get("per_page", 20))))
+        except ValueError:
+            page, per_page = 1, 20
+        offset = (page - 1) * per_page
+
+        all_releases = await catalog_repository.list_discovered_releases(
+            artist_name=artist_filter,
+            limit=200 if followed_only else per_page,
+            offset=0 if followed_only else offset,
+        )
+
+        user_follows = await catalog_repository.list_user_followed_artists(user.telegram_id)
+        followed_names = {f.artist_name.strip().lower() for f in user_follows}
+
+        if followed_only:
+            filtered = [r for r in all_releases if r.artist_name.strip().lower() in followed_names]
+            total_items = len(filtered)
+            items_slice = filtered[offset : offset + per_page]
+        else:
+            total_items = len(all_releases)
+            items_slice = all_releases
+
+        serialized = [
+            {
+                "id": r.id,
+                "artist_name": r.artist_name,
+                "title": r.title,
+                "release_type": r.release_type,
+                "release_date": r.release_date,
+                "cover_url": r.cover_url,
+                "preview_url": r.preview_url,
+                "external_url": r.external_url,
+                "provider": r.provider,
+                "track_count": r.track_count,
+                "in_library": r.in_library,
+                "is_followed": r.artist_name.strip().lower() in followed_names,
+            }
+            for r in items_slice
+        ]
+
+        return web.json_response(
+            {
+                "items": serialized,
+                "total": total_items,
+                "page": page,
+                "per_page": per_page,
+                "followed_count": len(user_follows),
+            }
+        )
+
+    async def handle_get_radar_follows(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        if catalog_repository is None:
+            return web.json_response({"error": "Repository unavailable"}, status=503)
+
+        user_follows = await catalog_repository.list_user_followed_artists(user.telegram_id)
+        return web.json_response(
+            {
+                "items": [
+                    {
+                        "id": f.id,
+                        "artist_name": f.artist_name,
+                        "notify_telegram": f.notify_telegram,
+                        "created_at": f.created_at.isoformat(),
+                    }
+                    for f in user_follows
+                ]
+            }
+        )
+
+    async def handle_post_radar_follow(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        if catalog_repository is None:
+            return web.json_response({"error": "Repository unavailable"}, status=503)
+
+        body = await request.json()
+        artist_name = str(body.get("artist_name", "")).strip()
+        follow = bool(body.get("follow", True))
+
+        if not artist_name:
+            return web.json_response({"error": "artist_name is required"}, status=400)
+
+        if radar_service is not None:
+            if follow:
+                await radar_service.follow_artist(user.telegram_id, artist_name)
+            else:
+                await radar_service.unfollow_artist(user.telegram_id, artist_name)
+        else:
+            if follow:
+                await catalog_repository.follow_artist(user.telegram_id, artist_name)
+            else:
+                await catalog_repository.unfollow_artist(user.telegram_id, artist_name)
+
+        return web.json_response({"ok": True, "artist_name": artist_name, "is_followed": follow})
+
+    async def handle_post_radar_scan(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        if not has_permission(user, Permission.SUBMIT_INGESTION):
+            raise PermissionDeniedError("Permission denied to trigger release scan.")
+
+        if radar_service is None:
+            return web.json_response({"error": "Radar service unavailable"}, status=503)
+
+        discovered, _ = await radar_service.scan_monitored_artists()
+        return web.json_response({"ok": True, "discovered_count": len(discovered)})
+
+    app.router.add_get("/api/v1/app/radar/releases", handle_get_radar_releases)
+    app.router.add_get("/api/v1/app/radar/follows", handle_get_radar_follows)
+    app.router.add_post("/api/v1/app/radar/follow", handle_post_radar_follow)
+    app.router.add_post("/api/v1/app/radar/scan", handle_post_radar_scan)
+
     # 4. SPA Static Files & Fallback Handler (with Vite dev proxy support in dev_mode)
     resolved_static = static_dir.resolve() if static_dir else None
 
@@ -2989,6 +3128,7 @@ class BotWebServer:
         pipeline: IngestionPipeline | None = None,
         scratch_dir: Path | None = None,
         event_bus: QueueEventBus | None = None,
+        radar_service: ReleaseRadarService | None = None,
     ) -> None:
         self._bot_token = bot_token
         self._governance_service = governance_service
@@ -3006,6 +3146,7 @@ class BotWebServer:
         self._pipeline = pipeline
         self._scratch_dir = scratch_dir
         self._event_bus = event_bus
+        self._radar_service = radar_service
 
         self._app = build_webapp_api(
             bot_token=bot_token,
@@ -3022,6 +3163,7 @@ class BotWebServer:
             pipeline=pipeline,
             scratch_dir=scratch_dir,
             event_bus=event_bus,
+            radar_service=radar_service,
         )
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None

@@ -14,7 +14,8 @@ from aiogram import F, Router
 from aiogram.enums import ChatAction
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, InlineKeyboardButton, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from src.bot.api_server import resolve_local_api_file_path
 from src.bot.keyboards.admin import (
@@ -22,6 +23,7 @@ from src.bot.keyboards.admin import (
     RESERVED_MENU_BUTTONS,
     build_queued_job_keyboard,
 )
+from src.bot.keyboards.radar import RadarCallback, build_release_detail_keyboard
 from src.bot.keyboards.songs import (
     SORT_DESCRIPTIONS,
     SORT_LABELS,
@@ -29,6 +31,7 @@ from src.bot.keyboards.songs import (
     SongsPageCallback,
     SongsSortCallback,
     SongsToggleFieldCallback,
+    SongsTrackCallback,
     build_bulk_research_menu_keyboard,
     build_bulk_research_plan_keyboard,
     build_bulk_review_overview_keyboard,
@@ -46,6 +49,7 @@ from src.bot.keyboards.songs import (
     build_songs_search_menu_keyboard,
     build_songs_sort_keyboard,
 )
+from src.bot.routers.radar import format_release_detail_card
 from src.bot.states import SongManagementStates
 from src.bot.ui import (
     ack_callback,
@@ -943,6 +947,8 @@ async def handle_songs_search_text(
                 catalog_repository,
             )
             web_url = settings.web_app_url.strip() if settings and settings.web_app_url else None
+            uid = current_user.telegram_id if current_user else 0
+            is_foll = await governance_repository.is_artist_followed(uid, direct_track.artist)
             await message.answer(
                 format_song_detail_card(
                     direct_track,
@@ -956,6 +962,7 @@ async def handle_songs_search_text(
                     can_edit=_can_edit_songs(current_user),
                     back_callback=back_cb,
                     web_app_url=web_url,
+                    is_followed=is_foll,
                 ),
             )
             return
@@ -1747,6 +1754,8 @@ async def handle_songs_callback(
             uploader_label=up_lbl,
             modifier_label=mod_lbl,
         )
+        uid = current_user.telegram_id if current_user else 0
+        is_followed = await governance_repository.is_artist_followed(uid, record.artist)
         await safe_edit_text(
             msg,
             card,
@@ -1755,6 +1764,7 @@ async def handle_songs_callback(
                 can_edit=_can_edit_songs(current_user),
                 back_callback=back_cb,
                 web_app_url=web_url,
+                is_followed=is_followed,
             ),
         )
         return
@@ -1806,6 +1816,51 @@ async def handle_songs_callback(
             ),
             reply_markup=build_song_history_keyboard(record.id),
         )
+        return
+
+    # 4c. Inspect Artist on Release Radar
+    if action == "radar_artist":
+        await ack_callback(callback)
+        artist_name = record.artist.strip()
+        uid = current_user.telegram_id if current_user else 0
+        is_followed = await governance_repository.is_artist_followed(uid, artist_name)
+        releases = await governance_repository.list_discovered_releases(artist_name=artist_name, limit=1)
+        if releases:
+            card = format_release_detail_card(releases[0], is_followed)
+            markup = build_release_detail_keyboard(
+                releases[0],
+                is_followed,
+                settings.web_app_url if settings else None,
+            )
+            await safe_edit_text(msg, card, reply_markup=markup)
+        else:
+            card = format_screen(
+                title=f"🎤 {artist_name}",
+                context_lines=[
+                    f"Artist: <b>{html.escape(artist_name)}</b>",
+                    f"Status: <b>{'🔔 Following' if is_followed else '🔕 Not Following'}</b>",
+                    "",
+                    "<i>No releases are currently cached on radar for this artist. "
+                    "Follow them to receive alerts as soon as new music drops!</i>",
+                ],
+                footer_lines=["<i>Release Radar • Artist Follow</i>"],
+            )
+            builder = InlineKeyboardBuilder()
+            follow_text = f"🔕 Unfollow {artist_name}" if is_followed else f"🔔 Follow {artist_name}"
+            follow_action = "unfollow" if is_followed else "follow"
+            builder.row(
+                InlineKeyboardButton(
+                    text=follow_text,
+                    callback_data=RadarCallback(action=follow_action, target_id=artist_name).pack(),
+                )
+            )
+            builder.row(
+                InlineKeyboardButton(
+                    text="◀️ Back to Song",
+                    callback_data=SongsTrackCallback(action="view", track_id=short_sid).pack(),
+                )
+            )
+            await safe_edit_text(msg, card, reply_markup=builder.as_markup())
         return
 
     # 5. Retrieve / Download Song File (permanent artifact, forwarded or cached file_id when available)

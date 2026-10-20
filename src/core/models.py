@@ -389,3 +389,46 @@ class IngestionResult:
     lyrics_attached: bool = False
     tracks_ingested: int = 1
     lyrics_embedded_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class FollowedArtist:
+    """An artist followed by a user for new release notifications."""
+
+    id: int
+    telegram_id: int
+    artist_name: str
+    provider_artist_id: str | None = None
+    notify_telegram: bool = True
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveredRelease:
+    """An album, EP, or single discovered from an external music provider."""
+
+    id: str
+    artist_name: str
+    title: str
+    release_type: str
+    release_date: str
+    cover_url: str | None = None
+    preview_url: str | None = None
+    external_url: str | None = None
+    provider: str = "deezer"
+    provider_release_id: str = ""
+    track_count: int = 1
+    in_library: bool = False
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass(frozen=True, slots=True)
+class ReleaseNotification:
+    """Notification linking a discovered release to a subscribed user."""
+
+    id: int
+    telegram_id: int
+    release_id: str
+    is_read: bool = False
+    delivered_at: datetime | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))

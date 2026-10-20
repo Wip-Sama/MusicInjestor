@@ -12,6 +12,38 @@
 
 ## Completed Milestones
 
+### M34: Release Radar & Artist Notification System (Deezer Integration & 30s Previews)
+- **Architecture & Provider Selection:**
+  - Evaluated external metadata & streaming data providers (Deezer, Spotify, MusicBrainz, ListenBrainz, Last.fm). Selected Deezer as the primary Release Radar provider because it requires no API key, incurs zero additional third-party dependencies (driven natively by `httpx`), and serves direct 30-second MP3 audio preview streams out of the box.
+- **Core Domain & Ingestion Engine (`src/core/`):**
+  - **Models & Enums (`src/core/models.py`):** Added `FollowedArtist`, `DiscoveredRelease`, and `ReleaseNotification` pure domain dataclasses with SQLite roundtrip compatibility and typing.
+  - **Port Definitions (`src/core/ports.py`):** Defined `ReleaseRadarProviderPort` with `search_artist`, `get_artist_recent_releases`, and `get_release_preview_track`. Added persistence protocols to `GovernanceRepositoryPort` for following/unfollowing, listing monitored artists, upserting discovered releases, and managing notifications.
+  - **Deezer Provider (`src/core/deezer.py`):** Implemented `DeezerReleaseProvider` supporting exact artist matching, discography crawling (`/artist/{id}/albums`), album track inspection (`/album/{id}/tracks`), and high-res cover art resolution.
+  - **Radar Domain Orchestrator (`src/core/radar.py`):** Built `ReleaseRadarService` managing artist follow/unfollow lifecycle, date parsing/recency filtering (`is_release_recent`), background scanning across all monitored artists (library tracks + user follows), and binary audio preview byte streaming (`get_preview_audio_bytes`).
+- **Persistence Layer (`src/db/models.py`, `src/db/repository.py`):**
+  - Added SQLite tables and indexes: `artist_follows` (`(telegram_id, artist_name)` unique constraint), `discovered_releases` (`(provider, provider_release_id)` unique constraint), and `release_notifications`.
+  - Added repository methods: `follow_artist`, `unfollow_artist`, `list_user_followed_artists`, `is_artist_followed`, `list_all_monitored_artists`, `upsert_discovered_releases` (with automatic `in_library` reconciliation against `library_tracks`), `list_discovered_releases`, `get_discovered_release`, `create_release_notifications`, `list_user_release_notifications`, and `mark_notification_read`.
+- **Telegram Bot Interface (`src/bot/`):**
+  - **Command & Navigation (`src/bot/routers/radar.py`, `src/bot/keyboards/radar.py`):** Added `/radar` command, paginated recent drops list, single release inspection card, and followed artists management list with one-tap unfollow controls.
+  - **30-Second Audio Delivery:** Implemented `handle_radar_preview_audio` streaming 30-second audio files directly into Telegram chats via `BufferedInputFile` with deep-links into the Web Mini App and Deezer.
+  - **Cross-Router Integration:** Added `📡 Artist on Radar` action in `/songs` track details and registered `/radar` in the bot commands menu.
+  - **Callback Safety:** Configured `RadarCallback` with `sep="~"` to prevent collision with colons in external identifiers and artist names.
+- **Song Artist Following & Responsive Navigation UX:**
+  - **Mini App Follow from Song (`FullscreenPlayer.tsx`, `TrackCard.tsx`, `SongStudioModal.tsx`, `AudioPlayerContext.tsx`):** Added global `isArtistFollowed` and `toggleFollowArtist` methods in `AudioPlayerContext` with instant optimistic caching and Telegram haptic feedback. Added sleek follow pill buttons (`🔔 Follow` / `✓ Following`) in the Fullscreen Player next to the artist name, in the Song Studio header, and as a quick one-tap bell icon next to Studio sliders on Catalog track rows. Synchronized artist follows seamlessly across Player, Catalog, and Radar views.
+  - **Scrollable Top Navigation Bar (`webapp/src/App.tsx`):** Fixed top navigation tab bar overflow on mobile viewports by enabling smooth horizontal touch scrolling (`overflowX: auto`, hidden scrollbars) and `flex: 1 0 auto` with `minWidth: max-content` on tab buttons, preventing icon/text truncation.
+  - **Responsive Search & Sort Layout (`webapp/src/views/CatalogView.tsx`):** Protected sort selector with `flexShrink: 0` and `minWidth: max-content`, added `minWidth: 0` and flexible shrinking to the search input container with concise placeholder, preventing the sort dropdown from being pushed out of the viewport.
+  - **Telegram Bot Follow from Song (`src/bot/routers/songs.py`, `src/bot/keyboards/songs.py`):** Enhanced `/songs` action menu to display follow state on the `📡 Artist on Radar` button and present an interactive artist follow screen with one-tap toggle when no prior releases are cached in the database.
+- **Web Mini App (`webapp/`, `src/bot/webapp_server.py`):**
+  - **REST Endpoints:** Added `GET /api/v1/app/radar/releases`, `GET /api/v1/app/radar/follows`, `POST /api/v1/app/radar/follow`, and `POST /api/v1/app/radar/scan`.
+  - **Radar View (`webapp/src/views/RadarView.tsx`):** Built a responsive Release Radar tab in the Mini App featuring release cards with cover art, release type badges, library status badges, 30s audio preview streaming integrated with the global `useAudioPlayer`, follow/unfollow buttons with Telegram haptic feedback, and a Followed Artists modal.
+  - **App Routing (`webapp/src/App.tsx`):** Added bottom navigation "Radar" tab and deep linking support (`startapp=radar`, `startapp=release_{id}`).
+- **Configuration & Worker Scheduling (`src/config/settings.py`, `main.py`):**
+  - Added `radar_enabled` (default `True`) and `radar_sync_interval_seconds` (default `43200` = 12h).
+  - Wired periodic background loop `run_periodic_release_radar_loop` with graceful cancellation in `main.py`.
+- **Test Coverage & Quality Assurance:**
+  - Added isolated unit tests: `test_deezer_provider.py`, `test_release_radar.py`, `test_bot_radar.py`, `test_webapp_radar.py`, and integration tests in `test_db_radar.py`.
+  - Executed full test suite: 260 tests passed, 0 failures, 100% architecture boundary compliance. Clean `ty` check and `npm run build`.
+
 ### M33: Pre-Commit External Link Search & Queue Tag Editing (Telegram Bot & Mini App)
 - **Telegram Bot Pre-Commit Link Search & Tag Editor:**
   - **Link Search Action & Keyboard (`src/bot/keyboards/verification.py`):** Added `🔗 Search by Link` button (`VerifyActionCallback(action="link_search", job_id=job_id)`) positioned alongside `⚡ Auto Re-Search` in `build_job_edit_keyboard`.

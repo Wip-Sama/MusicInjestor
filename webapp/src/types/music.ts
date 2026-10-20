@@ -34,3 +34,26 @@ export interface ParsedLrcLine {
   text: string;
 }
 
+export interface RadarRelease {
+  id: string;
+  artist_name: string;
+  title: string;
+  release_type: string;
+  release_date: string;
+  cover_url: string | null;
+  preview_url: string | null;
+  external_url: string | null;
+  provider: string;
+  track_count: number;
+  in_library: boolean;
+  is_followed: boolean;
+}
+
+export interface RadarFollowItem {
+  id: number;
+  artist_name: string;
+  notify_telegram: boolean;
+  created_at: string;
+}
+
+

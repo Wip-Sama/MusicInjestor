@@ -320,7 +320,7 @@ def test_format_ingestion_summary_variants() -> None:
 def test_build_root_router_and_rbac_middleware_and_admin_handlers(tmp_path: Path) -> None:
     """Verify root router, `RbacMiddleware` guest/blocked gating, `/start`, `/adduser`, and `/admin` flows."""
     root = build_root_router()
-    assert len(root.sub_routers) == 5
+    assert len(root.sub_routers) == 6
 
     db = SqliteDatabaseManager(tmp_path / "mw.db")
     repo = SqliteCatalogRepository(db)

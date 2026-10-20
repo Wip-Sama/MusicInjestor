@@ -13,6 +13,7 @@ import {
   CheckCircle2,
   AlertCircle,
   Library,
+  Radio,
   UserCheck,
   UploadCloud,
   Shield,
@@ -27,6 +28,7 @@ import { SyncedLyrics } from './components/player/SyncedLyrics';
 import { QueueDrawer } from './components/player/QueueDrawer';
 import { SettingsModal } from './components/settings/SettingsModal';
 import { CatalogView } from './views/CatalogView';
+import { RadarView } from './views/RadarView';
 import { IngestQueueView } from './views/IngestQueueView';
 import { GovernanceView } from './views/GovernanceView';
 import {
@@ -37,7 +39,7 @@ import {
   apiFetch,
 } from './lib/auth';
 
-type TabType = 'catalog' | 'ingest' | 'governance' | 'profile';
+type TabType = 'catalog' | 'radar' | 'ingest' | 'governance' | 'profile';
 
 const AppContent: React.FC = () => {
   const { playTrack, setIsPlayerOpen } = useAudioPlayer();
@@ -85,6 +87,8 @@ const AppContent: React.FC = () => {
             startParam === 'ingest'
           ) {
             setActiveTab('ingest');
+          } else if (startParam === 'radar' || startParam.startsWith('release_')) {
+            setActiveTab('radar');
           } else if (
             (startParam === 'governance' || startParam === 'admin') &&
             canManageUsers(data)
@@ -314,17 +318,23 @@ const GuestCatalogLockedCard: React.FC<{ profile: UserProfile }> = ({ profile: _
               borderRadius: '10px',
               padding: '4px',
               gap: '4px',
+              overflowX: 'auto',
+              scrollbarWidth: 'none',
+              msOverflowStyle: 'none',
+              WebkitOverflowScrolling: 'touch',
             }}
           >
             <button
               onClick={() => setActiveTab('catalog')}
               style={{
-                flex: 1,
+                flex: '1 0 auto',
+                minWidth: 'max-content',
+                whiteSpace: 'nowrap',
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
-                gap: '5px',
-                padding: '8px 8px',
+                gap: '6px',
+                padding: '8px 12px',
                 borderRadius: '8px',
                 border: 'none',
                 backgroundColor: activeTab === 'catalog' ? 'var(--tg-theme-bg-color, #1c1c1e)' : 'transparent',
@@ -340,14 +350,41 @@ const GuestCatalogLockedCard: React.FC<{ profile: UserProfile }> = ({ profile: _
             </button>
 
             <button
-              onClick={() => setActiveTab('ingest')}
+              onClick={() => setActiveTab('radar')}
               style={{
-                flex: 1,
+                flex: '1 0 auto',
+                minWidth: 'max-content',
+                whiteSpace: 'nowrap',
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
-                gap: '5px',
-                padding: '8px 8px',
+                gap: '6px',
+                padding: '8px 12px',
+                borderRadius: '8px',
+                border: 'none',
+                backgroundColor: activeTab === 'radar' ? 'var(--tg-theme-bg-color, #1c1c1e)' : 'transparent',
+                color: activeTab === 'radar' ? 'var(--tg-theme-button-color, #0a84ff)' : 'var(--tg-theme-subtitle-text-color, #8e8e93)',
+                fontWeight: activeTab === 'radar' ? 700 : 500,
+                fontSize: '13px',
+                cursor: 'pointer',
+                boxShadow: activeTab === 'radar' ? '0 1px 4px rgba(0,0,0,0.2)' : 'none',
+              }}
+            >
+              <Radio size={14} />
+              <span>Radar</span>
+            </button>
+
+            <button
+              onClick={() => setActiveTab('ingest')}
+              style={{
+                flex: '1 0 auto',
+                minWidth: 'max-content',
+                whiteSpace: 'nowrap',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                gap: '6px',
+                padding: '8px 12px',
                 borderRadius: '8px',
                 border: 'none',
                 backgroundColor: activeTab === 'ingest' ? 'var(--tg-theme-bg-color, #1c1c1e)' : 'transparent',
@@ -367,12 +404,14 @@ const GuestCatalogLockedCard: React.FC<{ profile: UserProfile }> = ({ profile: _
               <button
                 onClick={() => setActiveTab('governance')}
                 style={{
-                  flex: 1,
+                  flex: '1 0 auto',
+                  minWidth: 'max-content',
+                  whiteSpace: 'nowrap',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
-                  gap: '5px',
-                  padding: '8px 8px',
+                  gap: '6px',
+                  padding: '8px 12px',
                   borderRadius: '8px',
                   border: 'none',
                   backgroundColor: activeTab === 'governance' ? 'var(--tg-theme-bg-color, #1c1c1e)' : 'transparent',
@@ -391,12 +430,14 @@ const GuestCatalogLockedCard: React.FC<{ profile: UserProfile }> = ({ profile: _
             <button
               onClick={() => setActiveTab('profile')}
               style={{
-                flex: 1,
+                flex: '1 0 auto',
+                minWidth: 'max-content',
+                whiteSpace: 'nowrap',
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
-                gap: '5px',
-                padding: '8px 8px',
+                gap: '6px',
+                padding: '8px 12px',
                 borderRadius: '8px',
                 border: 'none',
                 backgroundColor: activeTab === 'profile' ? 'var(--tg-theme-bg-color, #1c1c1e)' : 'transparent',
@@ -447,6 +488,10 @@ const GuestCatalogLockedCard: React.FC<{ profile: UserProfile }> = ({ profile: _
           ) : (
             <GuestCatalogLockedCard profile={profile} />
           )
+        )}
+
+        {!loading && profile && activeTab === 'radar' && (
+          <RadarView profile={profile} />
         )}
 
         {!loading && profile && activeTab === 'ingest' && (

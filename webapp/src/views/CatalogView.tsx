@@ -74,43 +74,49 @@ export const CatalogView: React.FC<CatalogViewProps> = ({ profile }) => {
         <div
           style={{
             flex: 1,
+            minWidth: 0,
             display: 'flex',
             alignItems: 'center',
             backgroundColor: 'var(--tg-theme-secondary-bg-color, #2c2c2e)',
             borderRadius: '10px',
-            padding: '8px 12px',
-            gap: '8px',
+            padding: '8px 10px',
+            gap: '6px',
           }}
         >
-          <Search size={18} color="var(--tg-theme-subtitle-text-color, #8e8e93)" />
+          <Search size={18} color="var(--tg-theme-subtitle-text-color, #8e8e93)" style={{ flexShrink: 0 }} />
           <input
             type="text"
-            placeholder="Search by title, artist, or album..."
+            placeholder="Search title, artist, album..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             style={{
               flex: 1,
+              width: '100%',
+              minWidth: 0,
               background: 'transparent',
               border: 'none',
               outline: 'none',
               color: 'var(--tg-theme-text-color, #fff)',
               fontSize: '14px',
+              textOverflow: 'ellipsis',
             }}
           />
         </div>
 
-        {/* Sort selector */}
+        {/* Sort selector: protected flex width preventing viewport overflow */}
         <div
           style={{
+            flexShrink: 0,
+            minWidth: 'max-content',
             display: 'flex',
             alignItems: 'center',
             backgroundColor: 'var(--tg-theme-secondary-bg-color, #2c2c2e)',
             borderRadius: '10px',
-            padding: '0 8px',
+            padding: '0 10px',
             height: '38px',
           }}
         >
-          <SlidersHorizontal size={16} color="var(--tg-theme-subtitle-text-color, #8e8e93)" style={{ marginRight: '4px' }} />
+          <SlidersHorizontal size={15} color="var(--tg-theme-subtitle-text-color, #8e8e93)" style={{ marginRight: '6px', flexShrink: 0 }} />
           <select
             value={sortBy}
             onChange={(e) => {
@@ -123,6 +129,7 @@ export const CatalogView: React.FC<CatalogViewProps> = ({ profile }) => {
               outline: 'none',
               color: 'var(--tg-theme-text-color, #fff)',
               fontSize: '13px',
+              fontWeight: 500,
               cursor: 'pointer',
             }}
           >

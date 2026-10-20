@@ -72,6 +72,10 @@ _YAML_SECTION_KEY_MAP: dict[str, dict[str, str]] = {
         "listen_host": "WEB_LISTEN_HOST",
         "listen_port": "WEB_LISTEN_PORT",
     },
+    "radar": {
+        "enabled": "RADAR_ENABLED",
+        "sync_interval_seconds": "RADAR_SYNC_INTERVAL_SECONDS",
+    },
 }
 
 
@@ -200,6 +204,10 @@ class AppSettings(BaseModel):
     web_app_dev_mode: bool = Field(default=True)
     web_listen_host: str = Field(default="0.0.0.0")
     web_listen_port: int = Field(default=8080, ge=0, le=65535)
+
+    # Release Radar & Artist Monitoring settings
+    radar_enabled: bool = Field(default=True)
+    radar_sync_interval_seconds: int = Field(default=43200, ge=60)
 
     @field_validator("auto_approve_confidence")
     @classmethod

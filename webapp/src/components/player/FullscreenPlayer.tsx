@@ -11,6 +11,8 @@ import {
   Mic2,
   ListMusic,
   Sliders,
+  Bell,
+  Check,
 } from 'lucide-react';
 import { useAudioPlayer } from '../../context/AudioPlayerContext';
 import { formatTime } from '../../lib/lrc';
@@ -40,6 +42,8 @@ export const FullscreenPlayer: React.FC = () => {
     setIsLyricsOpen,
     setIsQueueOpen,
     updateTrackData,
+    isArtistFollowed,
+    toggleFollowArtist,
   } = useAudioPlayer();
 
   if (!isPlayerOpen || !currentTrack) return null;
@@ -169,16 +173,70 @@ export const FullscreenPlayer: React.FC = () => {
             </div>
             <div
               style={{
-                fontSize: '16px',
-                fontWeight: 500,
-                color: 'var(--tg-theme-subtitle-text-color, #8e8e93)',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
                 marginTop: '4px',
-                whiteSpace: 'nowrap',
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
               }}
             >
-              {currentTrack.artist}
+              <span
+                style={{
+                  fontSize: '16px',
+                  fontWeight: 500,
+                  color: 'var(--tg-theme-subtitle-text-color, #8e8e93)',
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  maxWidth: '180px',
+                }}
+              >
+                {currentTrack.artist}
+              </span>
+
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  toggleFollowArtist(currentTrack.artist);
+                }}
+                title={
+                  isArtistFollowed(currentTrack.artist)
+                    ? `Unfollow ${currentTrack.artist}`
+                    : `Follow ${currentTrack.artist} for new release notifications`
+                }
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '4px',
+                  padding: '3px 8px',
+                  borderRadius: '12px',
+                  border: isArtistFollowed(currentTrack.artist)
+                    ? '1px solid rgba(48, 209, 88, 0.4)'
+                    : '1px solid rgba(255, 255, 255, 0.15)',
+                  fontSize: '11px',
+                  fontWeight: 600,
+                  backgroundColor: isArtistFollowed(currentTrack.artist)
+                    ? 'rgba(48, 209, 88, 0.15)'
+                    : 'rgba(255, 255, 255, 0.08)',
+                  color: isArtistFollowed(currentTrack.artist)
+                    ? '#30d158'
+                    : 'var(--tg-theme-button-color, #0a84ff)',
+                  cursor: 'pointer',
+                  flexShrink: 0,
+                  transition: 'all 0.15s ease',
+                }}
+              >
+                {isArtistFollowed(currentTrack.artist) ? (
+                  <>
+                    <Check size={12} strokeWidth={2.5} />
+                    <span>Following</span>
+                  </>
+                ) : (
+                  <>
+                    <Bell size={12} />
+                    <span>Follow</span>
+                  </>
+                )}
+              </button>
             </div>
           </div>
 

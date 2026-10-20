@@ -19,11 +19,14 @@ from src.core.models import (
     AccessRequestStatus,
     AudioFingerprint,
     AuditLogEntry,
+    DiscoveredRelease,
     DuplicateCheckResult,
+    FollowedArtist,
     IngestionJob,
     JobState,
     LibraryTrackRecord,
     MetadataCandidate,
+    ReleaseNotification,
     SourceType,
     TagCorrectionRequest,
     TagCorrectionStatus,
@@ -1603,6 +1606,300 @@ class SqliteCatalogRepository:
             await conn.commit()
             return int((cur_lib.rowcount or 0) + (cur_cat.rowcount or 0))
 
+    async def follow_artist(
+        self,
+        telegram_id: int,
+        artist_name: str,
+        provider_artist_id: str | None = None,
+    ) -> FollowedArtist:
+        """Follow an artist for a user to receive release notifications."""
+        clean_name = artist_name.strip()
+        async with self._db.connect() as conn:
+            await conn.execute(
+                """
+                INSERT INTO artist_follows (telegram_id, artist_name, provider_artist_id, notify_telegram)
+                VALUES (?, ?, ?, 1)
+                ON CONFLICT(telegram_id, LOWER(artist_name)) DO UPDATE SET
+                    provider_artist_id = coalesce(
+                        excluded.provider_artist_id,
+                        artist_follows.provider_artist_id
+                    ),
+                    notify_telegram = 1
+                """,
+                (telegram_id, clean_name, provider_artist_id),
+            )
+            await conn.commit()
+            async with conn.execute(
+                """
+                SELECT id, telegram_id, artist_name, provider_artist_id, notify_telegram, created_at
+                FROM artist_follows
+                WHERE telegram_id = ? AND LOWER(artist_name) = LOWER(?)
+                """,
+                (telegram_id, clean_name),
+            ) as cur:
+                row = await cur.fetchone()
+                if row is None:
+                    msg = f"Failed to retrieve followed artist record for {clean_name}"
+                    raise RuntimeError(msg)
+                return _row_to_followed_artist(row)
+
+    async def unfollow_artist(self, telegram_id: int, artist_name: str) -> bool:
+        """Unfollow an artist for a user."""
+        clean_name = artist_name.strip()
+        async with self._db.connect() as conn:
+            cur = await conn.execute(
+                "DELETE FROM artist_follows WHERE telegram_id = ? AND LOWER(artist_name) = LOWER(?)",
+                (telegram_id, clean_name),
+            )
+            await conn.commit()
+            return bool(cur.rowcount and cur.rowcount > 0)
+
+    async def list_user_followed_artists(self, telegram_id: int) -> list[FollowedArtist]:
+        """List all artists followed by a specific user."""
+        async with (
+            self._db.connect() as conn,
+            conn.execute(
+                """
+                SELECT id, telegram_id, artist_name, provider_artist_id, notify_telegram, created_at
+                FROM artist_follows
+                WHERE telegram_id = ?
+                ORDER BY artist_name ASC
+                """,
+                (telegram_id,),
+            ) as cur,
+        ):
+            rows = await cur.fetchall()
+            return [_row_to_followed_artist(r) for r in rows]
+
+    async def is_artist_followed(self, telegram_id: int, artist_name: str) -> bool:
+        """Check whether a user follows an artist."""
+        clean_name = artist_name.strip()
+        async with (
+            self._db.connect() as conn,
+            conn.execute(
+                "SELECT 1 FROM artist_follows WHERE telegram_id = ? AND LOWER(artist_name) = LOWER(?)",
+                (telegram_id, clean_name),
+            ) as cur,
+        ):
+            return (await cur.fetchone()) is not None
+
+    async def list_all_monitored_artists(self) -> list[str]:
+        """Return the union of distinct artists in library_tracks and followed artists."""
+        async with (
+            self._db.connect() as conn,
+            conn.execute(
+                """
+                SELECT DISTINCT artist FROM library_tracks WHERE TRIM(artist) != ''
+                UNION
+                SELECT DISTINCT artist_name FROM artist_follows WHERE TRIM(artist_name) != ''
+                ORDER BY 1 COLLATE NOCASE ASC
+                """
+            ) as cur,
+        ):
+            rows = await cur.fetchall()
+            return [str(r[0]).strip() for r in rows if r[0] and str(r[0]).strip()]
+
+    async def upsert_discovered_releases(
+        self,
+        releases: Sequence[DiscoveredRelease],
+    ) -> list[DiscoveredRelease]:
+        """Persist newly discovered artist releases into the database, reconciling in_library status."""
+        if not releases:
+            return []
+
+        persisted: list[DiscoveredRelease] = []
+        async with self._db.connect() as conn:
+            for rel in releases:
+                async with conn.execute(
+                    "SELECT 1 FROM library_tracks "
+                    "WHERE LOWER(artist) = LOWER(?) AND LOWER(album) = LOWER(?) LIMIT 1",
+                    (rel.artist_name.strip(), rel.title.strip()),
+                ) as cur:
+                    in_lib = (await cur.fetchone()) is not None or rel.in_library
+
+                await conn.execute(
+                    """
+                    INSERT INTO discovered_releases (
+                        id, artist_name, title, release_type, release_date,
+                        cover_url, preview_url, external_url, provider,
+                        provider_release_id, track_count, in_library, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(id) DO UPDATE SET
+                        title = excluded.title,
+                        release_date = excluded.release_date,
+                        cover_url = coalesce(excluded.cover_url, discovered_releases.cover_url),
+                        preview_url = coalesce(excluded.preview_url, discovered_releases.preview_url),
+                        external_url = coalesce(excluded.external_url, discovered_releases.external_url),
+                        track_count = excluded.track_count,
+                        in_library = excluded.in_library
+                    """,
+                    (
+                        rel.id,
+                        rel.artist_name,
+                        rel.title,
+                        rel.release_type,
+                        rel.release_date,
+                        rel.cover_url,
+                        rel.preview_url,
+                        rel.external_url,
+                        rel.provider,
+                        rel.provider_release_id,
+                        rel.track_count,
+                        1 if in_lib else 0,
+                    ),
+                )
+                persisted.append(
+                    DiscoveredRelease(
+                        id=rel.id,
+                        artist_name=rel.artist_name,
+                        title=rel.title,
+                        release_type=rel.release_type,
+                        release_date=rel.release_date,
+                        cover_url=rel.cover_url,
+                        preview_url=rel.preview_url,
+                        external_url=rel.external_url,
+                        provider=rel.provider,
+                        provider_release_id=rel.provider_release_id,
+                        track_count=rel.track_count,
+                        in_library=in_lib,
+                        created_at=rel.created_at,
+                    )
+                )
+            await conn.commit()
+        return persisted
+
+    async def list_discovered_releases(
+        self,
+        artist_name: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[DiscoveredRelease]:
+        """List discovered releases ordered by release_date descending."""
+        query = (
+            "SELECT id, artist_name, title, release_type, release_date, cover_url, "
+            "preview_url, external_url, provider, provider_release_id, track_count, "
+            "in_library, created_at FROM discovered_releases "
+        )
+        params: list[object] = []
+        if artist_name and artist_name.strip():
+            query += "WHERE LOWER(artist_name) = LOWER(?) "
+            params.append(artist_name.strip())
+
+        query += "ORDER BY release_date DESC, created_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+        async with self._db.connect() as conn, conn.execute(query, tuple(params)) as cur:
+            rows = await cur.fetchall()
+            return [_row_to_discovered_release(r) for r in rows]
+
+    async def get_discovered_release(self, release_id: str) -> DiscoveredRelease | None:
+        """Retrieve a discovered release by its ID."""
+        async with (
+            self._db.connect() as conn,
+            conn.execute(
+                """
+                SELECT id, artist_name, title, release_type, release_date, cover_url,
+                       preview_url, external_url, provider, provider_release_id, track_count,
+                       in_library, created_at
+                FROM discovered_releases
+                WHERE id = ?
+                """,
+                (release_id,),
+            ) as cur,
+        ):
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            return _row_to_discovered_release(row)
+
+    async def create_release_notifications(
+        self,
+        notifications: Sequence[ReleaseNotification],
+    ) -> None:
+        """Persist release notifications for followers."""
+        if not notifications:
+            return
+
+        async with self._db.connect() as conn:
+            for n in notifications:
+                await conn.execute(
+                    """
+                    INSERT OR IGNORE INTO release_notifications (
+                        telegram_id, release_id, is_read, delivered_at, created_at
+                    ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """,
+                    (
+                        n.telegram_id,
+                        n.release_id,
+                        1 if n.is_read else 0,
+                        n.delivered_at.isoformat() if n.delivered_at else None,
+                    ),
+                )
+            await conn.commit()
+
+    async def list_user_release_notifications(
+        self,
+        telegram_id: int,
+        unread_only: bool = False,
+        limit: int = 50,
+    ) -> list[tuple[ReleaseNotification, DiscoveredRelease]]:
+        """List release notifications for a user joined with the discovered release."""
+        query = (
+            "SELECT rn.id, rn.telegram_id, rn.release_id, rn.is_read, rn.delivered_at, rn.created_at, "
+            "dr.id, dr.artist_name, dr.title, dr.release_type, dr.release_date, dr.cover_url, "
+            "dr.preview_url, dr.external_url, dr.provider, dr.provider_release_id, dr.track_count, "
+            "dr.in_library, dr.created_at "
+            "FROM release_notifications rn "
+            "JOIN discovered_releases dr ON rn.release_id = dr.id "
+            "WHERE rn.telegram_id = ? "
+        )
+        params: list[object] = [telegram_id]
+        if unread_only:
+            query += "AND rn.is_read = 0 "
+
+        query += "ORDER BY dr.release_date DESC, rn.created_at DESC LIMIT ?"
+        params.append(limit)
+
+        async with self._db.connect() as conn, conn.execute(query, tuple(params)) as cur:
+            rows = await cur.fetchall()
+            results: list[tuple[ReleaseNotification, DiscoveredRelease]] = []
+            for r in rows:
+                notif = ReleaseNotification(
+                    id=int(str(r[0])),
+                    telegram_id=int(str(r[1])),
+                    release_id=str(r[2]),
+                    is_read=bool(int(str(r[3]))),
+                    delivered_at=_parse_iso_datetime(r[4]),
+                    created_at=_parse_iso_datetime(r[5]) or datetime.now(UTC),
+                )
+                rel = DiscoveredRelease(
+                    id=str(r[6]),
+                    artist_name=str(r[7]),
+                    title=str(r[8]),
+                    release_type=str(r[9]),
+                    release_date=str(r[10]),
+                    cover_url=str(r[11]) if r[11] is not None else None,
+                    preview_url=str(r[12]) if r[12] is not None else None,
+                    external_url=str(r[13]) if r[13] is not None else None,
+                    provider=str(r[14]),
+                    provider_release_id=str(r[15]),
+                    track_count=int(str(r[16])),
+                    in_library=bool(int(str(r[17]))),
+                    created_at=_parse_iso_datetime(r[18]) or datetime.now(UTC),
+                )
+                results.append((notif, rel))
+            return results
+
+    async def mark_notification_read(self, telegram_id: int, notification_id: int) -> bool:
+        """Mark a release notification as read."""
+        async with self._db.connect() as conn:
+            cur = await conn.execute(
+                "UPDATE release_notifications SET is_read = 1 WHERE id = ? AND telegram_id = ?",
+                (notification_id, telegram_id),
+            )
+            await conn.commit()
+            return bool(cur.rowcount and cur.rowcount > 0)
+
 
 _LIBRARY_TRACK_COLUMNS = (
     "id, job_id, uploaded_by, storage_path, fingerprint, "
@@ -1670,4 +1967,35 @@ def _row_to_tag_correction(row: tuple[object, ...]) -> TagCorrectionRequest:
         reviewed_by=int(str(row[9])) if row[9] is not None else None,
         reviewed_at=_parse_iso_datetime(row[10]),
         created_at=_parse_iso_datetime(row[11]) or datetime.now(UTC),
+    )
+
+
+def _row_to_followed_artist(row: Sequence[object]) -> FollowedArtist:
+    """Map an `artist_follows` table row into a `FollowedArtist`."""
+    return FollowedArtist(
+        id=int(str(row[0])),
+        telegram_id=int(str(row[1])),
+        artist_name=str(row[2]),
+        provider_artist_id=str(row[3]) if row[3] is not None else None,
+        notify_telegram=bool(int(str(row[4]))),
+        created_at=_parse_iso_datetime(row[5]) or datetime.now(UTC),
+    )
+
+
+def _row_to_discovered_release(row: Sequence[object]) -> DiscoveredRelease:
+    """Map a `discovered_releases` table row into a `DiscoveredRelease`."""
+    return DiscoveredRelease(
+        id=str(row[0]),
+        artist_name=str(row[1]),
+        title=str(row[2]),
+        release_type=str(row[3]),
+        release_date=str(row[4]),
+        cover_url=str(row[5]) if row[5] is not None else None,
+        preview_url=str(row[6]) if row[6] is not None else None,
+        external_url=str(row[7]) if row[7] is not None else None,
+        provider=str(row[8]),
+        provider_release_id=str(row[9]),
+        track_count=int(str(row[10])),
+        in_library=bool(int(str(row[11]))),
+        created_at=_parse_iso_datetime(row[12]) or datetime.now(UTC),
     )

@@ -231,6 +231,7 @@ def build_song_action_keyboard(
     can_edit: bool = True,
     back_callback: str | None = None,
     web_app_url: str | None = None,
+    is_followed: bool | None = None,
 ) -> InlineKeyboardMarkup:
     """Build the ordered action menu for a song in `/songs` (Retrieval rows first, Edit rows second)."""
     sid = _short_id(track_id)
@@ -302,6 +303,17 @@ def build_song_action_keyboard(
                 copy_text=CopyTextButton(text=track_id),
             ),
         )
+    radar_label = (
+        "📡 Artist on Radar (🔔 Following)"
+        if is_followed is True
+        else ("📡 Artist on Radar (🔕 Follow)" if is_followed is False else "📡 Artist on Radar")
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text=radar_label,
+            callback_data=SongsTrackCallback(action="radar_artist", track_id=sid).pack(),
+        )
+    )
     effective_back = back_callback or SongsMenuCallback(action="list").pack()
     append_escape_row(
         builder,

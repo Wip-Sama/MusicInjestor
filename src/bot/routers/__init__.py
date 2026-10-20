@@ -5,6 +5,7 @@ from aiogram import Router
 from src.bot.routers.admin import admin_router
 from src.bot.routers.commands import commands_router
 from src.bot.routers.files import files_router
+from src.bot.routers.radar import radar_router
 from src.bot.routers.songs import songs_router
 from src.bot.routers.verification import verification_router
 
@@ -16,6 +17,7 @@ def build_root_router() -> Router:
         commands_router,
         admin_router,
         songs_router,
+        radar_router,
         files_router,
         verification_router,
     ):
@@ -30,6 +32,7 @@ __all__ = [
     "build_root_router",
     "commands_router",
     "files_router",
+    "radar_router",
     "songs_router",
     "verification_router",
 ]

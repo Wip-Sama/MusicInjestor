@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import html
 import logging
 import shutil
 from pathlib import Path
@@ -19,6 +20,7 @@ from src.bot.oidc_server import (
 from src.bot.routers import build_root_router
 from src.bot.webapp_server import BotWebServer
 from src.config.settings import AppSettings, load_settings
+from src.core.deezer import DeezerReleaseProvider
 from src.core.extractor import SevenZipArchiveExtractor
 from src.core.fingerprint import ChromaprintFingerprinter
 from src.core.lyrics import LrclibLyricsClient
@@ -27,6 +29,7 @@ from src.core.oidc import AuthentikOidcService
 from src.core.organizer import LibraryOrganizer
 from src.core.pipeline import IngestionPipeline
 from src.core.queue import IngestionQueueWorker
+from src.core.radar import ReleaseRadarService
 from src.core.rbac import GovernanceService
 from src.db.database import SqliteDatabaseManager
 from src.db.repository import SqliteCatalogRepository
@@ -36,6 +39,7 @@ logger = logging.getLogger(__name__)
 BOT_COMMANDS: tuple[BotCommand, ...] = (
     BotCommand(command="start", description="Open main menu, status & SSO pairing"),
     BotCommand(command="songs", description="Browse, search, download, edit & export songs"),
+    BotCommand(command="radar", description="New releases radar & followed artists"),
     BotCommand(command="rescan", description="Scan library folder & sync database"),
     BotCommand(command="job", description="Inspect, pause, unlock or review a job by ID"),
     BotCommand(command="cancel", description="Exit any active input or confirmation prompt"),
@@ -161,6 +165,53 @@ async def run_periodic_library_rescan_loop(
             logger.warning("Periodic library rescan failed: %s", exc)
 
 
+async def run_periodic_release_radar_loop(
+    radar_service: ReleaseRadarService,
+    repository: SqliteCatalogRepository,
+    bot: Bot | None = None,
+    interval_seconds: int = 43200,
+    stop_event: asyncio.Event | None = None,
+    run_on_startup: bool = False,
+) -> None:
+    """Periodically scan monitored artists and notify users of new releases."""
+    effective_stop = stop_event or asyncio.Event()
+    if run_on_startup and not effective_stop.is_set():
+        try:
+            logger.info("Starting initial Release Radar scan...")
+            await radar_service.scan_monitored_artists()
+        except Exception as exc:
+            logger.warning("Initial Release Radar scan failed: %s", exc)
+
+    while not effective_stop.is_set():
+        try:
+            await asyncio.wait_for(effective_stop.wait(), timeout=max(60, interval_seconds))
+            break
+        except TimeoutError:
+            pass
+        try:
+            logger.info("Executing scheduled Release Radar artist scan...")
+            discovered, notifications = await radar_service.scan_monitored_artists()
+            if bot is not None and notifications:
+                for notif in notifications:
+                    rel = await repository.get_discovered_release(notif.release_id)
+                    if rel is not None:
+                        try:
+                            text = (
+                                f"🌟 <b>New Music Drop Alert!</b>\n\n"
+                                f"🎤 Artist: <b>{html.escape(rel.artist_name)}</b>\n"
+                                f"💿 Release: <b>{html.escape(rel.title)}</b> [{rel.release_type.upper()}]\n"
+                                f"📅 Date: <code>{html.escape(rel.release_date)}</code>\n\n"
+                                f"<i>Use /radar to listen to a 30s audio preview!</i>"
+                            )
+                            await bot.send_message(chat_id=notif.telegram_id, text=text, parse_mode="HTML")
+                        except Exception as n_exc:
+                            logger.warning(
+                                "Failed to send release alert to user %d: %s", notif.telegram_id, n_exc
+                            )
+        except Exception as exc:
+            logger.warning("Scheduled Release Radar scan failed: %s", exc)
+
+
 async def start_vite_dev_server_if_needed(settings: AppSettings) -> asyncio.subprocess.Process | None:
     """Auto-start Vite dev server in webapp/ if in dev_mode and not already running on port 5173."""
     if not (settings.web_app_enabled and settings.web_app_dev_mode):
@@ -221,6 +272,8 @@ async def run_app(settings: AppSettings | None = None) -> None:
         )
 
     bot = build_bot_instance(resolved_settings)
+    deezer_provider = DeezerReleaseProvider()
+    radar_service = ReleaseRadarService(provider=deezer_provider, repository=repository)
     notifier = TelegramAdminLogNotifier(
         bot=bot,
         admin_log_channel_id=resolved_settings.admin_log_channel_id,
@@ -269,10 +322,12 @@ async def run_app(settings: AppSettings | None = None) -> None:
     dispatcher["queue_worker"] = queue_worker
     dispatcher["notifier"] = notifier
     dispatcher["organizer"] = organizer
+    dispatcher["radar_service"] = radar_service
     dispatcher.include_router(build_root_router())
 
     web_server: BotWebServer | None = None
     oidc_sync_task: asyncio.Task[None] | None = None
+    radar_task: asyncio.Task[None] | None = None
     background_stop_event = asyncio.Event()
     rescan_task = asyncio.create_task(
         run_periodic_library_rescan_loop(
@@ -298,6 +353,17 @@ async def run_app(settings: AppSettings | None = None) -> None:
             )
         )
 
+    if resolved_settings.radar_enabled:
+        radar_task = asyncio.create_task(
+            run_periodic_release_radar_loop(
+                radar_service=radar_service,
+                repository=repository,
+                bot=bot,
+                interval_seconds=resolved_settings.radar_sync_interval_seconds,
+                stop_event=background_stop_event,
+            )
+        )
+
     if resolved_settings.web_app_enabled or resolved_settings.oidc_enabled:
         meta_service = getattr(pipeline, "_metadata", None)
         lyrics_client = getattr(pipeline, "_lyrics", None)
@@ -317,6 +383,7 @@ async def run_app(settings: AppSettings | None = None) -> None:
             queue_worker=queue_worker,
             pipeline=pipeline,
             scratch_dir=resolved_settings.storage_scratch_dir,
+            radar_service=radar_service,
         )
         await web_server.start()
 
@@ -336,6 +403,10 @@ async def run_app(settings: AppSettings | None = None) -> None:
             oidc_sync_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await oidc_sync_task
+        if radar_task is not None:
+            radar_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await radar_task
         if web_server is not None:
             await web_server.stop()
         if vite_proc is not None:
