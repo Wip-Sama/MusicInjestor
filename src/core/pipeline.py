@@ -787,13 +787,31 @@ class IngestionPipeline:
             tracks_written = 1
             job.processed_tracks = 1
 
+            has_synced_primary = False
+            if lyrics is not None and lyrics.has_synced:
+                has_synced_primary = True
+            else:
+                read_fn = getattr(self._organizer, "read_track_lyrics", None)
+                if callable(read_fn):
+                    read_lyr = await read_fn(final_path)
+                    has_synced_primary = bool(read_lyr and read_lyr.has_synced)
+
             if job.fingerprint is not None:
-                await self._catalog.register_ingested_track(
-                    job_id=job.job_id,
-                    metadata=primary_meta,
-                    fingerprint=job.fingerprint,
-                    library_path=final_path,
-                )
+                try:
+                    await self._catalog.register_ingested_track(
+                        job_id=job.job_id,
+                        metadata=primary_meta,
+                        fingerprint=job.fingerprint,
+                        library_path=final_path,
+                        has_synced_lyrics=has_synced_primary,
+                    )
+                except TypeError:
+                    await self._catalog.register_ingested_track(
+                        job_id=job.job_id,
+                        metadata=primary_meta,
+                        fingerprint=job.fingerprint,
+                        library_path=final_path,
+                    )
 
             for index, extra_path in enumerate(extra_list, start=2):
                 extra_local = await self._metadata.read_local_metadata(extra_path)
@@ -832,12 +850,30 @@ class IngestionPipeline:
                     metadata=extra_meta,
                     lyrics=extra_lyrics,
                 )
-                await self._catalog.register_ingested_track(
-                    job_id=job.job_id,
-                    metadata=extra_meta,
-                    fingerprint=extra_fp,
-                    library_path=extra_final,
-                )
+                has_synced_extra = False
+                if extra_lyrics is not None and extra_lyrics.has_synced:
+                    has_synced_extra = True
+                else:
+                    read_fn = getattr(self._organizer, "read_track_lyrics", None)
+                    if callable(read_fn):
+                        read_extra_lyr = await read_fn(extra_final)
+                        has_synced_extra = bool(read_extra_lyr and read_extra_lyr.has_synced)
+
+                try:
+                    await self._catalog.register_ingested_track(
+                        job_id=job.job_id,
+                        metadata=extra_meta,
+                        fingerprint=extra_fp,
+                        library_path=extra_final,
+                        has_synced_lyrics=has_synced_extra,
+                    )
+                except TypeError:
+                    await self._catalog.register_ingested_track(
+                        job_id=job.job_id,
+                        metadata=extra_meta,
+                        fingerprint=extra_fp,
+                        library_path=extra_final,
+                    )
                 tracks_written += 1
                 job.processed_tracks = tracks_written
 

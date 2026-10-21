@@ -6,7 +6,6 @@ import hmac
 import html
 import json
 import logging
-import re
 import shutil
 import time
 import uuid
@@ -42,7 +41,7 @@ from src.core.models import (
     UserPreferences,
     UserRole,
 )
-from src.core.organizer import LibraryOrganizer
+from src.core.organizer import LibraryOrganizer, is_synced_lyrics_text
 from src.core.pipeline import IngestionPipeline
 from src.core.ports import GovernanceRepositoryPort
 from src.core.queue import IngestionQueueWorker
@@ -60,8 +59,6 @@ from src.core.transcoder import (
 )
 
 logger = logging.getLogger(__name__)
-
-_LRC_TIMESTAMP_RE: re.Pattern[str] = re.compile(r"\[(?:(\d{1,2}):)?(\d{1,3}):(\d{2})(?:\.(\d{1,3}))?\]")
 
 
 class QueueEventBus:
@@ -1162,7 +1159,7 @@ def build_webapp_api(
         lyrics_obj = None
         if isinstance(new_lyrics, str) and new_lyrics.strip():
             cleaned = new_lyrics.strip()
-            is_synced = bool(_LRC_TIMESTAMP_RE.search(cleaned))
+            is_synced = is_synced_lyrics_text(cleaned)
             lyrics_obj = LyricsData(
                 synced_lyrics=cleaned if is_synced else None,
                 plain_lyrics=None if is_synced else cleaned,
@@ -1194,7 +1191,7 @@ def build_webapp_api(
                 logger.warning("Failed to apply cover art hex for %s: %s", record.id, exc)
 
         final_lyrics = await organizer.read_track_lyrics(new_path)
-        has_synced_flag = bool(final_lyrics and (final_lyrics.has_synced or final_lyrics.has_any))
+        has_synced_flag = bool(final_lyrics and final_lyrics.has_synced)
 
         updated_record = await catalog_repository.update_library_track_full(
             record.id,
@@ -1392,7 +1389,7 @@ def build_webapp_api(
             "true",
             "1",
         }
-        is_synced = bool(_LRC_TIMESTAMP_RE.search(lyrics_text))
+        is_synced = is_synced_lyrics_text(lyrics_text)
 
         if should_apply:
             await organizer.update_track_lyrics(record.storage_path, lyrics_text)
@@ -2247,7 +2244,7 @@ def build_webapp_api(
             raw_lyr = data.get("lyrics")
             if isinstance(raw_lyr, str) and raw_lyr.strip():
                 clean_lyr = raw_lyr.strip()
-                is_synced = "[" in clean_lyr and "]" in clean_lyr
+                is_synced = is_synced_lyrics_text(clean_lyr)
                 lyrics_obj = LyricsData(
                     synced_lyrics=clean_lyr if is_synced else None,
                     plain_lyrics=None if is_synced else clean_lyr,

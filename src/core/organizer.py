@@ -61,21 +61,43 @@ def parse_lrc_timestamps(synced_lyrics: str) -> list[tuple[str, int]]:
     return [(text, ts_ms) for ts_ms, text in entries]
 
 
+def is_synced_lyrics_text(text: str) -> bool:
+    """Return True if `text` contains standard LRC timestamp tags like `[mm:ss.xx]`."""
+    return bool(_LRC_TIMESTAMP_RE.search(text))
+
+
 def _write_id3_lyrics_frames(id3_tags: object, primary_lyrics: str, lyrics: LyricsData) -> bool:
     """Attach `USLT`, `TXXX`, and `SYLT` frames to an ID3 tag container."""
     add_fn = getattr(id3_tags, "add", None)
     if not callable(add_fn):
         return False
-    add_fn(USLT(encoding=Encoding.UTF8, lang="eng", desc="", text=primary_lyrics))
-    add_fn(TXXX(encoding=Encoding.UTF8, desc="LYRICS", text=[primary_lyrics]))
+
+    delall_fn = getattr(id3_tags, "delall", None)
+    if callable(delall_fn):
+        delall_fn("USLT")
+        delall_fn("SYLT")
+        delall_fn("ULT")
+
+    keys_fn = getattr(id3_tags, "keys", None)
+    pop_fn = getattr(id3_tags, "pop", None)
+    getitem_fn = getattr(id3_tags, "__getitem__", None)
+    if callable(keys_fn) and callable(pop_fn) and callable(getitem_fn):
+        txxx_lyrics_keys = [
+            k
+            for k in list(keys_fn())
+            if str(k).startswith("TXXX")
+            and str(getattr(getitem_fn(k), "desc", "") or "").strip().upper()
+            in {"LYRICS", "SYNCEDLYRICS", "UNSYNCEDLYRICS", "UNSYNCED LYRICS"}
+        ]
+        for k in txxx_lyrics_keys:
+            pop_fn(k, None)
+
     if lyrics.has_synced and lyrics.synced_lyrics:
-        add_fn(
-            TXXX(
-                encoding=Encoding.UTF8,
-                desc="SYNCEDLYRICS",
-                text=[lyrics.synced_lyrics],
-            )
-        )
+        add_fn(USLT(encoding=Encoding.UTF8, lang="eng", desc="", text=lyrics.synced_lyrics))
+        add_fn(TXXX(encoding=Encoding.UTF8, desc="SYNCEDLYRICS", text=[lyrics.synced_lyrics]))
+        add_fn(TXXX(encoding=Encoding.UTF8, desc="LYRICS", text=[lyrics.synced_lyrics]))
+        if lyrics.plain_lyrics:
+            add_fn(TXXX(encoding=Encoding.UTF8, desc="UNSYNCEDLYRICS", text=[lyrics.plain_lyrics]))
         sylt_frames = parse_lrc_timestamps(lyrics.synced_lyrics)
         if sylt_frames:
             add_fn(
@@ -88,6 +110,11 @@ def _write_id3_lyrics_frames(id3_tags: object, primary_lyrics: str, lyrics: Lyri
                     text=sylt_frames,
                 )
             )
+    else:
+        add_fn(USLT(encoding=Encoding.UTF8, lang="eng", desc="", text=primary_lyrics))
+        add_fn(TXXX(encoding=Encoding.UTF8, desc="LYRICS", text=[primary_lyrics]))
+        add_fn(TXXX(encoding=Encoding.UTF8, desc="UNSYNCEDLYRICS", text=[primary_lyrics]))
+
     return True
 
 
@@ -111,14 +138,20 @@ def _extract_existing_lyrics_sync(audio_path: Path) -> LyricsData | None:
 
     getter = getattr(tags, "get", None)
     if callable(getter):
-        for key in ("SYNCEDLYRICS", "syncedlyrics"):
+        for key in ("SYNCEDLYRICS", "syncedlyrics", "----:com.apple.iTunes:SYNCEDLYRICS"):
             try:
                 val = getter(key)
             except Exception:
                 continue
-            if isinstance(val, list) and val and str(val[0]).strip():
-                synced = str(val[0]).strip()
-                break
+            if isinstance(val, list) and val:
+                raw_val = val[0]
+                if isinstance(raw_val, (bytes, bytearray)):
+                    decoded = raw_val.decode("utf-8", errors="replace").strip()
+                else:
+                    decoded = str(raw_val).strip()
+                if decoded:
+                    synced = decoded
+                    break
         for key in ("LYRICS", "lyrics", "UNSYNCEDLYRICS", "unsyncedlyrics", "\xa9lyr"):
             try:
                 val = getter(key)
@@ -132,18 +165,38 @@ def _extract_existing_lyrics_sync(audio_path: Path) -> LyricsData | None:
                     plain = text
 
     getall_fn = getattr(tags, "getall", None)
-    if callable(getall_fn) and not (synced or plain):
-        try:
-            uslt_frames = getall_fn("USLT")
-            if isinstance(uslt_frames, list) and uslt_frames:
-                uslt_text = str(getattr(uslt_frames[0], "text", "") or "").strip()
-                if uslt_text:
-                    if _LRC_TIMESTAMP_RE.search(uslt_text):
-                        synced = uslt_text
-                    else:
-                        plain = uslt_text
-        except Exception:
-            pass
+    if callable(getall_fn):
+        if not synced:
+            try:
+                uslt_frames = getall_fn("USLT")
+                if isinstance(uslt_frames, list):
+                    for frame in uslt_frames:
+                        uslt_text = str(getattr(frame, "text", "") or "").strip()
+                        if uslt_text and _LRC_TIMESTAMP_RE.search(uslt_text):
+                            synced = uslt_text
+                            break
+                        if uslt_text and not plain:
+                            plain = uslt_text
+            except Exception:
+                pass
+
+        if not synced:
+            try:
+                sylt_frames = getall_fn("SYLT")
+                if isinstance(sylt_frames, list) and sylt_frames:
+                    sylt = sylt_frames[0]
+                    lines: list[str] = []
+                    for item in getattr(sylt, "text", []):
+                        if isinstance(item, tuple) and len(item) == 2:
+                            lyric_line, ts_ms = item[0], item[1]
+                            minutes = int(ts_ms // 60000)
+                            seconds = int((ts_ms % 60000) // 1000)
+                            centis = int((ts_ms % 1000) // 10)
+                            lines.append(f"[{minutes:02d}:{seconds:02d}.{centis:02d}] {lyric_line}")
+                    if lines:
+                        synced = "\n".join(lines)
+            except Exception:
+                pass
 
     if not synced and not plain:
         return None
@@ -181,15 +234,27 @@ def _embed_lyrics_into_audio_sync(audio_path: Path, lyrics: LyricsData) -> None:
             return
 
         if suffix in {".flac", ".ogg", ".opus"}:
-            raw_audio["LYRICS"] = [primary_lyrics]
             if lyrics.has_synced and lyrics.synced_lyrics:
+                raw_audio["LYRICS"] = [lyrics.synced_lyrics]
                 raw_audio["SYNCEDLYRICS"] = [lyrics.synced_lyrics]
-            raw_audio["UNSYNCEDLYRICS"] = [lyrics.plain_lyrics or primary_lyrics]
+                if lyrics.plain_lyrics:
+                    raw_audio["UNSYNCEDLYRICS"] = [lyrics.plain_lyrics]
+                elif "UNSYNCEDLYRICS" in raw_audio:
+                    del raw_audio["UNSYNCEDLYRICS"]
+            else:
+                raw_audio["LYRICS"] = [primary_lyrics]
+                raw_audio["UNSYNCEDLYRICS"] = [primary_lyrics]
+                if "SYNCEDLYRICS" in raw_audio:
+                    del raw_audio["SYNCEDLYRICS"]
             raw_audio.save()
             return
 
-        if suffix in {".m4a", ".alac"}:
+        if suffix in {".m4a", ".alac", ".mp4"}:
             raw_audio["\xa9lyr"] = [primary_lyrics]
+            if lyrics.has_synced and lyrics.synced_lyrics:
+                raw_audio["----:com.apple.iTunes:SYNCEDLYRICS"] = [lyrics.synced_lyrics.encode("utf-8")]
+            elif "----:com.apple.iTunes:SYNCEDLYRICS" in raw_audio:
+                del raw_audio["----:com.apple.iTunes:SYNCEDLYRICS"]
             raw_audio.save()
             return
 
@@ -571,6 +636,10 @@ class LibraryOrganizer:
         effective_lyrics = lyrics
         if effective_lyrics is None or not effective_lyrics.has_any:
             effective_lyrics = await asyncio.to_thread(_extract_existing_lyrics_sync, source_audio_path)
+        elif not effective_lyrics.has_synced:
+            existing = await asyncio.to_thread(_extract_existing_lyrics_sync, source_audio_path)
+            if existing is not None and existing.has_synced:
+                effective_lyrics = existing
 
         await asyncio.to_thread(shutil.copy2, source_audio_path, target_audio_path)
         self.apply_file_permissions(target_audio_path)
@@ -673,6 +742,10 @@ class LibraryOrganizer:
         effective_lyrics = lyrics
         if effective_lyrics is None or not effective_lyrics.has_any:
             effective_lyrics = await self.read_track_lyrics(current_path)
+        elif not effective_lyrics.has_synced:
+            existing = await self.read_track_lyrics(current_path)
+            if existing is not None and existing.has_synced:
+                effective_lyrics = existing
 
         same_file = False
         try:
@@ -1082,7 +1155,7 @@ def _inspect_library_audio_file_sync(
     album = meta.album if meta.album and meta.album != "Unknown Album" else (clean_album_folder or meta.title)
     year = meta.year or folder_year
     lyrics = _read_sidecar_or_embedded_lyrics_sync(audio_path)
-    has_synced = bool(lyrics and (lyrics.has_synced or lyrics.has_any))
+    has_synced = bool(lyrics and lyrics.has_synced)
 
     return LibraryTrackRecord(
         id=existing.id if existing is not None else str(uuid.uuid4()),

@@ -9,7 +9,7 @@ from typing import Any
 
 from src.core.lyrics import LrclibLyricsClient
 from src.core.metadata import MusicBrainzMetadataService
-from src.core.models import AuditAction, AuditLogEntry, LibraryTrackRecord, TrackMetadata
+from src.core.models import AuditAction, AuditLogEntry, LibraryTrackRecord, LyricsData, TrackMetadata
 from src.core.organizer import LibraryOrganizer
 from src.core.ports import GovernanceRepositoryPort
 from src.core.throttler import ApiThrottler, default_api_throttler
@@ -237,6 +237,7 @@ class BulkResearchService:
                             best_meta = candidates[0].metadata
 
                     fetched_lyrics_text: str | None = None
+                    fetched_lrc: LyricsData | None = None
                     if plan.search_lyrics:
                         fetched_lrc = await self._lyrics.fetch_lyrics(best_meta)
                         if fetched_lrc is not None:
@@ -292,6 +293,12 @@ class BulkResearchService:
                         if fetched_lyrics_text:
                             await self._organizer.update_track_lyrics(new_path, fetched_lyrics_text)
 
+                        is_synced_now = (
+                            bool(fetched_lrc and fetched_lrc.has_synced)
+                            if fetched_lyrics_text is not None
+                            else record.has_synced_lyrics
+                        )
+
                         # Update SQLite catalog
                         updated_record = LibraryTrackRecord(
                             id=record.id,
@@ -305,7 +312,7 @@ class BulkResearchService:
                             title=effective_meta.title,
                             year=effective_meta.year,
                             track_number=effective_meta.track_number or record.track_number,
-                            has_synced_lyrics=bool(fetched_lyrics_text or record.has_synced_lyrics),
+                            has_synced_lyrics=is_synced_now,
                             ingested_at=record.ingested_at,
                             updated_at=record.updated_at,
                             modified_by=actor_id,

@@ -79,7 +79,7 @@ from src.core.models import (
     TrackMetadata,
     UserAccount,
 )
-from src.core.organizer import LibraryOrganizer
+from src.core.organizer import LibraryOrganizer, is_synced_lyrics_text
 from src.core.pipeline import IngestionPipeline
 from src.core.ports import CatalogRepositoryPort, GovernanceRepositoryPort
 from src.core.rbac import has_permission
@@ -513,7 +513,7 @@ def format_song_edit_dry_run_card(
     new_lyrics = proposal.get("new_lyrics")
     if isinstance(new_lyrics, str) and new_lyrics.strip():
         line_count = len(new_lyrics.strip().splitlines())
-        is_synced = "[" in new_lyrics and "]" in new_lyrics
+        is_synced = is_synced_lyrics_text(new_lyrics)
         kind = "Synced LRC" if is_synced else "Plain Text"
         if enabled_set is not None and "lyrics" not in enabled_set:
             context_lines.append(
@@ -2536,7 +2536,7 @@ async def handle_songs_callback(
         lyrics_obj: LyricsData | None = None
         if isinstance(new_lyrics_raw, str) and new_lyrics_raw.strip():
             cleaned_lyr = new_lyrics_raw.strip()
-            is_synced = "[" in cleaned_lyr and "]" in cleaned_lyr
+            is_synced = is_synced_lyrics_text(cleaned_lyr)
             lyrics_obj = LyricsData(
                 synced_lyrics=cleaned_lyr if is_synced else None,
                 plain_lyrics=None if is_synced else cleaned_lyr,
@@ -2571,7 +2571,7 @@ async def handle_songs_callback(
             await organizer.update_track_cover_art(new_path, cover_bytes, mime_type=cover_mime)
 
         final_lyrics = await organizer.read_track_lyrics(new_path)
-        has_synced_flag = bool(final_lyrics and (final_lyrics.has_synced or final_lyrics.has_any))
+        has_synced_flag = bool(final_lyrics and final_lyrics.has_synced)
 
         actor_id = current_user.telegram_id if current_user is not None else 0
         updated_record = await governance_repository.update_library_track_full(
@@ -2792,7 +2792,7 @@ async def handle_bulk_review_callback(
             lyrics_obj = None
             if plyrics and str(plyrics).strip():
                 cleaned = str(plyrics).strip()
-                is_synced = "[" in cleaned and "]" in cleaned
+                is_synced = is_synced_lyrics_text(cleaned)
                 lyrics_obj = LyricsData(
                     synced_lyrics=cleaned if is_synced else None,
                     plain_lyrics=None if is_synced else cleaned,
@@ -2815,7 +2815,7 @@ async def handle_bulk_review_callback(
                 lyrics_obj,
             )
             final_lyrics = await organizer.read_track_lyrics(new_path)
-            has_lyr = bool(final_lyrics and (final_lyrics.has_synced or final_lyrics.has_any))
+            has_lyr = bool(final_lyrics and final_lyrics.has_synced)
             await governance_repository.update_library_track_full(
                 rec.id,
                 title=upd_meta.title,
@@ -2911,7 +2911,7 @@ async def handle_bulk_review_callback(
             lyrics_obj = None
             if plyrics and str(plyrics).strip():
                 cleaned = str(plyrics).strip()
-                is_synced = "[" in cleaned and "]" in cleaned
+                is_synced = is_synced_lyrics_text(cleaned)
                 lyrics_obj = LyricsData(
                     synced_lyrics=cleaned if is_synced else None,
                     plain_lyrics=None if is_synced else cleaned,
@@ -2934,7 +2934,7 @@ async def handle_bulk_review_callback(
                 lyrics_obj,
             )
             final_lyrics = await organizer.read_track_lyrics(new_path)
-            has_lyr = bool(final_lyrics and (final_lyrics.has_synced or final_lyrics.has_any))
+            has_lyr = bool(final_lyrics and final_lyrics.has_synced)
             await governance_repository.update_library_track_full(
                 rec.id,
                 title=upd_meta.title,

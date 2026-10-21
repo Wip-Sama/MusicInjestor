@@ -70,7 +70,7 @@ def _score_search_hit(hit: dict[str, object], metadata: TrackMetadata) -> float:
     if title_sim < 0.40:
         return 0.0
 
-    synced_bonus = 0.12 if synced else 0.0
+    synced_bonus = 0.35 if synced else 0.0
     score = (0.50 * title_sim) + (0.35 * artist_sim) + duration_bonus + synced_bonus
     return round(score, 4)
 
@@ -109,32 +109,41 @@ class LrclibLyricsClient:
         title_variants = extract_title_search_variants(metadata.title) or [metadata.title]
         get_url = f"{self._base_url}/get"
         search_url = f"{self._base_url}/search"
+        plain_fallback: LyricsData | None = None
 
         try:
             async with httpx.AsyncClient(
                 timeout=self._timeout,
                 transport=self._transport,
             ) as client:
-                # 1. Exact `/get` lookup across title & artist variants
+                # 1. Exact `/get` lookup across title & artist variants (prefer synced, then without album)
                 for title_candidate in title_variants[:2]:
                     for artist_candidate in artist_variants[:4]:
-                        params: dict[str, str | int] = {
-                            "track_name": title_candidate,
-                            "artist_name": artist_candidate,
-                            "album_name": metadata.album,
-                        }
-                        if metadata.duration_seconds is not None:
-                            params["duration"] = metadata.duration_seconds
+                        album_candidates: tuple[str | None, ...] = (
+                            (metadata.album, None) if metadata.album else (None,)
+                        )
+                        for album_candidate in album_candidates:
+                            params: dict[str, str | int] = {
+                                "track_name": title_candidate,
+                                "artist_name": artist_candidate,
+                            }
+                            if album_candidate:
+                                params["album_name"] = album_candidate
+                            if metadata.duration_seconds is not None:
+                                params["duration"] = metadata.duration_seconds
 
-                        await self._throttler.throttle("lrclib")
-                        response = await client.get(get_url, params=params)
-                        if response.status_code != 200:
-                            continue
-                        raw_json = response.json()
-                        if isinstance(raw_json, dict):
-                            found = _payload_to_lyrics_data(raw_json)
-                            if found is not None:
-                                return found
+                            await self._throttler.throttle("lrclib")
+                            response = await client.get(get_url, params=params)
+                            if response.status_code != 200:
+                                continue
+                            raw_json = response.json()
+                            if isinstance(raw_json, dict):
+                                found = _payload_to_lyrics_data(raw_json)
+                                if found is not None:
+                                    if found.has_synced:
+                                        return found
+                                    if plain_fallback is None:
+                                        plain_fallback = found
 
                 # 2. Fallback to `/search` (tolerates album title mismatches and Japanese/Romaji scripts)
                 search_queries: list[dict[str, str]] = []
@@ -156,8 +165,11 @@ class LrclibLyricsClient:
                 ):
                     search_queries.append({"q": artist_variants[0]})
 
-                best_hit: dict[str, object] | None = None
-                best_score = 0.0
+                best_synced_hit: dict[str, object] | None = None
+                best_synced_score = 0.0
+                best_plain_hit: dict[str, object] | None = None
+                best_plain_score = 0.0
+
                 for q_params in search_queries:
                     await self._throttler.throttle("lrclib")
                     resp = await client.get(search_url, params=q_params)
@@ -170,15 +182,31 @@ class LrclibLyricsClient:
                         if not isinstance(item, dict):
                             continue
                         score = _score_search_hit(item, metadata)
-                        if score > best_score and score >= 0.45:
-                            best_score = score
-                            best_hit = item
+                        if score < 0.45:
+                            continue
+                        has_synced = bool(str(item.get("syncedLyrics") or "").strip())
+                        if has_synced:
+                            if score > best_synced_score:
+                                best_synced_score = score
+                                best_synced_hit = item
+                        else:
+                            if score > best_plain_score:
+                                best_plain_score = score
+                                best_plain_hit = item
                     # Stop early if we found a high-confidence synced match
-                    if best_hit is not None and best_score >= 0.80 and best_hit.get("syncedLyrics"):
+                    if best_synced_hit is not None and best_synced_score >= 0.80:
                         break
 
-                if best_hit is not None:
-                    found = _payload_to_lyrics_data(best_hit)
+                if best_synced_hit is not None:
+                    found = _payload_to_lyrics_data(best_synced_hit)
+                    if found is not None:
+                        return found
+
+                if plain_fallback is not None:
+                    return plain_fallback
+
+                if best_plain_hit is not None:
+                    found = _payload_to_lyrics_data(best_plain_hit)
                     if found is not None:
                         return found
 

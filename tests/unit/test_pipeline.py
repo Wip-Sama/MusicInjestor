@@ -47,6 +47,7 @@ class InMemoryCatalogRepository:
         metadata: TrackMetadata,
         fingerprint: AudioFingerprint,
         library_path: Path,
+        has_synced_lyrics: bool = False,
     ) -> None:
         await asyncio.sleep(0)
         self.tracks_by_fp[fingerprint.fingerprint] = library_path
@@ -379,8 +380,15 @@ def test_pipeline_multi_track_archive_release_tracklist_mapping_and_stage_callba
             metadata: TrackMetadata,
             fingerprint: AudioFingerprint,
             library_path: Path,
+            has_synced_lyrics: bool = False,
         ) -> None:
-            await super().register_ingested_track(job_id, metadata, fingerprint, library_path)
+            await super().register_ingested_track(
+                job_id,
+                metadata,
+                fingerprint,
+                library_path,
+                has_synced_lyrics=has_synced_lyrics,
+            )
             recorded_tracks.append(metadata)
 
     catalog = TrackingCatalog()

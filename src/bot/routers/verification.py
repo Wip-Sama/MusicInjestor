@@ -50,7 +50,7 @@ from src.core.models import (
     TrackMetadata,
     UserAccount,
 )
-from src.core.organizer import LibraryOrganizer
+from src.core.organizer import LibraryOrganizer, is_synced_lyrics_text
 from src.core.pipeline import IngestionPipeline
 from src.core.queue import IngestionQueueWorker
 from src.core.rbac import has_permission
@@ -747,7 +747,7 @@ async def handle_verification_callback(
         raw_lyr = proposal.get("new_lyrics")
         if isinstance(raw_lyr, str) and raw_lyr.strip():
             cleaned_lyr = raw_lyr.strip()
-            is_synced = "[" in cleaned_lyr and "]" in cleaned_lyr
+            is_synced = is_synced_lyrics_text(cleaned_lyr)
             lyrics_obj = LyricsData(
                 synced_lyrics=cleaned_lyr if is_synced else None,
                 plain_lyrics=None if is_synced else cleaned_lyr,

@@ -12,6 +12,25 @@
 
 ## Completed Milestones
 
+### M35: Synchronized Lyrics Preference & Robust In-File Audio Tag Embedding
+- **LRCLIB Search Client Synchronized Priority (`src/core/lyrics.py`):**
+  - Updated `LrclibLyricsClient.fetch_lyrics` to prioritize synchronized lyrics over plain text:
+    - If `/get` with `album_name` returns plain lyrics (`syncedLyrics: null`), it retains it as `plain_fallback` and queries `/get` without `album_name` and `/search` to find a synchronized version.
+    - Updated `_score_search_hit` to boost synchronized lyrics (`synced_bonus = 0.35`). Separated candidate evaluation in `/search` into `best_synced_hit` and `best_plain_hit`, returning the synchronized match whenever available and only falling back to plain lyrics if no synced lyrics exist on LRCLIB.
+- **In-File Audio Tag Lyrics Embedding (`src/core/organizer.py`):**
+  - **ID3 / MP3 / WAV (`_write_id3_lyrics_frames`):** Purges all pre-existing stale `USLT` frames (including different languages/descriptions like `USLT:desc:XXX`), `SYLT`, `ULT`, and case-insensitive `TXXX` lyrics frames (`LYRICS`, `SYNCEDLYRICS`, `UNSYNCEDLYRICS`). When synced lyrics are available, writes timestamped LRC into `USLT` (enabling synced playback on players like Symfonium, Poweramp, and Samsung Music), `TXXX:SYNCEDLYRICS`, `TXXX:LYRICS`, and parsed `(text, timestamp_ms)` into `SYLT` frames.
+  - **FLAC / Ogg / Opus (`_embed_lyrics_into_audio_sync`):** Embeds synced timestamped lyrics into `raw_audio["LYRICS"]` and `raw_audio["SYNCEDLYRICS"]`, preserving plain lyrics in `UNSYNCEDLYRICS` if available.
+  - **MP4 / M4A / ALAC (`_embed_lyrics_into_audio_sync`):** Writes timestamped lyrics to `\xa9lyr` and `----:com.apple.iTunes:SYNCEDLYRICS`.
+  - **Pre-Existing Synced Lyrics Retention (`finalize_track`, `relocate_and_retag_track`):** Prevents downgrading of pre-existing embedded synced lyrics when external providers return only plain lyrics or none.
+  - **Extraction from Audio Tags (`_extract_existing_lyrics_sync`):** Added support for reading M4A `----:com.apple.iTunes:SYNCEDLYRICS`, iterating all `USLT` frames to find timestamped LRC, and reconstructing LRC from ID3 `SYLT` frames.
+- **Accurate Synced Classification & Re-Search Targeting:**
+  - Fixed `_scan_track_file_sync` and `bulk_research.py` where tracks with plain lyrics were falsely flagged as `has_synced_lyrics = True`.
+  - Added reusable `is_synced_lyrics_text` helper in `src/core/organizer.py` verifying standard `[mm:ss.xx]` timestamp tags (preventing bracketed text like `[Verse 1]` from being misclassified as synced lyrics).
+  - Updated Telegram Bot (`songs.py`, `verification.py`) and Web Mini App (`webapp_server.py`) to accurately report and preserve `has_synced_lyrics`.
+- **Quality Assurance & Verification:**
+  - Added dedicated unit test suite `tests/unit/test_synced_lyrics_preference.py` covering LRCLIB synced priority, ID3 frame wiping, FLAC/M4A tag embedding, SYLT reconstruction, non-downgrading retention, and bulk re-search upgrade.
+  - Verified 100% pass across all 271 tests in the repository, with zero warnings on `uv run ty check`, and clean `uv run ruff check` and `uv run ruff format`.
+
 ### M34: Release Radar & Artist Notification System (Deezer Integration & 30s Previews)
 - **Architecture & Provider Selection:**
   - Evaluated external metadata & streaming data providers (Deezer, Spotify, MusicBrainz, ListenBrainz, Last.fm). Selected Deezer as the primary Release Radar provider because it requires no API key, incurs zero additional third-party dependencies (driven natively by `httpx`), and serves direct 30-second MP3 audio preview streams out of the box.

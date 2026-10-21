@@ -45,6 +45,8 @@ class CatalogRepositoryPort(Protocol):
         metadata: TrackMetadata,
         fingerprint: AudioFingerprint,
         library_path: Path,
+        uploaded_by: int = 0,
+        has_synced_lyrics: bool = False,
     ) -> None:
         """Persist a newly ingested track and its fingerprint into the library catalog."""
         ...
@@ -482,6 +484,10 @@ class StorageOrganizerPort(Protocol):
         lyrics: LyricsData | None = None,
     ) -> Path:
         """Write metadata tags, optionally write `.lrc` sidecar, and move track to target storage."""
+        ...
+
+    async def read_track_lyrics(self, audio_path: Path) -> LyricsData | None:
+        """Read lyrics from `.lrc` sidecar or embedded audio tags."""
         ...
 
 
