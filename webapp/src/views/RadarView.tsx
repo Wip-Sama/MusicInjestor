@@ -11,11 +11,17 @@ import {
   Disc,
   Users,
   Music,
+  ChevronDown,
+  ChevronUp,
+  Copy,
+  Check,
+  ListMusic,
+  Globe,
 } from 'lucide-react';
 import { Card, Subheadline, Caption, Spinner } from '@telegram-apps/telegram-ui';
 import { useAudioPlayer } from '../context/AudioPlayerContext';
 import { apiFetch } from '../lib/auth';
-import { RadarRelease, RadarFollowItem, TrackItem } from '../types/music';
+import { RadarRelease, RadarFollowItem, TrackItem, ReleaseTrackPreview } from '../types/music';
 
 interface RadarViewProps {
   profile?: unknown;
@@ -60,6 +66,13 @@ export const RadarView: React.FC<RadarViewProps> = () => {
   const [activeTab, setActiveTab] = useState<'releases' | 'follows'>('releases');
   const [followsList, setFollowsList] = useState<RadarFollowItem[]>([]);
   const [loadingFollows, setLoadingFollows] = useState<boolean>(false);
+  const [expandedReleaseId, setExpandedReleaseId] = useState<string | null>(null);
+  const [releaseTracksCache, setReleaseTracksCache] = useState<Record<string, ReleaseTrackPreview[]>>({});
+  const [loadingTracksFor, setLoadingTracksFor] = useState<string | null>(null);
+  const [copiedReleaseId, setCopiedReleaseId] = useState<string | null>(null);
+  const [platformMenuReleaseId, setPlatformMenuReleaseId] = useState<string | null>(null);
+  const longPressTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isLongPressTriggeredRef = React.useRef<boolean>(false);
 
   const loadReleases = useCallback(() => {
     setLoading(true);
@@ -160,6 +173,85 @@ export const RadarView: React.FC<RadarViewProps> = () => {
     } finally {
       setRefreshing(false);
     }
+  };
+
+  const handleToggleExpandAlbum = async (releaseId: string) => {
+    if (expandedReleaseId === releaseId) {
+      setExpandedReleaseId(null);
+      return;
+    }
+    setExpandedReleaseId(releaseId);
+    if (!releaseTracksCache[releaseId]) {
+      setLoadingTracksFor(releaseId);
+      try {
+        const res = await apiFetch(`/api/v1/app/radar/release/${releaseId}/tracks`);
+        if (res.ok) {
+          const data = await res.json();
+          setReleaseTracksCache((prev) => ({ ...prev, [releaseId]: data.tracks || [] }));
+        }
+      } catch (err) {
+        console.error('Failed to load album tracks:', err);
+      } finally {
+        setLoadingTracksFor(null);
+      }
+    }
+  };
+
+  const handlePlayAlbumTrackPreview = (
+    release: RadarRelease,
+    track: ReleaseTrackPreview,
+    allTracks: ReleaseTrackPreview[]
+  ) => {
+    if (!track.preview_url) return;
+    const trackQueue: TrackItem[] = allTracks.map((t) => ({
+      id: `${release.id}:${t.track_id}`,
+      title: `${t.title} (Preview)`,
+      artist: release.artist_name,
+      album: release.title,
+      year: release.release_date ? parseInt(release.release_date.slice(0, 4)) : null,
+      track_number: t.track_position,
+      duration_seconds: t.duration_seconds || 30,
+      has_synced_lyrics: false,
+      format: 'mp3',
+      audio_url: t.preview_url,
+      cover_url: release.cover_url || '',
+    }));
+
+    const currentItem = trackQueue.find((t) => t.id === `${release.id}:${track.track_id}`) || trackQueue[0];
+    if (currentTrack?.id === currentItem.id) {
+      togglePlay();
+      return;
+    }
+    playTrack(currentItem, trackQueue);
+  };
+
+  const startLongPress = (id: string, url: string) => {
+    isLongPressTriggeredRef.current = false;
+    if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
+    longPressTimerRef.current = setTimeout(() => {
+      isLongPressTriggeredRef.current = true;
+      navigator.clipboard.writeText(url).catch(() => {});
+      triggerNotificationHaptic('success');
+      setCopiedReleaseId(id);
+      setTimeout(() => setCopiedReleaseId(null), 2000);
+    }, 450);
+  };
+
+  const cancelLongPress = () => {
+    if (longPressTimerRef.current) {
+      clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  };
+
+  const handleLinkButtonClick = (e: React.MouseEvent, _id: string, url: string) => {
+    if (isLongPressTriggeredRef.current) {
+      e.preventDefault();
+      e.stopPropagation();
+      isLongPressTriggeredRef.current = false;
+      return;
+    }
+    window.open(url, '_blank', 'noreferrer');
   };
 
   const handlePlayPreview = (release: RadarRelease) => {
@@ -504,7 +596,32 @@ export const RadarView: React.FC<RadarViewProps> = () => {
                       <span>{rel.is_followed ? 'Following' : 'Follow Artist'}</span>
                     </button>
 
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      {/* Album multi-track expand toggle */}
+                      {(rel.track_count > 1 || rel.release_type === 'album') && (
+                        <button
+                          onClick={() => handleToggleExpandAlbum(rel.id)}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '4px',
+                            padding: '5px 8px',
+                            borderRadius: '6px',
+                            border: 'none',
+                            backgroundColor: expandedReleaseId === rel.id ? 'rgba(10, 132, 255, 0.2)' : 'rgba(255, 255, 255, 0.08)',
+                            color: expandedReleaseId === rel.id ? 'var(--tg-theme-button-color, #0a84ff)' : 'var(--tg-theme-text-color, #fff)',
+                            cursor: 'pointer',
+                            fontSize: '12px',
+                            fontWeight: 600,
+                          }}
+                        >
+                          <ListMusic size={13} />
+                          <span>Tracks ({rel.track_count})</span>
+                          {expandedReleaseId === rel.id ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                        </button>
+                      )}
+
+                      {/* Single preview button */}
                       {rel.preview_url && (
                         <button
                           onClick={() => handlePlayPreview(rel)}
@@ -523,33 +640,249 @@ export const RadarView: React.FC<RadarViewProps> = () => {
                           }}
                         >
                           {isCurrentlyPlaying ? <Pause size={13} /> : <Play size={13} />}
-                          <span>{isCurrentlyPlaying ? 'Pause' : '30s Preview'}</span>
+                          <span>{isCurrentlyPlaying ? 'Pause' : 'Preview'}</span>
                         </button>
                       )}
 
-                      {rel.external_url && (
-                        <a
-                          href={rel.external_url}
-                          target="_blank"
-                          rel="noreferrer"
-                          style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: '4px',
-                            padding: '5px 8px',
-                            borderRadius: '6px',
-                            backgroundColor: 'rgba(255, 255, 255, 0.08)',
-                            color: 'var(--tg-theme-subtitle-text-color, #8e8e93)',
-                            textDecoration: 'none',
-                            fontSize: '12px',
-                          }}
-                        >
-                          <ExternalLink size={13} />
-                          <span>Deezer</span>
-                        </a>
-                      )}
+                      {/* Primary Platform Link with tap to open & long-press to copy */}
+                      {(() => {
+                        const primUrl = rel.primary_url || rel.external_url;
+                        if (!primUrl) return null;
+                        const platKey = (rel.primary_platform || 'deezer').toLowerCase();
+                        const platLabels: Record<string, string> = {
+                          deezer: 'Deezer',
+                          tidal: 'Tidal',
+                          qobuz: 'Qobuz',
+                          spotify: 'Spotify',
+                          apple_music: 'Apple Music',
+                        };
+                        const platLabel = platLabels[platKey] || platKey.toUpperCase();
+                        const isCopied = copiedReleaseId === rel.id;
+
+                        return (
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '3px', position: 'relative' }}>
+                            <button
+                              onMouseDown={() => startLongPress(rel.id, primUrl)}
+                              onMouseUp={cancelLongPress}
+                              onMouseLeave={cancelLongPress}
+                              onTouchStart={() => startLongPress(rel.id, primUrl)}
+                              onTouchEnd={cancelLongPress}
+                              onClick={(e) => handleLinkButtonClick(e, rel.id, primUrl)}
+                              style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '4px',
+                                padding: '5px 8px',
+                                borderRadius: '6px',
+                                border: 'none',
+                                backgroundColor: isCopied ? '#30d15822' : 'rgba(255, 255, 255, 0.08)',
+                                color: isCopied ? '#30d158' : 'var(--tg-theme-subtitle-text-color, #8e8e93)',
+                                cursor: 'pointer',
+                                fontSize: '12px',
+                              }}
+                              title="Tap to open • Long press to copy link"
+                            >
+                              {isCopied ? <Check size={13} color="#30d158" /> : <ExternalLink size={13} />}
+                              <span>{isCopied ? 'Copied!' : platLabel}</span>
+                            </button>
+
+                            {/* Dropdown toggle for other streaming platform options */}
+                            {rel.external_links && Object.keys(rel.external_links).length > 1 && (
+                              <button
+                                onClick={() => setPlatformMenuReleaseId(platformMenuReleaseId === rel.id ? null : rel.id)}
+                                style={{
+                                  padding: '5px 6px',
+                                  borderRadius: '6px',
+                                  border: 'none',
+                                  backgroundColor: platformMenuReleaseId === rel.id ? 'rgba(10, 132, 255, 0.2)' : 'rgba(255, 255, 255, 0.08)',
+                                  color: platformMenuReleaseId === rel.id ? 'var(--tg-theme-button-color, #0a84ff)' : 'var(--tg-theme-subtitle-text-color, #8e8e93)',
+                                  cursor: 'pointer',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'center',
+                                }}
+                                title="Other platforms"
+                              >
+                                <Globe size={13} />
+                              </button>
+                            )}
+                          </div>
+                        );
+                      })()}
                     </div>
                   </div>
+
+                  {/* Other Platforms Menu Dropdown */}
+                  {platformMenuReleaseId === rel.id && rel.external_links && (
+                    <div
+                      style={{
+                        padding: '10px',
+                        borderRadius: '8px',
+                        backgroundColor: 'var(--tg-theme-bg-color, #1c1c1e)',
+                        border: '1px solid rgba(255, 255, 255, 0.08)',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '6px',
+                      }}
+                    >
+                      <div style={{ fontSize: '11px', fontWeight: 700, color: '#8e8e93', textTransform: 'uppercase' }}>
+                        All Streaming Links:
+                      </div>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: '6px' }}>
+                        {Object.entries(rel.external_links).map(([plat, url]) => {
+                          const labels: Record<string, { name: string; icon: string }> = {
+                            deezer: { name: 'Deezer', icon: '🌐' },
+                            tidal: { name: 'Tidal', icon: '🌊' },
+                            qobuz: { name: 'Qobuz', icon: '🎼' },
+                            spotify: { name: 'Spotify', icon: '🟢' },
+                            apple_music: { name: 'Apple Music', icon: '🍎' },
+                          };
+                          const info = labels[plat] || { name: plat, icon: '🌐' };
+                          const isCopied = copiedReleaseId === `${rel.id}:${plat}`;
+                          return (
+                            <div
+                              key={plat}
+                              style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'space-between',
+                                padding: '5px 8px',
+                                borderRadius: '6px',
+                                backgroundColor: 'rgba(255, 255, 255, 0.06)',
+                              }}
+                            >
+                              <a
+                                href={url}
+                                target="_blank"
+                                rel="noreferrer"
+                                style={{
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: '4px',
+                                  color: '#fff',
+                                  textDecoration: 'none',
+                                  fontSize: '12px',
+                                  fontWeight: 500,
+                                }}
+                              >
+                                <span>{info.icon}</span>
+                                <span>{info.name}</span>
+                              </a>
+                              <button
+                                onClick={() => {
+                                  navigator.clipboard.writeText(url).catch(() => {});
+                                  triggerNotificationHaptic('success');
+                                  setCopiedReleaseId(`${rel.id}:${plat}`);
+                                  setTimeout(() => setCopiedReleaseId(null), 2000);
+                                }}
+                                style={{
+                                  background: 'none',
+                                  border: 'none',
+                                  padding: '2px',
+                                  color: isCopied ? '#30d158' : '#8e8e93',
+                                  cursor: 'pointer',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                }}
+                                title="Copy link"
+                              >
+                                {isCopied ? <Check size={12} /> : <Copy size={12} />}
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Expandable Album Tracklist Previews */}
+                  {expandedReleaseId === rel.id && (
+                    <div
+                      style={{
+                        padding: '10px',
+                        borderRadius: '8px',
+                        backgroundColor: 'var(--tg-theme-bg-color, #1c1c1e)',
+                        border: '1px solid rgba(255, 255, 255, 0.08)',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '6px',
+                      }}
+                    >
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <span style={{ fontSize: '11px', fontWeight: 700, color: '#8e8e93', textTransform: 'uppercase' }}>
+                          Album Track Previews ({rel.track_count} tracks)
+                        </span>
+                      </div>
+
+                      {loadingTracksFor === rel.id ? (
+                        <div style={{ display: 'flex', justifyContent: 'center', padding: '12px' }}>
+                          <Spinner size="s" />
+                        </div>
+                      ) : !releaseTracksCache[rel.id] || releaseTracksCache[rel.id].length === 0 ? (
+                        <div style={{ fontSize: '12px', color: '#8e8e93', padding: '6px 0', textAlign: 'center' }}>
+                          No track previews available from provider.
+                        </div>
+                      ) : (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                          {releaseTracksCache[rel.id].map((trk) => {
+                            const isTrkPlaying = currentTrack?.id === `${rel.id}:${trk.track_id}` && isPlaying;
+                            return (
+                              <div
+                                key={trk.track_id}
+                                style={{
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'space-between',
+                                  padding: '6px 8px',
+                                  borderRadius: '6px',
+                                  backgroundColor: isTrkPlaying ? 'rgba(10, 132, 255, 0.15)' : 'rgba(255, 255, 255, 0.04)',
+                                }}
+                              >
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+                                  <button
+                                    onClick={() => handlePlayAlbumTrackPreview(rel, trk, releaseTracksCache[rel.id] || [])}
+                                    style={{
+                                      width: '24px',
+                                      height: '24px',
+                                      borderRadius: '50%',
+                                      border: 'none',
+                                      backgroundColor: isTrkPlaying ? 'var(--tg-theme-button-color, #0a84ff)' : 'rgba(255, 255, 255, 0.12)',
+                                      color: '#fff',
+                                      display: 'flex',
+                                      alignItems: 'center',
+                                      justifyContent: 'center',
+                                      cursor: 'pointer',
+                                      flexShrink: 0,
+                                    }}
+                                  >
+                                    {isTrkPlaying ? <Pause size={11} /> : <Play size={11} style={{ marginLeft: '1px' }} />}
+                                  </button>
+                                  <span style={{ fontSize: '11px', color: '#8e8e93', width: '18px' }}>
+                                    {trk.track_position}.
+                                  </span>
+                                  <span
+                                    style={{
+                                      fontSize: '12px',
+                                      fontWeight: 500,
+                                      color: isTrkPlaying ? 'var(--tg-theme-button-color, #0a84ff)' : '#fff',
+                                      whiteSpace: 'nowrap',
+                                      overflow: 'hidden',
+                                      textOverflow: 'ellipsis',
+                                    }}
+                                  >
+                                    {trk.title}
+                                  </span>
+                                </div>
+                                <span style={{ fontSize: '11px', color: '#8e8e93', flexShrink: 0 }}>
+                                  30s
+                                </span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </Card>
               );
             })}

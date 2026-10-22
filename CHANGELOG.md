@@ -12,6 +12,29 @@
 
 ## Completed Milestones
 
+### M36: Multi-Track Album Previews, External Streaming Platform Ordering & Clipboard Link Copy
+- **Zero Test Warnings & 100% Radar Test Coverage:**
+  - Eliminated 40 `aiohttp.web.NotAppKeyWarning` warnings by introducing typed `EVENT_BUS_KEY: web.AppKey[QueueEventBus] = web.AppKey("event_bus", QueueEventBus)` in `src/bot/webapp_server.py`.
+  - Eliminated 6 unawaited mock coroutine `RuntimeWarning`s in `src/core/pipeline.py` (with `inspect.iscoroutine` guard) and unit tests (`test_pipeline_coverage.py`, `test_songs_router_coverage.py`, `test_user_preferences_and_settings.py`).
+  - Achieved 100% line coverage for `src/core/radar.py` by adding targeted edge-case unit tests in `tests/unit/test_release_radar.py`.
+- **Multi-Track Album Previews (`ReleaseTrackPreview`):**
+  - Added `ReleaseTrackPreview` pure domain dataclass in `src/core/models.py`.
+  - Extended `ReleaseRadarProviderPort` and `DeezerReleaseProvider` with `get_release_track_previews` fetching full tracklists and preview MP3 stream URLs from Deezer API (`/album/{id}/tracks`).
+  - Added `ReleaseRadarService.get_release_track_previews` caching tracklists and streaming individual track audio preview bytes.
+  - Added REST endpoint `GET /api/v1/app/radar/release/{release_id}/tracks` in `src/bot/webapp_server.py`.
+  - Added album tracklist preview keyboard and navigation in Telegram Bot (`build_album_tracks_keyboard`, `RadarCallback(action="album_tracks")`, `RadarCallback(action="preview_track")`).
+  - Added expandable multi-track accordion and queue playback for album drops in Web Mini App (`webapp/src/views/RadarView.tsx`).
+- **External Streaming Platform Priority & Clipboard Copy:**
+  - Created pure domain module `src/core/platform_links.py` generating search and direct links for Deezer, Tidal, Qobuz, Spotify, and Apple Music (`build_streaming_platform_links`, `resolve_primary_platform_link`, `parse_platform_order_input`).
+  - Added `streaming_platform_order` persistence to `UserPreferences` in `src/core/models.py` and SQLite `user_settings` table in `src/db/models.py`, `src/db/database.py`, and `src/db/repository.py`.
+  - **Telegram Bot Integration:**
+    - Added user settings screen in `src/bot/routers/commands.py` (`🎛️ Platform Links Priority`) allowing reordering via space-separated numbers (e.g. `2 3 1` for Tidal → Qobuz → Deezer).
+    - Attached native `CopyTextButton` inline buttons (`📋 Copy Link`) across radar release previews and track cards using Bot API 7.8+ copy mechanism.
+    - Added multi-platform selection keyboard (`build_other_platforms_keyboard`) displaying direct links and copy buttons across all 5 platforms.
+  - **Web Mini App Integration (`webapp/`):**
+    - Updated `SettingsModal.tsx` with reorderable platform priority section supporting drag-and-drop and up/down movement buttons.
+    - Updated `RadarView.tsx` with primary platform button supporting tap to open and long-press (>= 450ms) with Telegram haptics to copy direct link to clipboard, alongside an expandable dropdown for all platforms.
+
 ### M35: Synchronized Lyrics Preference & Robust In-File Audio Tag Embedding
 - **LRCLIB Search Client Synchronized Priority (`src/core/lyrics.py`):**
   - Updated `LrclibLyricsClient.fetch_lyrics` to prioritize synchronized lyrics over plain text:

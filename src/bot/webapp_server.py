@@ -43,6 +43,11 @@ from src.core.models import (
 )
 from src.core.organizer import LibraryOrganizer, is_synced_lyrics_text
 from src.core.pipeline import IngestionPipeline
+from src.core.platform_links import (
+    build_streaming_platform_links,
+    parse_platform_order_input,
+    resolve_primary_platform_link,
+)
 from src.core.ports import GovernanceRepositoryPort
 from src.core.queue import IngestionQueueWorker
 from src.core.radar import ReleaseRadarService
@@ -80,6 +85,9 @@ class QueueEventBus:
         for sub in list(self._subscribers):
             with contextlib.suppress(Exception):
                 sub.put_nowait(event)
+
+
+EVENT_BUS_KEY: web.AppKey[QueueEventBus] = web.AppKey("event_bus", QueueEventBus)
 
 
 def serialize_bulk_progress(progress: BulkResearchProgress | None) -> dict[str, Any] | None:
@@ -351,7 +359,7 @@ def build_webapp_api(
     """Construct an `aiohttp.web.Application` exposing TMA API, OIDC callbacks, and static assets."""
     app = web.Application()
     bus = event_bus or QueueEventBus()
-    app["event_bus"] = bus
+    app[EVENT_BUS_KEY] = bus
 
     if queue_worker is not None:
 
@@ -483,6 +491,7 @@ def build_webapp_api(
                 "stream_bitrate": prefs.stream_bitrate,
                 "auto_lyrics_search": prefs.auto_lyrics_search,
                 "theme": prefs.theme,
+                "streaming_platform_order": prefs.streaming_platform_order,
             }
         )
 
@@ -523,12 +532,20 @@ def build_webapp_api(
         if new_theme not in {"system", "dark", "light"}:
             new_theme = current.theme
 
+        raw_platform_order = str(body.get("streaming_platform_order") or "").strip()
+        if raw_platform_order:
+            ordered_platforms = parse_platform_order_input(raw_platform_order.replace(",", " "))
+            new_platform_order = ",".join(ordered_platforms)
+        else:
+            new_platform_order = current.streaming_platform_order
+
         updated = UserPreferences(
             telegram_id=user.telegram_id,
             stream_format=new_format,
             stream_bitrate=new_bitrate,
             auto_lyrics_search=new_auto_lyrics,
             theme=new_theme,
+            streaming_platform_order=new_platform_order,
         )
         saved = await governance_service._repo.update_user_preferences(updated)
         return web.json_response(
@@ -538,6 +555,7 @@ def build_webapp_api(
                 "stream_bitrate": saved.stream_bitrate,
                 "auto_lyrics_search": saved.auto_lyrics_search,
                 "theme": saved.theme,
+                "streaming_platform_order": saved.streaming_platform_order,
             }
         )
 
@@ -1757,7 +1775,7 @@ def build_webapp_api(
             auto_apply=auto_apply,
         )
 
-        bus: QueueEventBus | None = app.get("event_bus")
+        bus: QueueEventBus | None = app.get(EVENT_BUS_KEY)
 
         async def _on_bulk_progress(current: int, total: int, label: str, status: str) -> None:
             active_info = get_active_bulk_research()
@@ -2879,6 +2897,7 @@ def build_webapp_api(
 
         user_follows = await catalog_repository.list_user_followed_artists(user.telegram_id)
         followed_names = {f.artist_name.strip().lower() for f in user_follows}
+        prefs = await catalog_repository.get_user_preferences(user.telegram_id)
 
         if followed_only:
             filtered = [r for r in all_releases if r.artist_name.strip().lower() in followed_names]
@@ -2888,23 +2907,29 @@ def build_webapp_api(
             total_items = len(all_releases)
             items_slice = all_releases
 
-        serialized = [
-            {
-                "id": r.id,
-                "artist_name": r.artist_name,
-                "title": r.title,
-                "release_type": r.release_type,
-                "release_date": r.release_date,
-                "cover_url": r.cover_url,
-                "preview_url": r.preview_url,
-                "external_url": r.external_url,
-                "provider": r.provider,
-                "track_count": r.track_count,
-                "in_library": r.in_library,
-                "is_followed": r.artist_name.strip().lower() in followed_names,
-            }
-            for r in items_slice
-        ]
+        serialized = []
+        for r in items_slice:
+            links = build_streaming_platform_links(r.artist_name, r.title, deezer_url=r.external_url)
+            prim_plat, prim_url = resolve_primary_platform_link(links, prefs.platform_priority_list)
+            serialized.append(
+                {
+                    "id": r.id,
+                    "artist_name": r.artist_name,
+                    "title": r.title,
+                    "release_type": r.release_type,
+                    "release_date": r.release_date,
+                    "cover_url": r.cover_url,
+                    "preview_url": r.preview_url,
+                    "external_url": prim_url or r.external_url,
+                    "provider": r.provider,
+                    "track_count": r.track_count,
+                    "in_library": r.in_library,
+                    "is_followed": r.artist_name.strip().lower() in followed_names,
+                    "external_links": links,
+                    "primary_platform": prim_plat,
+                    "primary_url": prim_url,
+                }
+            )
 
         return web.json_response(
             {
@@ -2984,7 +3009,38 @@ def build_webapp_api(
         discovered, _ = await radar_service.scan_monitored_artists()
         return web.json_response({"ok": True, "discovered_count": len(discovered)})
 
+    async def handle_get_radar_release_tracks(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        release_id = request.match_info.get("release_id", "").strip()
+        if not release_id or catalog_repository is None:
+            return web.json_response({"error": "Service unavailable"}, status=503)
+
+        release = await catalog_repository.get_discovered_release(release_id)
+        if not release:
+            return web.json_response({"error": "Release not found"}, status=404)
+
+        tracks = []
+        if radar_service is not None:
+            tracks = await radar_service.get_release_track_previews(release.provider_release_id)
+
+        serialized = [
+            {
+                "track_id": trk.track_id,
+                "title": trk.title,
+                "preview_url": trk.preview_url,
+                "duration_seconds": trk.duration_seconds,
+                "track_position": trk.track_position,
+            }
+            for trk in tracks
+        ]
+        return web.json_response({"release_id": release_id, "tracks": serialized})
+
     app.router.add_get("/api/v1/app/radar/releases", handle_get_radar_releases)
+    app.router.add_get("/api/v1/app/radar/release/{release_id}/tracks", handle_get_radar_release_tracks)
     app.router.add_get("/api/v1/app/radar/follows", handle_get_radar_follows)
     app.router.add_post("/api/v1/app/radar/follow", handle_post_radar_follow)
     app.router.add_post("/api/v1/app/radar/scan", handle_post_radar_scan)

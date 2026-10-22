@@ -34,6 +34,14 @@ export interface ParsedLrcLine {
   text: string;
 }
 
+export interface ReleaseTrackPreview {
+  track_id: string;
+  title: string;
+  preview_url: string;
+  duration_seconds: number;
+  track_position: number;
+}
+
 export interface RadarRelease {
   id: string;
   artist_name: string;
@@ -47,6 +55,9 @@ export interface RadarRelease {
   track_count: number;
   in_library: boolean;
   is_followed: boolean;
+  external_links?: Record<string, string>;
+  primary_platform?: string;
+  primary_url?: string;
 }
 
 export interface RadarFollowItem {
@@ -55,5 +66,3 @@ export interface RadarFollowItem {
   notify_telegram: boolean;
   created_at: string;
 }
-
-

@@ -123,3 +123,80 @@ async def test_radar_service_get_preview_audio_bytes() -> None:
     assert await service.get_preview_audio_bytes("") is None
     mock_resp.status_code = 404
     assert await service.get_preview_audio_bytes("https://notfound.mp3") is None
+
+
+@pytest.mark.anyio
+async def test_radar_service_extra_coverage() -> None:
+    """Cover remaining branches: invalid date parsing, default http client, error handling, follow checks."""
+    # 1. Invalid date in is_release_recent
+    assert is_release_recent("not-a-valid-date-xxxx") is True
+
+    mock_provider = AsyncMock(spec=ReleaseRadarProviderPort)
+    mock_repo = AsyncMock(spec=GovernanceRepositoryPort)
+    service = ReleaseRadarService(provider=mock_provider, repository=mock_repo)
+
+    # 2. _get_http_client default branch
+    client = await service._get_http_client()
+    assert isinstance(client, httpx.AsyncClient)
+    await client.aclose()
+
+    # 3. follow_artist error branch when provider fails
+    mock_provider.search_artist.return_value = "p_123"
+    mock_provider.get_artist_recent_releases.side_effect = RuntimeError("Network flap")
+    mock_repo.follow_artist.return_value = FollowedArtist(id=1, telegram_id=10, artist_name="ArtistErr")
+    followed = await service.follow_artist(10, "ArtistErr")
+    assert followed.artist_name == "ArtistErr"
+
+    # 4. list_user_follows and is_artist_followed
+    mock_repo.list_user_followed_artists.return_value = [followed]
+    mock_repo.is_artist_followed.return_value = True
+    assert len(await service.list_user_follows(10)) == 1
+    assert await service.is_artist_followed(10, "ArtistErr") is True
+
+    # 5. scan_monitored_artists when list is empty
+    mock_repo.list_all_monitored_artists.return_value = []
+    assert await service.scan_monitored_artists() == ([], [])
+
+    # 6. scan_monitored_artists with no provider_id, no recent releases, and exception
+    mock_repo.list_all_monitored_artists.return_value = ["NoID", "NoRecent", "Boom"]
+
+    async def mock_search(name: str):
+        if name == "NoID":
+            return None
+        return f"id_{name}"
+
+    mock_provider.search_artist.side_effect = mock_search
+
+    async def mock_get_releases(provider_artist_id: str, artist_name: str, limit: int = 10):
+        if artist_name == "Boom":
+            raise RuntimeError("Deezer down")
+        if artist_name == "NoRecent":
+            return [
+                DiscoveredRelease(
+                    id="old_1",
+                    artist_name="NoRecent",
+                    title="Old Hit",
+                    release_type="album",
+                    release_date="2010-01-01",
+                )
+            ]
+        return []
+
+    mock_provider.get_artist_recent_releases.side_effect = mock_get_releases
+
+    disc, notifs = await service.scan_monitored_artists(max_days_back=30)
+    assert disc == []
+    assert notifs == []
+
+    # 7. get_preview_audio_bytes with network exception and short bytes
+    mock_http = AsyncMock(spec=httpx.AsyncClient)
+    mock_http.get.side_effect = httpx.ConnectTimeout("timeout")
+    service_err = ReleaseRadarService(provider=mock_provider, repository=mock_repo, http_client=mock_http)
+    assert await service_err.get_preview_audio_bytes("https://valid.url/preview.mp3") is None
+
+    mock_resp_short = MagicMock(spec=httpx.Response)
+    mock_resp_short.status_code = 200
+    mock_resp_short.content = b"too short"
+    mock_http.get.side_effect = None
+    mock_http.get.return_value = mock_resp_short
+    assert await service_err.get_preview_audio_bytes("https://valid.url/preview.mp3") is None

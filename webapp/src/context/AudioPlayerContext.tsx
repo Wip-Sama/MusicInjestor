@@ -21,6 +21,7 @@ interface AudioPlayerContextType {
   streamFormat: string;
   streamBitrate: number;
   autoLyricsSearch: boolean;
+  streamingPlatformOrder: string;
   followedArtists: Set<string>;
   isArtistFollowed: (artistName: string) => boolean;
   toggleFollowArtist: (artistName: string) => Promise<boolean>;
@@ -41,6 +42,7 @@ interface AudioPlayerContextType {
     stream_format?: string;
     stream_bitrate?: number;
     auto_lyrics_search?: boolean;
+    streaming_platform_order?: string;
   }) => Promise<void>;
 }
 
@@ -66,6 +68,7 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
   const [streamFormat, setStreamFormat] = useState<string>('auto');
   const [streamBitrate, setStreamBitrate] = useState<number>(192);
   const [autoLyricsSearch, setAutoLyricsSearch] = useState<boolean>(true);
+  const [streamingPlatformOrder, setStreamingPlatformOrder] = useState<string>('deezer,tidal,qobuz,spotify,apple_music');
 
   const [followedArtists, setFollowedArtists] = useState<Set<string>>(new Set());
 
@@ -165,6 +168,9 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (data.stream_bitrate) setStreamBitrate(data.stream_bitrate);
         if (typeof data.auto_lyrics_search === 'boolean') {
           setAutoLyricsSearch(data.auto_lyrics_search);
+        }
+        if (data.streaming_platform_order) {
+          setStreamingPlatformOrder(data.streaming_platform_order);
         }
       })
       .catch((err) => {
@@ -342,15 +348,18 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
     stream_format?: string;
     stream_bitrate?: number;
     auto_lyrics_search?: boolean;
+    streaming_platform_order?: string;
   }) => {
     triggerHaptic();
     const newFormat = settings.stream_format ?? streamFormat;
     const newBitrate = settings.stream_bitrate ?? streamBitrate;
     const newLyrics = settings.auto_lyrics_search ?? autoLyricsSearch;
+    const newOrder = settings.streaming_platform_order ?? streamingPlatformOrder;
 
     setStreamFormat(newFormat);
     setStreamBitrate(newBitrate);
     setAutoLyricsSearch(newLyrics);
+    setStreamingPlatformOrder(newOrder);
 
     try {
       await apiFetch('/api/v1/app/user/settings', {
@@ -360,6 +369,7 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
           stream_format: newFormat,
           stream_bitrate: newBitrate,
           auto_lyrics_search: newLyrics,
+          streaming_platform_order: newOrder,
         }),
       });
     } catch (err) {
@@ -500,6 +510,7 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
         streamFormat,
         streamBitrate,
         autoLyricsSearch,
+        streamingPlatformOrder,
         followedArtists,
         isArtistFollowed,
         toggleFollowArtist,

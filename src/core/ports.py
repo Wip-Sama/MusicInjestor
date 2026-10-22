@@ -17,6 +17,7 @@ from src.core.models import (
     LyricsData,
     MetadataCandidate,
     ReleaseNotification,
+    ReleaseTrackPreview,
     TagCorrectionRequest,
     TagCorrectionStatus,
     TrackMetadata,
@@ -513,4 +514,11 @@ class ReleaseRadarProviderPort(Protocol):
         provider_release_id: str,
     ) -> tuple[str, str] | None:
         """Fetch `(track_title, preview_mp3_url)` for a release."""
+        ...
+
+    async def get_release_track_previews(
+        self,
+        provider_release_id: str,
+    ) -> list[ReleaseTrackPreview]:
+        """Fetch all available 30-second audio preview tracks for an album or release."""
         ...

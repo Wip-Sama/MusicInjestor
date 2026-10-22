@@ -28,10 +28,12 @@ from src.bot.keyboards.admin import (
 )
 from src.bot.keyboards.songs import (
     SettingsCallback,
+    build_cancel_platform_order_keyboard,
     build_song_action_keyboard,
     build_user_settings_keyboard,
 )
 from src.bot.routers.songs import format_song_detail_card
+from src.bot.states import SettingsStates
 from src.bot.ui import (
     ack_callback,
     format_screen,
@@ -51,6 +53,7 @@ from src.core.models import JobState, Permission, UserAccount, UserPreferences, 
 from src.core.oidc import AuthentikOidcService
 from src.core.organizer import LibraryOrganizer
 from src.core.pipeline import IngestionPipeline
+from src.core.platform_links import PLATFORM_LABELS, parse_platform_order_input
 from src.core.ports import CatalogRepositoryPort, GovernanceRepositoryPort
 from src.core.queue import IngestionQueueWorker
 from src.core.rbac import GovernanceService, has_permission
@@ -304,6 +307,8 @@ def _render_settings_card(prefs: UserPreferences, current_user: UserAccount | No
         f"• <b>Transcoding Bitrate:</b> <code>{prefs.stream_bitrate} kbps</code>",
         f"• <b>Auto-Search Online Lyrics:</b> <code>{lyr_status}</code>",
     ]
+    platform_names = [PLATFORM_LABELS.get(p, p.title()) for p in prefs.platform_priority_list]
+    context.append(f"• <b>Platform Links Priority:</b> <code>{' → '.join(platform_names)}</code>")
     if current_user is not None and current_user.is_oidc_linked:
         ident = html.escape(current_user.authentik_username or current_user.authentik_sub or "")
         context.append(f"• <b>Authentik SSO:</b> Linked as <code>{ident}</code>")
@@ -711,6 +716,49 @@ async def handle_settings_callback(
         await ack_callback(callback)
         prefs.auto_lyrics_search = not prefs.auto_lyrics_search
         await governance_repository.update_user_preferences(prefs)
+    elif callback_data.action == "platforms":
+        await ack_callback(callback)
+        if state is not None:
+            await state.set_state(SettingsStates.waiting_for_platform_order)
+        priority_lines = [
+            f"<b>{idx + 1}.</b> {PLATFORM_LABELS.get(p, p.title())}"
+            for idx, p in enumerate(prefs.platform_priority_list)
+        ]
+        prompt = format_screen(
+            title="🎛️ Platform Links Priority",
+            context_lines=[
+                (
+                    "Customize the order in which music platform links are presented "
+                    "for new releases and track previews."
+                ),
+                "",
+                "<b>Current Priority:</b>",
+                *priority_lines,
+                "",
+                "<b>Platform Numbers:</b>",
+                "<b>1</b> — Deezer",
+                "<b>2</b> — Tidal",
+                "<b>3</b> — Qobuz",
+                "<b>4</b> — Spotify",
+                "<b>5</b> — Apple Music",
+                "",
+                (
+                    "Please send the numbers in your desired order separated by spaces "
+                    "(e.g. <code>2 3 1</code> for Tidal → Qobuz → Deezer, or <code>2 1 3 4 5</code>)."
+                ),
+            ],
+            footer_lines=["<i>🧭 Home › Settings › Platform Links</i>"],
+        )
+        await safe_edit_text(
+            callback.message,
+            prompt,
+            reply_markup=build_cancel_platform_order_keyboard(),
+        )
+        return
+    elif callback_data.action == "cancel":
+        await ack_callback(callback)
+        if state is not None:
+            await reset_fsm_state(state)
     elif callback_data.action == "oidc" and callback_data.value == "disconnect":
         if governance_service is not None and current_user.is_oidc_linked:
             current_user = await governance_service.unlink_user_oidc(
@@ -1263,4 +1311,33 @@ async def handle_cmd_app(
             footer_lines=["<i>Tap below to open the application.</i>"],
         ),
         reply_markup=builder.as_markup(),
+    )
+
+
+@commands_router.message(SettingsStates.waiting_for_platform_order)
+async def handle_platform_order_text_input(
+    message: Message,
+    current_user: UserAccount | None = None,
+    governance_repository: GovernanceRepositoryPort | None = None,
+    state: FSMContext | None = None,
+) -> None:
+    """Process user numerical/spaced input for ordering external streaming platform priority."""
+    if current_user is None or governance_repository is None or not message.text:
+        return
+
+    text = message.text.strip()
+    new_order = parse_platform_order_input(text)
+    prefs = await governance_repository.get_user_preferences(current_user.telegram_id)
+    prefs.streaming_platform_order = ",".join(new_order)
+    await governance_repository.update_user_preferences(prefs)
+    if state is not None:
+        await reset_fsm_state(state)
+
+    platform_names = [PLATFORM_LABELS.get(p, p.title()) for p in new_order]
+    confirm_text = f"✅ Platform priority updated: <b>{' → '.join(platform_names)}</b>"
+    await message.answer(confirm_text, parse_mode="HTML")
+    await safe_answer(
+        message,
+        _render_settings_card(prefs, current_user),
+        reply_markup=build_user_settings_keyboard(prefs, user=current_user),
     )

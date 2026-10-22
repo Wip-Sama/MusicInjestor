@@ -1,11 +1,17 @@
 """Inline keyboard builders and callback models for the `/radar` Release Radar menu."""
 
 from aiogram.filters.callback_data import CallbackData
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from aiogram.types import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from src.bot.keyboards.admin import append_escape_row
-from src.core.models import DiscoveredRelease, FollowedArtist
+from src.core.models import DiscoveredRelease, FollowedArtist, ReleaseTrackPreview
+from src.core.platform_links import (
+    PLATFORM_ICONS,
+    PLATFORM_LABELS,
+    build_streaming_platform_links,
+    resolve_primary_platform_link,
+)
 
 
 class RadarCallback(CallbackData, prefix="radar", sep="~"):
@@ -87,19 +93,28 @@ def build_release_detail_keyboard(
     is_followed: bool,
     web_app_url: str | None = None,
     page: int = 1,
+    platform_priority: list[str] | None = None,
 ) -> InlineKeyboardMarkup:
     """Build action buttons for inspecting a single discovered release."""
     builder = InlineKeyboardBuilder()
 
-    # Audio preview button if preview_url is present or can be fetched
-    builder.row(
+    # Audio preview button
+    preview_row: list[InlineKeyboardButton] = [
         InlineKeyboardButton(
-            text="🎧 Listen 30s Audio Preview",
+            text="🎧 30s Audio Preview",
             callback_data=RadarCallback(action="preview", target_id=release.id, page=page).pack(),
         )
-    )
+    ]
+    if release.track_count > 1 or release.release_type == "album":
+        preview_row.append(
+            InlineKeyboardButton(
+                text=f"💿 Album Tracks ({release.track_count})",
+                callback_data=RadarCallback(action="album_tracks", target_id=release.id, page=page).pack(),
+            )
+        )
+    builder.row(*preview_row)
 
-    # Follow/Unfollow toggle for this release's artist
+    # Follow/Unfollow toggle
     follow_text = f"🔕 Unfollow {release.artist_name}" if is_followed else f"🔔 Follow {release.artist_name}"
     follow_action = "unfollow" if is_followed else "follow"
     builder.row(
@@ -109,24 +124,41 @@ def build_release_detail_keyboard(
         )
     )
 
-    # Provider and Web App links
-    row_links: list[InlineKeyboardButton] = []
-    if release.external_url and release.external_url.startswith("http"):
-        row_links.append(
-            InlineKeyboardButton(
-                text="🌐 Open Deezer Link",
-                url=release.external_url,
-            )
+    # Primary streaming link & Copy link
+    links = build_streaming_platform_links(
+        release.artist_name, release.title, deezer_url=release.external_url
+    )
+    primary_plat, primary_url = resolve_primary_platform_link(links, platform_priority or ["deezer"])
+    plat_icon = PLATFORM_ICONS.get(primary_plat, "🌐")
+    plat_label = PLATFORM_LABELS.get(primary_plat, primary_plat.title())
+
+    link_row: list[InlineKeyboardButton] = [
+        InlineKeyboardButton(
+            text=f"{plat_icon} Open {plat_label}",
+            url=primary_url,
+        ),
+        InlineKeyboardButton(
+            text="📋 Copy Link",
+            copy_text=CopyTextButton(text=primary_url),
+        ),
+    ]
+    builder.row(*link_row)
+
+    # Other platform links & Mini App
+    extra_row: list[InlineKeyboardButton] = [
+        InlineKeyboardButton(
+            text="🔗 Other Platforms",
+            callback_data=RadarCallback(action="other_links", target_id=release.id, page=page).pack(),
         )
+    ]
     if web_app_url and web_app_url.strip():
-        row_links.append(
+        extra_row.append(
             InlineKeyboardButton(
                 text="🎵 Mini App",
                 web_app=WebAppInfo(url=f"{web_app_url.strip().rstrip('/')}?startapp=release_{release.id}"),
             )
         )
-    if row_links:
-        builder.row(*row_links)
+    builder.row(*extra_row)
 
     builder.row(
         InlineKeyboardButton(
@@ -140,32 +172,47 @@ def build_release_detail_keyboard(
 def build_preview_audio_keyboard(
     release: DiscoveredRelease,
     web_app_url: str | None = None,
+    platform_priority: list[str] | None = None,
 ) -> InlineKeyboardMarkup:
     """Build inline buttons attached to the 30-second audio preview file sent in chat."""
     builder = InlineKeyboardBuilder()
-    row: list[InlineKeyboardButton] = []
-    if release.external_url and release.external_url.startswith("http"):
-        row.append(
+    links = build_streaming_platform_links(
+        release.artist_name, release.title, deezer_url=release.external_url
+    )
+    primary_plat, primary_url = resolve_primary_platform_link(links, platform_priority or ["deezer"])
+    plat_icon = PLATFORM_ICONS.get(primary_plat, "🌐")
+    plat_label = PLATFORM_LABELS.get(primary_plat, primary_plat.title())
+
+    row: list[InlineKeyboardButton] = [
+        InlineKeyboardButton(
+            text=f"{plat_icon} Open {plat_label}",
+            url=primary_url,
+        ),
+        InlineKeyboardButton(
+            text="📋 Copy Link",
+            copy_text=CopyTextButton(text=primary_url),
+        ),
+    ]
+    builder.row(*row)
+
+    sec_row: list[InlineKeyboardButton] = []
+    if release.track_count > 1 or release.release_type == "album":
+        sec_row.append(
             InlineKeyboardButton(
-                text="🌐 Open Provider",
-                url=release.external_url,
+                text="💿 Album Tracks",
+                callback_data=RadarCallback(action="album_tracks", target_id=release.id).pack(),
             )
         )
     if web_app_url and web_app_url.strip():
-        row.append(
+        sec_row.append(
             InlineKeyboardButton(
-                text="🎵 Open in Mini App",
+                text="🎵 Mini App",
                 web_app=WebAppInfo(url=f"{web_app_url.strip().rstrip('/')}?startapp=release_{release.id}"),
             )
         )
-    if not row:
-        row.append(
-            InlineKeyboardButton(
-                text="📡 Release Radar",
-                callback_data=RadarCallback(action="page", page=1).pack(),
-            )
-        )
-    builder.row(*row)
+    if sec_row:
+        builder.row(*sec_row)
+
     return builder.as_markup()
 
 
@@ -216,6 +263,69 @@ def build_followed_artists_keyboard(
         InlineKeyboardButton(
             text="◀️ Back to Releases",
             callback_data=RadarCallback(action="page", page=1).pack(),
+        )
+    )
+    return builder.as_markup()
+
+
+def build_album_tracks_keyboard(
+    release: DiscoveredRelease,
+    tracks: list[ReleaseTrackPreview],
+    page: int = 1,
+) -> InlineKeyboardMarkup:
+    """Build keyboard allowing user to preview individual tracks from an album release."""
+    builder = InlineKeyboardBuilder()
+
+    for t in tracks[:12]:
+        lbl = f"▶️ {t.track_position}. {t.title}"
+        if len(lbl) > 42:
+            lbl = f"{lbl[:39]}..."
+        builder.row(
+            InlineKeyboardButton(
+                text=lbl,
+                callback_data=RadarCallback(
+                    action="preview_track",
+                    target_id=f"{release.id}:{t.track_id}",
+                    page=page,
+                ).pack(),
+            )
+        )
+
+    builder.row(
+        InlineKeyboardButton(
+            text="◀️ Back to Release Detail",
+            callback_data=RadarCallback(action="view", target_id=release.id, page=page).pack(),
+        )
+    )
+    return builder.as_markup()
+
+
+def build_other_platforms_keyboard(
+    release: DiscoveredRelease,
+    links: dict[str, str],
+    page: int = 1,
+) -> InlineKeyboardMarkup:
+    """Build keyboard displaying links and copy buttons across Deezer, Tidal, Qobuz, Spotify, Apple Music."""
+    builder = InlineKeyboardBuilder()
+
+    for plat, url in links.items():
+        icon = PLATFORM_ICONS.get(plat, "🌐")
+        label = PLATFORM_LABELS.get(plat, plat.title())
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{icon} {label}",
+                url=url,
+            ),
+            InlineKeyboardButton(
+                text="📋 Copy",
+                copy_text=CopyTextButton(text=url),
+            ),
+        )
+
+    builder.row(
+        InlineKeyboardButton(
+            text="◀️ Back to Release Detail",
+            callback_data=RadarCallback(action="view", target_id=release.id, page=page).pack(),
         )
     )
     return builder.as_markup()

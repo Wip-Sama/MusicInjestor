@@ -2,6 +2,7 @@
 
 import contextlib
 import hashlib
+import inspect
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
@@ -122,7 +123,11 @@ def _discover_staged_audio_files(
         get_dir_fn = getattr(extractor, "get_job_scratch_dir", None)
         if callable(get_dir_fn):
             with contextlib.suppress(Exception):
-                candidate_dirs.append(get_dir_fn(job.job_id))
+                res = get_dir_fn(job.job_id)
+                if inspect.iscoroutine(res):
+                    res.close()
+                elif isinstance(res, Path):
+                    candidate_dirs.append(res)
         scratch_root = getattr(extractor, "_scratch_root", None)
         if isinstance(scratch_root, Path):
             candidate_dirs.append(scratch_root / job.job_id)

@@ -8,7 +8,7 @@ from urllib.parse import quote_plus
 
 import httpx
 
-from src.core.models import DiscoveredRelease
+from src.core.models import DiscoveredRelease, ReleaseTrackPreview
 from src.core.ports import ReleaseRadarProviderPort
 
 logger = logging.getLogger(__name__)
@@ -99,6 +99,46 @@ class DeezerReleaseProvider(ReleaseRadarProviderPort):
         except Exception as exc:
             logger.warning("Failed to fetch Deezer preview for album %s: %s", cleaned_id, exc)
             return None
+
+    async def get_release_track_previews(
+        self,
+        provider_release_id: str,
+    ) -> list[ReleaseTrackPreview]:
+        """Retrieve all track previews for the specified Deezer album/single ID."""
+        cleaned_id = provider_release_id.strip()
+        if not cleaned_id:
+            return []
+
+        url = f"{self._base_url}/album/{quote_plus(cleaned_id)}/tracks"
+        try:
+            client = await self._get_client()
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                return []
+
+            payload: dict[str, Any] = resp.json()
+            tracks: list[dict[str, Any]] = payload.get("data", [])
+            results: list[ReleaseTrackPreview] = []
+            for idx, track in enumerate(tracks):
+                preview = str(track.get("preview", "")).strip()
+                title = str(track.get("title", "")).strip()
+                tr_id = str(track.get("id") or idx + 1)
+                pos = int(track.get("track_position") or idx + 1)
+                dur = int(track.get("duration") or 30)
+                if preview and preview.startswith("http"):
+                    results.append(
+                        ReleaseTrackPreview(
+                            track_id=tr_id,
+                            title=title or f"Track {pos}",
+                            preview_url=preview,
+                            duration_seconds=dur,
+                            track_position=pos,
+                        )
+                    )
+            return results
+        except Exception as exc:
+            logger.warning("Failed to fetch Deezer track previews for album %s: %s", cleaned_id, exc)
+            return []
 
     async def get_artist_recent_releases(
         self,

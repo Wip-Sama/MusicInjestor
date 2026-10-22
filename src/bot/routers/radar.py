@@ -11,7 +11,9 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from src.bot.keyboards.radar import (
     RadarCallback,
+    build_album_tracks_keyboard,
     build_followed_artists_keyboard,
+    build_other_platforms_keyboard,
     build_preview_audio_keyboard,
     build_radar_home_keyboard,
     build_release_detail_keyboard,
@@ -20,6 +22,7 @@ from src.bot.ui import ack_callback, format_screen, safe_edit_text
 from src.config.settings import AppSettings
 from src.core.deezer import DeezerReleaseProvider
 from src.core.models import DiscoveredRelease, UserAccount
+from src.core.platform_links import build_streaming_platform_links
 from src.core.ports import GovernanceRepositoryPort
 from src.core.radar import ReleaseRadarService
 
@@ -152,7 +155,7 @@ async def handle_radar_page(
         followed_count=len(user_follows),
         web_app_url=settings.web_app_url,
     )
-    await safe_edit_text(query, card, reply_markup=keyboard)
+    await safe_edit_text(query.message, card, reply_markup=keyboard)
 
 
 @radar_router.callback_query(RadarCallback.filter(F.action == "view"))
@@ -172,6 +175,7 @@ async def handle_radar_view_release(
 
     user_id = current_user.telegram_id if current_user else (query.from_user.id if query.from_user else 0)
     is_followed = await governance_repository.is_artist_followed(user_id, release.artist_name)
+    prefs = await governance_repository.get_user_preferences(user_id)
 
     card = format_release_detail_card(release, is_followed)
     keyboard = build_release_detail_keyboard(
@@ -179,8 +183,9 @@ async def handle_radar_view_release(
         is_followed=is_followed,
         web_app_url=settings.web_app_url,
         page=callback_data.page,
+        platform_priority=prefs.platform_priority_list,
     )
-    await safe_edit_text(query, card, reply_markup=keyboard)
+    await safe_edit_text(query.message, card, reply_markup=keyboard)
 
 
 @radar_router.callback_query(RadarCallback.filter(F.action == "preview"))
@@ -190,6 +195,7 @@ async def handle_radar_preview_audio(
     governance_repository: GovernanceRepositoryPort,
     radar_service: ReleaseRadarService,
     settings: AppSettings,
+    current_user: UserAccount | None = None,
 ) -> None:
     """Download and deliver the 30-second audio snippet directly into the chat."""
     release = await governance_repository.get_discovered_release(callback_data.target_id)
@@ -224,7 +230,13 @@ async def handle_radar_preview_audio(
             f"🎤 <b>{html.escape(release.artist_name)}</b> — <b>{html.escape(release.title)}</b>\n"
             f"📅 Release Date: <code>{html.escape(release.release_date)}</code>"
         )
-        markup = build_preview_audio_keyboard(release, settings.web_app_url)
+        user_id = current_user.telegram_id if current_user else (query.from_user.id if query.from_user else 0)
+        prefs = await governance_repository.get_user_preferences(user_id)
+        markup = build_preview_audio_keyboard(
+            release,
+            settings.web_app_url,
+            platform_priority=prefs.platform_priority_list,
+        )
         try:
             await query.message.answer_audio(
                 audio=input_file,
@@ -270,10 +282,15 @@ async def handle_radar_toggle_follow(
     if rel:
         is_followed = callback_data.action == "follow"
         card = format_release_detail_card(rel, is_followed)
+        prefs = await governance_repository.get_user_preferences(user_id)
         keyboard = build_release_detail_keyboard(
-            rel, is_followed, settings.web_app_url, page=callback_data.page
+            rel,
+            is_followed,
+            settings.web_app_url,
+            page=callback_data.page,
+            platform_priority=prefs.platform_priority_list,
         )
-        await safe_edit_text(query, card, reply_markup=keyboard)
+        await safe_edit_text(query.message, card, reply_markup=keyboard)
 
 
 @radar_router.callback_query(RadarCallback.filter(F.action == "follows_list"))
@@ -308,7 +325,7 @@ async def handle_radar_follows_list(
                 callback_data=RadarCallback(action="page", page=1).pack(),
             )
         )
-        await safe_edit_text(query, card, reply_markup=builder.as_markup())
+        await safe_edit_text(query.message, card, reply_markup=builder.as_markup())
         return
 
     card = format_screen(
@@ -320,7 +337,7 @@ async def handle_radar_follows_list(
         footer_lines=[f"Total: {len(user_follows)} artists • <i>Radar Follows</i>"],
     )
     keyboard = build_followed_artists_keyboard(user_follows, page=callback_data.page)
-    await safe_edit_text(query, card, reply_markup=keyboard)
+    await safe_edit_text(query.message, card, reply_markup=keyboard)
 
 
 @radar_router.callback_query(RadarCallback.filter(F.action == "unfollow_list"))
@@ -347,7 +364,7 @@ async def handle_radar_unfollow_from_list(
         footer_lines=[f"Total: {len(user_follows)} artists • <i>Radar Follows</i>"],
     )
     keyboard = build_followed_artists_keyboard(user_follows, page=callback_data.page)
-    await safe_edit_text(query, card, reply_markup=keyboard)
+    await safe_edit_text(query.message, card, reply_markup=keyboard)
 
 
 @radar_router.callback_query(RadarCallback.filter(F.action == "refresh"))
@@ -385,4 +402,142 @@ async def handle_radar_refresh(
         followed_count=len(user_follows),
         web_app_url=settings.web_app_url,
     )
-    await safe_edit_text(query, card, reply_markup=keyboard)
+    await safe_edit_text(query.message, card, reply_markup=keyboard)
+
+
+@radar_router.callback_query(RadarCallback.filter(F.action == "album_tracks"))
+async def handle_radar_album_tracks(
+    query: CallbackQuery,
+    callback_data: RadarCallback,
+    governance_repository: GovernanceRepositoryPort,
+    radar_service: ReleaseRadarService,
+) -> None:
+    """Display paginated tracklist allowing user to preview individual tracks from an album."""
+    await ack_callback(query, "🎵 Loading album tracks...")
+    release = await governance_repository.get_discovered_release(callback_data.target_id)
+    if not release:
+        await ack_callback(query, "Release not found.", show_alert=True)
+        return
+
+    tracks = await radar_service.get_release_track_previews(release.provider_release_id)
+    if not tracks:
+        await ack_callback(query, "No preview tracks available for this album.", show_alert=True)
+        return
+
+    card = format_screen(
+        title=f"💿 {release.title} — Track Previews",
+        context_lines=[
+            f"🎤 <b>Artist:</b> <code>{html.escape(release.artist_name)}</code>",
+            f"💿 <b>Album:</b> <b>{html.escape(release.title)}</b>",
+            f"🎵 <b>Available Previews:</b> {len(tracks)} tracks",
+            "",
+            "<i>Select any track below to listen to its 30-second audio preview directly in chat!</i>",
+        ],
+        footer_lines=[f"Album Previews ({len(tracks)} tracks) • <i>📡 Release Radar</i>"],
+    )
+    keyboard = build_album_tracks_keyboard(release, tracks, page=callback_data.page)
+    await safe_edit_text(query.message, card, reply_markup=keyboard)
+
+
+@radar_router.callback_query(RadarCallback.filter(F.action == "preview_track"))
+async def handle_radar_preview_individual_track(
+    query: CallbackQuery,
+    callback_data: RadarCallback,
+    current_user: UserAccount | None,
+    governance_repository: GovernanceRepositoryPort,
+    radar_service: ReleaseRadarService,
+    settings: AppSettings,
+) -> None:
+    """Download and deliver a specific album track 30-second preview snippet."""
+    raw_target = callback_data.target_id
+    if ":" in raw_target:
+        parts = raw_target.rsplit(":", 1)
+        rel_id = parts[0]
+        track_id = parts[1]
+    else:
+        rel_id = raw_target
+        track_id = ""
+
+    release = await governance_repository.get_discovered_release(rel_id)
+    if not release:
+        await ack_callback(query, "Release not found.", show_alert=True)
+        return
+
+    tracks = await radar_service.get_release_track_previews(release.provider_release_id)
+    target_track = next((t for t in tracks if str(t.track_id) == str(track_id)), None)
+    preview_url = target_track.preview_url if target_track else release.preview_url
+    track_title = target_track.title if target_track else release.title
+
+    if not preview_url:
+        await ack_callback(query, "Preview not available for this track.", show_alert=True)
+        return
+
+    await ack_callback(query, f"🎧 Loading preview: {track_title}...")
+    audio_bytes = await radar_service.get_preview_audio_bytes(preview_url)
+    if not audio_bytes:
+        await ack_callback(query, "Failed to download preview audio stream.", show_alert=True)
+        return
+
+    user_id = current_user.telegram_id if current_user else (query.from_user.id if query.from_user else 0)
+    prefs = await governance_repository.get_user_preferences(user_id)
+
+    if query.message is not None:
+        clean_track = "".join(c for c in track_title if c.isalnum() or c in " _-")[:20]
+        filename = f"{release.artist_name[:15]}_{clean_track}_preview.mp3"
+        input_file = BufferedInputFile(audio_bytes, filename=filename)
+        caption = (
+            f"🎧 <b>30-Second Audio Preview</b>\n"
+            f"🎵 <b>{html.escape(track_title)}</b>\n"
+            f"🎤 <b>{html.escape(release.artist_name)}</b> — 💿 <i>{html.escape(release.title)}</i>\n"
+            f"📅 Release Date: <code>{html.escape(release.release_date)}</code>"
+        )
+        markup = build_preview_audio_keyboard(
+            release,
+            settings.web_app_url,
+            platform_priority=prefs.platform_priority_list,
+        )
+        try:
+            await query.message.answer_audio(
+                audio=input_file,
+                title=f"{track_title} (Preview)",
+                performer=release.artist_name,
+                caption=caption,
+                reply_markup=markup,
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            logger.warning("Could not send individual audio preview: %s", exc)
+            await ack_callback(query, "Could not send audio file to Telegram.", show_alert=True)
+
+
+@radar_router.callback_query(RadarCallback.filter(F.action == "other_links"))
+async def handle_radar_other_links(
+    query: CallbackQuery,
+    callback_data: RadarCallback,
+    governance_repository: GovernanceRepositoryPort,
+) -> None:
+    """Show external links and copy buttons across all streaming platforms."""
+    await ack_callback(query)
+    release = await governance_repository.get_discovered_release(callback_data.target_id)
+    if not release:
+        await ack_callback(query, "Release not found.", show_alert=True)
+        return
+
+    links = build_streaming_platform_links(
+        release.artist_name, release.title, deezer_url=release.external_url
+    )
+    card = format_screen(
+        title=f"🌐 Streaming Links — {release.title}",
+        context_lines=[
+            f"🎤 <b>Artist:</b> <code>{html.escape(release.artist_name)}</code>",
+            f"💿 <b>Release:</b> <b>{html.escape(release.title)}</b>",
+            "",
+            (
+                "Tap any platform to open in web/app, or tap <b>📋 Copy</b> "
+                "to copy its direct URL to your clipboard:"
+            ),
+        ],
+        footer_lines=["External Streaming Links • <i>📡 Release Radar</i>"],
+    )
+    keyboard = build_other_platforms_keyboard(release, links, page=callback_data.page)
+    await safe_edit_text(query.message, card, reply_markup=keyboard)

@@ -690,7 +690,8 @@ class SqliteCatalogRepository:
         async with self._db.connect() as conn:
             cursor = await conn.execute(
                 """
-                SELECT telegram_id, stream_format, stream_bitrate, auto_lyrics_search, theme
+                SELECT telegram_id, stream_format, stream_bitrate, auto_lyrics_search,
+                       theme, streaming_platform_order
                 FROM user_settings
                 WHERE telegram_id = ?
                 """,
@@ -704,13 +705,15 @@ class SqliteCatalogRepository:
                     stream_bitrate=int(row[2]),
                     auto_lyrics_search=bool(row[3]),
                     theme=str(row[4]),
+                    streaming_platform_order=str(row[5] or "deezer,tidal,qobuz,spotify,apple_music"),
                 )
             default_prefs = UserPreferences(telegram_id=telegram_id)
             await conn.execute(
                 """
                 INSERT OR IGNORE INTO user_settings (
-                    telegram_id, stream_format, stream_bitrate, auto_lyrics_search, theme
-                ) VALUES (?, ?, ?, ?, ?)
+                    telegram_id, stream_format, stream_bitrate, auto_lyrics_search,
+                    theme, streaming_platform_order
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     telegram_id,
@@ -718,6 +721,7 @@ class SqliteCatalogRepository:
                     default_prefs.stream_bitrate,
                     1 if default_prefs.auto_lyrics_search else 0,
                     default_prefs.theme,
+                    default_prefs.streaming_platform_order,
                 ),
             )
             await conn.commit()
@@ -729,13 +733,15 @@ class SqliteCatalogRepository:
             await conn.execute(
                 """
                 INSERT INTO user_settings (
-                    telegram_id, stream_format, stream_bitrate, auto_lyrics_search, theme, updated_at
-                ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    telegram_id, stream_format, stream_bitrate, auto_lyrics_search,
+                    theme, streaming_platform_order, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(telegram_id) DO UPDATE SET
                     stream_format = excluded.stream_format,
                     stream_bitrate = excluded.stream_bitrate,
                     auto_lyrics_search = excluded.auto_lyrics_search,
                     theme = excluded.theme,
+                    streaming_platform_order = excluded.streaming_platform_order,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
@@ -744,6 +750,7 @@ class SqliteCatalogRepository:
                     preferences.stream_bitrate,
                     1 if preferences.auto_lyrics_search else 0,
                     preferences.theme,
+                    preferences.streaming_platform_order,
                 ),
             )
             await conn.commit()

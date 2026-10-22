@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from src.bot.webapp_server import BotWebServer
-from src.core.models import DiscoveredRelease, UserAccount, UserRole
+from src.core.models import DiscoveredRelease, ReleaseTrackPreview, UserAccount, UserRole
 from src.core.radar import ReleaseRadarService
 from src.core.rbac import GovernanceService
 from src.db.database import SqliteDatabaseManager
@@ -40,6 +40,15 @@ async def test_webapp_radar_endpoints(tmp_path: Path) -> None:
 
     mock_radar = AsyncMock(spec=ReleaseRadarService)
     mock_radar.scan_monitored_artists.return_value = ([rel], [])
+    mock_radar.get_release_track_previews.return_value = [
+        ReleaseTrackPreview(
+            track_id="t_1",
+            title="Michi Teyu Ku",
+            preview_url="https://preview.mp3",
+            duration_seconds=30,
+            track_position=1,
+        )
+    ]
 
     gov_service = GovernanceService(repository=repo)
     server = BotWebServer(
@@ -79,6 +88,20 @@ async def test_webapp_radar_endpoints(tmp_path: Path) -> None:
             assert len(data["items"]) == 1
             assert data["items"][0]["title"] == "Michi Teyu Ku"
             assert data["items"][0]["is_followed"] is False
+            assert "external_links" in data["items"][0]
+            assert "primary_platform" in data["items"][0]
+            assert "primary_url" in data["items"][0]
+
+            # 1b. GET /api/v1/app/radar/release/deezer:999/tracks
+            tracks_resp = await client.get(
+                f"{base_url}/api/v1/app/radar/release/deezer:999/tracks", headers=headers
+            )
+            assert tracks_resp.status_code == 200
+            t_data = tracks_resp.json()
+            assert t_data["release_id"] == "deezer:999"
+            assert len(t_data["tracks"]) == 1
+            assert t_data["tracks"][0]["title"] == "Michi Teyu Ku"
+            assert t_data["tracks"][0]["preview_url"] == "https://preview.mp3"
 
             # 2. POST /api/v1/app/radar/follow
             follow_resp = await client.post(

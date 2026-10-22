@@ -133,3 +133,51 @@ async def test_deezer_get_artist_recent_releases() -> None:
     assert releases[0].preview_url == "https://cdn.deezer.com/preview901.mp3"
     assert releases[1].id == "deezer:902"
     assert releases[1].track_count == 10
+
+
+@pytest.mark.anyio
+async def test_deezer_get_release_track_previews() -> None:
+    """Test retrieving all tracks with preview snippets for an album."""
+    mock_client = AsyncMock(spec=httpx.AsyncClient)
+    mock_resp = MagicMock(spec=httpx.Response)
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "data": [
+            {
+                "id": 1001,
+                "title": "Track One",
+                "preview": "https://cdn.deezer.com/t1.mp3",
+                "track_position": 1,
+                "duration": 30,
+            },
+            {"id": 1002, "title": "Track Two", "preview": "", "track_position": 2, "duration": 30},
+            {
+                "id": 1003,
+                "title": "Track Three",
+                "preview": "https://cdn.deezer.com/t3.mp3",
+                "track_position": 3,
+                "duration": 30,
+            },
+        ]
+    }
+    mock_client.get.return_value = mock_resp
+
+    provider = DeezerReleaseProvider(client=mock_client)
+    tracks = await provider.get_release_track_previews("55555")
+    assert len(tracks) == 2
+    assert tracks[0].track_id == "1001"
+    assert tracks[0].title == "Track One"
+    assert tracks[0].preview_url == "https://cdn.deezer.com/t1.mp3"
+    assert tracks[1].track_id == "1003"
+    assert tracks[1].title == "Track Three"
+
+    # Empty id
+    assert await provider.get_release_track_previews("") == []
+
+    # Non-200
+    mock_resp.status_code = 500
+    assert await provider.get_release_track_previews("55555") == []
+
+    # Exception
+    mock_client.get.side_effect = RuntimeError("network failed")
+    assert await provider.get_release_track_previews("55555") == []

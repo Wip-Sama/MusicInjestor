@@ -1,5 +1,5 @@
 import React from 'react';
-import { X, Sliders, Music, CheckCircle2, Shield } from 'lucide-react';
+import { X, Sliders, Music, CheckCircle2, Shield, ChevronUp, ChevronDown, GripVertical } from 'lucide-react';
 import { useAudioPlayer } from '../../context/AudioPlayerContext';
 import { UserProfile } from '../../lib/auth';
 
@@ -14,8 +14,57 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, p
     streamFormat,
     streamBitrate,
     autoLyricsSearch,
+    streamingPlatformOrder,
     updateUserSettings,
   } = useAudioPlayer();
+  const [draggedIdx, setDraggedIdx] = React.useState<number | null>(null);
+
+  const ALL_PLATFORMS: Record<string, { label: string; icon: string }> = {
+    deezer: { label: 'Deezer', icon: '🌐' },
+    tidal: { label: 'Tidal', icon: '🌊' },
+    qobuz: { label: 'Qobuz', icon: '🎼' },
+    spotify: { label: 'Spotify', icon: '🟢' },
+    apple_music: { label: 'Apple Music', icon: '🍎' },
+  };
+
+  const getOrderedPlatforms = () => {
+    const raw = (streamingPlatformOrder || 'deezer,tidal,qobuz,spotify,apple_music')
+      .split(',')
+      .map((p) => p.trim().toLowerCase())
+      .filter((p) => ALL_PLATFORMS[p]);
+    const seen = new Set(raw);
+    for (const p of Object.keys(ALL_PLATFORMS)) {
+      if (!seen.has(p)) raw.push(p);
+    }
+    return raw;
+  };
+
+  const handleMovePlatform = (index: number, direction: 'up' | 'down') => {
+    const list = [...getOrderedPlatforms()];
+    const targetIndex = direction === 'up' ? index - 1 : index + 1;
+    if (targetIndex < 0 || targetIndex >= list.length) return;
+    const temp = list[index];
+    list[index] = list[targetIndex];
+    list[targetIndex] = temp;
+    updateUserSettings({ streaming_platform_order: list.join(',') });
+  };
+
+  const handleDragStart = (idx: number) => {
+    setDraggedIdx(idx);
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+  };
+
+  const handleDrop = (dropIdx: number) => {
+    if (draggedIdx === null || draggedIdx === dropIdx) return;
+    const list = [...getOrderedPlatforms()];
+    const [draggedItem] = list.splice(draggedIdx, 1);
+    list.splice(dropIdx, 0, draggedItem);
+    setDraggedIdx(null);
+    updateUserSettings({ streaming_platform_order: list.join(',') });
+  };
 
   if (!isOpen) return null;
 
@@ -256,6 +305,118 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, p
                   cursor: 'pointer',
                 }}
               />
+            </div>
+          </div>
+
+                    {/* Section: Platform Link Priority */}
+          <div>
+            <div
+              style={{
+                fontSize: '13px',
+                fontWeight: 700,
+                textTransform: 'uppercase',
+                color: 'var(--tg-theme-subtitle-text-color, #8e8e93)',
+                letterSpacing: '0.5px',
+                marginBottom: '4px',
+              }}
+            >
+              Platform Links Priority
+            </div>
+            <div style={{ fontSize: '11px', color: 'var(--tg-theme-subtitle-text-color, #8e8e93)', marginBottom: '10px' }}>
+              Drag or use arrows to choose which music service is prioritized for new release drops &amp; previews.
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+              {getOrderedPlatforms().map((platKey, idx, arr) => {
+                const info = ALL_PLATFORMS[platKey] || { label: platKey, icon: '🌐' };
+                const isFirst = idx === 0;
+                const isLast = idx === arr.length - 1;
+                return (
+                  <div
+                    key={platKey}
+                    draggable
+                    onDragStart={() => handleDragStart(idx)}
+                    onDragOver={handleDragOver}
+                    onDrop={() => handleDrop(idx)}
+                    style={{
+                      padding: '8px 12px',
+                      borderRadius: '10px',
+                      backgroundColor: 'var(--tg-theme-secondary-bg-color, #2c2c2e)',
+                      border: isFirst ? '1.5px solid var(--tg-theme-button-color, #0a84ff)' : '1px solid rgba(255, 255, 255, 0.08)',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      cursor: 'grab',
+                      opacity: draggedIdx === idx ? 0.4 : 1,
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                      <GripVertical size={14} color="var(--tg-theme-subtitle-text-color, #8e8e93)" />
+                      <span style={{ fontSize: '16px' }}>{info.icon}</span>
+                      <div>
+                        <span style={{ fontSize: '13px', fontWeight: 600, color: 'var(--tg-theme-text-color, #fff)' }}>
+                          {info.label}
+                        </span>
+                        {isFirst && (
+                          <span
+                            style={{
+                              marginLeft: '8px',
+                              fontSize: '10px',
+                              fontWeight: 700,
+                              backgroundColor: '#0a84ff22',
+                              color: 'var(--tg-theme-button-color, #0a84ff)',
+                              padding: '2px 6px',
+                              borderRadius: '4px',
+                              textTransform: 'uppercase',
+                            }}
+                          >
+                            Primary
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                      <button
+                        type="button"
+                        disabled={isFirst}
+                        onClick={() => handleMovePlatform(idx, 'up')}
+                        style={{
+                          background: 'rgba(255, 255, 255, 0.08)',
+                          border: 'none',
+                          borderRadius: '6px',
+                          padding: '4px',
+                          color: isFirst ? 'rgba(255, 255, 255, 0.2)' : 'var(--tg-theme-text-color, #fff)',
+                          cursor: isFirst ? 'default' : 'pointer',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                        }}
+                      >
+                        <ChevronUp size={14} />
+                      </button>
+                      <button
+                        type="button"
+                        disabled={isLast}
+                        onClick={() => handleMovePlatform(idx, 'down')}
+                        style={{
+                          background: 'rgba(255, 255, 255, 0.08)',
+                          border: 'none',
+                          borderRadius: '6px',
+                          padding: '4px',
+                          color: isLast ? 'rgba(255, 255, 255, 0.2)' : 'var(--tg-theme-text-color, #fff)',
+                          cursor: isLast ? 'default' : 'pointer',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                        }}
+                      >
+                        <ChevronDown size={14} />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           </div>
 

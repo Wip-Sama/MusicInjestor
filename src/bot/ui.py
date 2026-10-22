@@ -161,6 +161,9 @@ async def safe_edit_text(
     if message is None:
         return False
 
+    if isinstance(message, CallbackQuery):
+        message = message.message
+
     try:
         return await _attempt_message_edit(message, text, reply_markup)
     except Exception as exc:

@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 
-from src.core.models import DiscoveredRelease, FollowedArtist, ReleaseNotification
+from src.core.models import DiscoveredRelease, FollowedArtist, ReleaseNotification, ReleaseTrackPreview
 from src.core.ports import GovernanceRepositoryPort, ReleaseRadarProviderPort
 
 logger = logging.getLogger(__name__)
@@ -143,6 +143,13 @@ class ReleaseRadarService:
         )
 
         return discovered_releases, new_notifications
+
+    async def get_release_track_previews(
+        self,
+        provider_release_id: str,
+    ) -> list[ReleaseTrackPreview]:
+        """Fetch all track previews for a release from the provider."""
+        return await self._provider.get_release_track_previews(provider_release_id)
 
     async def get_preview_audio_bytes(self, preview_url: str) -> bytes | None:
         """Download 30-second audio stream bytes for Telegram chat playback."""

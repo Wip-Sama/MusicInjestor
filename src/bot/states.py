@@ -29,3 +29,9 @@ class SongManagementStates(StatesGroup):
     awaiting_research_query = State()
     awaiting_import_payload = State()
     awaiting_dry_run_confirmation = State()
+
+
+class SettingsStates(StatesGroup):
+    """FSM states during user settings customization."""
+
+    waiting_for_platform_order = State()

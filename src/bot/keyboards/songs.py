@@ -653,6 +653,12 @@ def build_user_settings_keyboard(
             callback_data=SettingsCallback(action="lyrics", value="toggle").pack(),
         )
     )
+    builder.row(
+        InlineKeyboardButton(
+            text="🎛️ Platform Links Priority",
+            callback_data=SettingsCallback(action="platforms", value="order").pack(),
+        )
+    )
 
     if user is not None and user.is_oidc_linked:
         builder.row(
@@ -749,5 +755,17 @@ def build_bulk_track_review_keyboard(
         builder,
         back_callback=SongsBulkReviewCallback(action="list", index=0).pack(),
         include_home=True,
+    )
+    return builder.as_markup()
+
+
+def build_cancel_platform_order_keyboard(back_callback: str = "menu:settings") -> InlineKeyboardMarkup:
+    """Build cancel escape keyboard during platform priority numeric input."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="◀️ Cancel",
+            callback_data=SettingsCallback(action="cancel", value="cancel").pack(),
+        )
     )
     return builder.as_markup()

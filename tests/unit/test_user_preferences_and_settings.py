@@ -15,6 +15,7 @@ from src.bot.keyboards.songs import (
 )
 from src.bot.routers.commands import (
     _render_settings_card,
+    handle_platform_order_text_input,
     handle_settings_callback,
     handle_settings_command,
 )
@@ -191,6 +192,43 @@ async def test_bot_settings_command_and_callbacks() -> None:
         actor=linked_user, target_telegram_id=linked_user.telegram_id
     )
 
+    # Callback: platforms prompt
+    state_mock = AsyncMock()
+    cb_data_plat = SettingsCallback(action="platforms", value="order")
+    await handle_settings_callback(
+        cb,
+        cb_data_plat,
+        current_user=user,
+        governance_repository=repo,
+        state=state_mock,
+    )
+    state_mock.set_state.assert_awaited()
+
+    # Callback: cancel platform order
+    cb_data_cancel = SettingsCallback(action="cancel", value="cancel")
+    await handle_settings_callback(
+        cb,
+        cb_data_cancel,
+        current_user=user,
+        governance_repository=repo,
+        state=state_mock,
+    )
+
+    # Message: platform order text input "2 3 1"
+    order_msg = MagicMock(spec=Message)
+    order_msg.text = "2 3 1"
+    order_msg.answer = AsyncMock()
+    await handle_platform_order_text_input(
+        message=order_msg,
+        current_user=user,
+        governance_repository=repo,
+        state=state_mock,
+    )
+    assert prefs.platform_priority_list[0] == "tidal"
+    assert prefs.platform_priority_list[1] == "qobuz"
+    assert prefs.platform_priority_list[2] == "deezer"
+    order_msg.answer.assert_awaited()
+
 
 @pytest.mark.anyio
 async def test_bot_bulk_review_callbacks(tmp_path: Path) -> None:
@@ -221,6 +259,7 @@ async def test_bot_bulk_review_callbacks(tmp_path: Path) -> None:
 
     user = UserAccount(telegram_id=100, display_name="Admin", role=UserRole.ADMIN)
     state = AsyncMock()
+    state.get_data.return_value = {}
 
     # Bulk menu callback
     menu_cb = _make_cb("songs:bulk_menu", user_id=100)

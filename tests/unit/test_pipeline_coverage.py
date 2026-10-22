@@ -1,7 +1,7 @@
 """Targeted coverage tests for IngestionPipeline edge cases and helpers."""
 
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -87,6 +87,7 @@ def test_resolve_staged_audio_paths_branches(tmp_path: Path) -> None:
 async def test_pipeline_job_lifecycle_and_search_candidates(tmp_path: Path) -> None:
     """Verify cancel_job, search_manual_candidates, and duplicate check in complete_custom_ingestion."""
     extractor = AsyncMock()
+    extractor.get_job_scratch_dir = MagicMock(return_value=tmp_path)
     fingerprinter = AsyncMock()
     metadata_svc = AsyncMock()
     lyrics_svc = AsyncMock()
@@ -149,6 +150,7 @@ async def test_pipeline_job_lifecycle_and_search_candidates(tmp_path: Path) -> N
 async def test_pipeline_prepare_for_review(tmp_path: Path) -> None:
     """Verify prepare_for_review stages candidates and sets confidence score."""
     extractor = AsyncMock()
+    extractor.get_job_scratch_dir = MagicMock(return_value=tmp_path)
     fingerprinter = AsyncMock()
     fingerprinter.fingerprint_audio.return_value = AudioFingerprint(duration_seconds=120, fingerprint="FP1")
     metadata_svc = AsyncMock()

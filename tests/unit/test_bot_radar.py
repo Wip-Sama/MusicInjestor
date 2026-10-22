@@ -7,7 +7,9 @@ from aiogram.types import CallbackQuery, Message, User
 
 from src.bot.keyboards.radar import (
     RadarCallback,
+    build_album_tracks_keyboard,
     build_followed_artists_keyboard,
+    build_other_platforms_keyboard,
     build_preview_audio_keyboard,
     build_radar_home_keyboard,
     build_release_detail_keyboard,
@@ -16,12 +18,15 @@ from src.bot.routers.radar import (
     format_radar_home_card,
     format_release_detail_card,
     handle_cmd_radar,
+    handle_radar_album_tracks,
+    handle_radar_other_links,
     handle_radar_preview_audio,
+    handle_radar_preview_individual_track,
     handle_radar_toggle_follow,
     handle_radar_view_release,
 )
 from src.config.settings import AppSettings
-from src.core.models import DiscoveredRelease, FollowedArtist, UserAccount, UserRole
+from src.core.models import DiscoveredRelease, FollowedArtist, ReleaseTrackPreview, UserAccount, UserRole
 from src.core.ports import GovernanceRepositoryPort
 from src.core.radar import ReleaseRadarService
 
@@ -174,3 +179,88 @@ async def test_handle_radar_toggle_follow() -> None:
         settings=settings,
     )
     mock_radar.unfollow_artist.assert_awaited_once_with(1001, "Ado")
+
+
+@pytest.mark.anyio
+async def test_handle_radar_album_tracks_and_other_platforms() -> None:
+    """Test viewing album tracks, listening to a track preview, and viewing other platform links."""
+    query = MagicMock(spec=CallbackQuery)
+    query.from_user = User(id=1001, is_bot=False, first_name="Test")
+    query.answer = AsyncMock()
+    msg = MagicMock(spec=Message)
+    msg.answer_audio = AsyncMock()
+    msg.edit_text = AsyncMock()
+    query.message = msg
+    user = UserAccount(telegram_id=1001, display_name="Test User", role=UserRole.LISTENER)
+
+    album_release = DiscoveredRelease(
+        id="deezer:album_99",
+        artist_name="Ado",
+        title="Kyogen",
+        release_type="album",
+        release_date="2022-01-26",
+        track_count=14,
+        provider_release_id="album_99",
+        external_url="https://deezer.com/album/99",
+    )
+    track_previews = [
+        ReleaseTrackPreview(
+            track_id="tr_1",
+            title="Readymade",
+            preview_url="https://cdn.mp3/1",
+            duration_seconds=30,
+            track_position=1,
+        ),
+        ReleaseTrackPreview(
+            track_id="tr_2",
+            title="Odo",
+            preview_url="https://cdn.mp3/2",
+            duration_seconds=30,
+            track_position=2,
+        ),
+    ]
+
+    mock_repo = AsyncMock(spec=GovernanceRepositoryPort)
+    mock_repo.get_discovered_release.return_value = album_release
+    mock_radar = AsyncMock(spec=ReleaseRadarService)
+    mock_radar.get_release_track_previews.return_value = track_previews
+    mock_radar.get_preview_audio_bytes.return_value = b"TRACK_AUDIO_BYTES"
+
+    settings = AppSettings()
+
+    # 1. Test album_tracks keyboard & handler
+    album_kb = build_album_tracks_keyboard(album_release, track_previews)
+    assert len(album_kb.inline_keyboard) >= 3
+
+    await handle_radar_album_tracks(
+        query=query,
+        callback_data=RadarCallback(action="album_tracks", target_id="deezer:album_99"),
+        governance_repository=mock_repo,
+        radar_service=mock_radar,
+    )
+    query.message.edit_text.assert_awaited()
+
+    # 2. Test preview_track handler
+    await handle_radar_preview_individual_track(
+        query=query,
+        callback_data=RadarCallback(action="preview_track", target_id="deezer:album_99:tr_2"),
+        current_user=user,
+        governance_repository=mock_repo,
+        radar_service=mock_radar,
+        settings=settings,
+    )
+    mock_radar.get_preview_audio_bytes.assert_awaited_with("https://cdn.mp3/2")
+    query.message.answer_audio.assert_awaited()
+
+    # 3. Test other_platforms keyboard & handler
+    other_kb = build_other_platforms_keyboard(
+        album_release, {"tidal": "https://tidal.com", "qobuz": "https://qobuz.com"}
+    )
+    assert len(other_kb.inline_keyboard) == 3
+
+    await handle_radar_other_links(
+        query=query,
+        callback_data=RadarCallback(action="other_links", target_id="deezer:album_99"),
+        governance_repository=mock_repo,
+    )
+    query.message.edit_text.assert_awaited()

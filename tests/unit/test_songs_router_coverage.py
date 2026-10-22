@@ -257,6 +257,7 @@ async def test_handle_songs_callback_rescan_and_bulk(tmp_path: Path):
     track = _make_track("trk1", tmp_path)
     gov_repo.list_library_tracks.return_value = [track]
     gov_repo.count_library_tracks.return_value = 1
+    gov_repo.get_library_track.return_value = track
 
     organizer = LibraryOrganizer(tmp_path)
     pipeline._organizer = organizer

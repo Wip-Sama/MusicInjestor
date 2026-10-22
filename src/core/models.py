@@ -167,6 +167,18 @@ class UserPreferences:
     stream_bitrate: int = 128
     auto_lyrics_search: bool = True
     theme: str = "system"
+    streaming_platform_order: str = "deezer,tidal,qobuz,spotify,apple_music"
+
+    @property
+    def platform_priority_list(self) -> list[str]:
+        """Return the prioritized platform list with fallbacks."""
+        valid = {"deezer", "tidal", "qobuz", "spotify", "apple_music"}
+        raw = [p.strip().lower() for p in self.streaming_platform_order.split(",") if p.strip()]
+        cleaned = [p for p in raw if p in valid]
+        for p in ("deezer", "tidal", "qobuz", "spotify", "apple_music"):
+            if p not in cleaned:
+                cleaned.append(p)
+        return cleaned
 
 
 @dataclass(frozen=True, slots=True)
@@ -432,3 +444,14 @@ class ReleaseNotification:
     is_read: bool = False
     delivered_at: datetime | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass(frozen=True, slots=True)
+class ReleaseTrackPreview:
+    """A preview snippet of a specific track within a release."""
+
+    track_id: str
+    title: str
+    preview_url: str
+    duration_seconds: int = 30
+    track_position: int = 1
