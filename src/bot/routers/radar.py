@@ -6,7 +6,7 @@ from math import ceil
 
 from aiogram import F, Router
 from aiogram.filters import Command
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from src.bot.keyboards.radar import (
@@ -21,7 +21,7 @@ from src.bot.keyboards.radar import (
 from src.bot.ui import ack_callback, format_screen, safe_edit_text
 from src.config.settings import AppSettings
 from src.core.deezer import DeezerReleaseProvider
-from src.core.models import DiscoveredRelease, UserAccount
+from src.core.models import DiscoveredRelease, LibraryTrackRecord, UserAccount
 from src.core.platform_links import build_streaming_platform_links
 from src.core.ports import GovernanceRepositoryPort
 from src.core.radar import ReleaseRadarService
@@ -85,6 +85,39 @@ def format_release_detail_card(
         title=f"💿 {release.title}",
         context_lines=context,
         footer_lines=footers,
+    )
+
+
+def format_release_notification_card(
+    release: DiscoveredRelease,
+    lib_track: LibraryTrackRecord | None = None,
+) -> str:
+    """Format the 3-tier HTML notification card for new music drops."""
+    is_in_library = bool(lib_track or release.in_library)
+    lib_badge = (
+        "✅ <b>Available in Library (Full Track)</b>" if is_in_library else "🆕 <i>Not yet in Library</i>"
+    )
+    context = [
+        f"🎤 <b>Artist:</b> <code>{html.escape(release.artist_name)}</code>",
+        f"💿 <b>Release:</b> <b>{html.escape(release.title)}</b>",
+        (
+            f"🏷️ <b>Format:</b> <code>{html.escape(release.release_type.upper())}</code> "
+            f"({release.track_count} tracks)"
+        ),
+        f"📅 <b>Date:</b> <code>{html.escape(release.release_date or 'Unknown')}</code>",
+        f"📊 <b>Status:</b> {lib_badge}",
+        "",
+        (
+            "<i>Tap below to stream the full track in bot or mini app, "
+            "or listen to a 30-second audio preview!</i>"
+            if is_in_library
+            else "<i>Tap below to listen to a 30-second audio preview or view in /radar!</i>"
+        ),
+    ]
+    return format_screen(
+        title="🌟 New Music Drop Alert!",
+        context_lines=context,
+        footer_lines=[f"Provider: <code>{html.escape(release.provider)}</code> • <i>Radar Notification</i>"],
     )
 
 
@@ -176,6 +209,10 @@ async def handle_radar_view_release(
     user_id = current_user.telegram_id if current_user else (query.from_user.id if query.from_user else 0)
     is_followed = await governance_repository.is_artist_followed(user_id, release.artist_name)
     prefs = await governance_repository.get_user_preferences(user_id)
+    lib_tracks = await governance_repository.find_library_tracks_for_release(
+        release.artist_name, release.title
+    )
+    lib_track_id = lib_tracks[0].id if lib_tracks else release.library_track_id
 
     card = format_release_detail_card(release, is_followed)
     keyboard = build_release_detail_keyboard(
@@ -184,8 +221,84 @@ async def handle_radar_view_release(
         web_app_url=settings.web_app_url,
         page=callback_data.page,
         platform_priority=prefs.platform_priority_list,
+        lib_track_id=lib_track_id,
     )
     await safe_edit_text(query.message, card, reply_markup=keyboard)
+
+
+@radar_router.callback_query(RadarCallback.filter(F.action == "play_full"))
+async def handle_radar_play_full_track(
+    query: CallbackQuery,
+    callback_data: RadarCallback,
+    governance_repository: GovernanceRepositoryPort,
+    settings: AppSettings,
+    current_user: UserAccount | None = None,
+) -> None:
+    """Stream/play complete track for releases in library rather than defaulting to preview snippet."""
+    release = await governance_repository.get_discovered_release(callback_data.target_id)
+    if not release:
+        await ack_callback(query, "Release not found.", show_alert=True)
+        return
+
+    lib_tracks = await governance_repository.find_library_tracks_for_release(
+        release.artist_name, release.title
+    )
+    if not lib_tracks:
+        await ack_callback(query, "Full track not found in library.", show_alert=True)
+        return
+
+    track = lib_tracks[0]
+    if not track.storage_path.is_file() and not track.telegram_file_id and track.source_message_id is None:
+        await ack_callback(query, "Audio file is missing on disk. Run /rescan.", show_alert=True)
+        return
+
+    await ack_callback(query, f"▶️ Delivering complete track: {track.title}...")
+    if query.message is not None:
+        user_id = current_user.telegram_id if current_user else (query.from_user.id if query.from_user else 0)
+        prefs = await governance_repository.get_user_preferences(user_id)
+        caption = (
+            f"🎵 <b>Complete Track (Library)</b>\n"
+            f"🎤 <b>{html.escape(track.artist)}</b> — <b>{html.escape(track.title)}</b>\n"
+            f"💿 Album: <code>{html.escape(track.album)}</code>"
+        )
+        markup = build_preview_audio_keyboard(
+            release,
+            settings.web_app_url,
+            platform_priority=prefs.platform_priority_list,
+            lib_track_id=track.id,
+        )
+        try:
+            if track.telegram_file_id:
+                await query.message.answer_audio(
+                    track.telegram_file_id,
+                    title=track.title,
+                    performer=track.artist,
+                    caption=caption,
+                    reply_markup=markup,
+                    parse_mode="HTML",
+                )
+            elif track.storage_path.is_file():
+                await query.message.answer_audio(
+                    FSInputFile(track.storage_path),
+                    title=track.title,
+                    performer=track.artist,
+                    caption=caption,
+                    reply_markup=markup,
+                    parse_mode="HTML",
+                )
+            lrc_path = track.storage_path.with_suffix(".lrc")
+            if lrc_path.is_file():
+                await query.message.answer_document(
+                    FSInputFile(lrc_path),
+                    caption=(
+                        "<b>📝 Synchronized Lyrics</b>\n"
+                        "<blockquote>Sidecar <code>.lrc</code> file</blockquote>"
+                    ),
+                    parse_mode="HTML",
+                )
+        except Exception as exc:
+            logger.warning("Could not deliver full track audio: %s", exc)
+            await ack_callback(query, "Could not send audio file to Telegram.", show_alert=True)
 
 
 @radar_router.callback_query(RadarCallback.filter(F.action == "preview"))
@@ -232,10 +345,15 @@ async def handle_radar_preview_audio(
         )
         user_id = current_user.telegram_id if current_user else (query.from_user.id if query.from_user else 0)
         prefs = await governance_repository.get_user_preferences(user_id)
+        lib_tracks = await governance_repository.find_library_tracks_for_release(
+            release.artist_name, release.title
+        )
+        lib_track_id = lib_tracks[0].id if lib_tracks else release.library_track_id
         markup = build_preview_audio_keyboard(
             release,
             settings.web_app_url,
             platform_priority=prefs.platform_priority_list,
+            lib_track_id=lib_track_id,
         )
         try:
             await query.message.answer_audio(
@@ -283,12 +401,15 @@ async def handle_radar_toggle_follow(
         is_followed = callback_data.action == "follow"
         card = format_release_detail_card(rel, is_followed)
         prefs = await governance_repository.get_user_preferences(user_id)
+        lib_tracks = await governance_repository.find_library_tracks_for_release(rel.artist_name, rel.title)
+        lib_track_id = lib_tracks[0].id if lib_tracks else rel.library_track_id
         keyboard = build_release_detail_keyboard(
             rel,
             is_followed,
             settings.web_app_url,
             page=callback_data.page,
             platform_priority=prefs.platform_priority_list,
+            lib_track_id=lib_track_id,
         )
         await safe_edit_text(query.message, card, reply_markup=keyboard)
 
@@ -480,6 +601,10 @@ async def handle_radar_preview_individual_track(
 
     user_id = current_user.telegram_id if current_user else (query.from_user.id if query.from_user else 0)
     prefs = await governance_repository.get_user_preferences(user_id)
+    lib_tracks = await governance_repository.find_library_tracks_for_release(
+        release.artist_name, release.title
+    )
+    lib_track_id = lib_tracks[0].id if lib_tracks else release.library_track_id
 
     if query.message is not None:
         clean_track = "".join(c for c in track_title if c.isalnum() or c in " _-")[:20]
@@ -495,6 +620,7 @@ async def handle_radar_preview_individual_track(
             release,
             settings.web_app_url,
             platform_priority=prefs.platform_priority_list,
+            lib_track_id=lib_track_id,
         )
         try:
             await query.message.answer_audio(

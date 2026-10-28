@@ -1,5 +1,5 @@
-import React, { useRef } from 'react';
-import { Play, Volume2, Sliders, Bell } from 'lucide-react';
+import React, { useRef, useState } from 'react';
+import { Play, Volume2, Sliders, Bell, Send } from 'lucide-react';
 import { useAudioPlayer } from '../../context/AudioPlayerContext';
 import { formatTime } from '../../lib/lrc';
 import { TrackItem } from '../../types/music';
@@ -23,9 +23,27 @@ export const TrackCard: React.FC<TrackCardProps> = ({
   onToggleSelect,
   onLongPress,
 }) => {
-  const { currentTrack, isPlaying, playTrack, togglePlay, isArtistFollowed, toggleFollowArtist } =
-    useAudioPlayer();
+  const {
+    currentTrack,
+    isPlaying,
+    playTrack,
+    togglePlay,
+    isArtistFollowed,
+    toggleFollowArtist,
+    sendTrackToChat,
+  } = useAudioPlayer();
   const isCurrent = currentTrack?.id === track.id;
+  const [isSending, setIsSending] = useState<boolean>(false);
+
+  const handleSendToChat = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (isSending) return;
+    setIsSending(true);
+    await sendTrackToChat(track.id);
+    setTimeout(() => {
+      setIsSending(false);
+    }, 2000);
+  };
 
   const timerRef = useRef<number | null>(null);
   const startPosRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
@@ -312,6 +330,25 @@ export const TrackCard: React.FC<TrackCardProps> = ({
           }}
         >
           <Bell size={15} fill={isArtistFollowed(track.artist) ? 'currentColor' : 'none'} />
+        </button>
+
+        <button
+          onClick={handleSendToChat}
+          title="Send audio file to Telegram chat"
+          style={{
+            background: isSending ? 'rgba(48, 209, 88, 0.2)' : 'rgba(255, 255, 255, 0.06)',
+            border: 'none',
+            borderRadius: '8px',
+            padding: '6px',
+            color: isSending ? '#30d158' : 'var(--tg-theme-subtitle-text-color, #8e8e93)',
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            transition: 'all 0.15s ease',
+          }}
+        >
+          <Send size={15} />
         </button>
 
         {onEdit && (

@@ -40,6 +40,7 @@ export interface ReleaseTrackPreview {
   preview_url: string;
   duration_seconds: number;
   track_position: number;
+  library_track_id?: string | null;
 }
 
 export interface RadarRelease {
@@ -54,6 +55,7 @@ export interface RadarRelease {
   provider: string;
   track_count: number;
   in_library: boolean;
+  library_track_id?: string | null;
   is_followed: boolean;
   external_links?: Record<string, string>;
   primary_platform?: string;
@@ -65,4 +67,61 @@ export interface RadarFollowItem {
   artist_name: string;
   notify_telegram: boolean;
   created_at: string;
+}
+
+
+export interface AlbumTrackGap {
+  position: number;
+  title: string;
+  duration_seconds: number;
+  is_owned: boolean;
+  library_track_id: string | null;
+  preview_url: string | null;
+  disk_number?: number;
+}
+
+export interface AlbumGapAnalysis {
+  album_id: string;
+  title: string;
+  artist: string;
+  cover_url: string | null;
+  release_date: string | null;
+  total_tracks: number;
+  owned_tracks_count: number;
+  missing_tracks_count: number;
+  coverage_percent: number;
+  is_complete: boolean;
+  provider: string;
+  external_url: string | null;
+  tracks: AlbumTrackGap[];
+}
+
+export interface SearchResultAlbum {
+  id: string;
+  title: string;
+  artist: string;
+  cover_url: string | null;
+  in_library: boolean;
+  total_tracks: number;
+  owned_tracks_count: number;
+  missing_tracks_count: number;
+  external_url: string | null;
+}
+
+export interface SearchResultTrack {
+  id: string;
+  title: string;
+  artist: string;
+  album: string;
+  in_library: boolean;
+  library_track_id: string | null;
+  preview_url: string | null;
+  duration_seconds: number;
+}
+
+export interface AppSearchResponse {
+  query: string;
+  scope: 'global' | 'library';
+  albums: SearchResultAlbum[];
+  tracks: SearchResultTrack[];
 }

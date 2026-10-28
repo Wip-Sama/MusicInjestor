@@ -137,6 +137,7 @@ CREATE TABLE IF NOT EXISTS user_settings (
     auto_lyrics_search INTEGER NOT NULL DEFAULT 1,
     theme TEXT NOT NULL DEFAULT 'system',
     streaming_platform_order TEXT NOT NULL DEFAULT 'deezer,tidal,qobuz,spotify,apple_music',
+    search_scope TEXT NOT NULL DEFAULT 'global',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -167,6 +168,7 @@ CREATE TABLE IF NOT EXISTS discovered_releases (
     provider_release_id TEXT NOT NULL DEFAULT '',
     track_count INTEGER NOT NULL DEFAULT 1,
     in_library INTEGER NOT NULL DEFAULT 0,
+    library_track_id TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
@@ -283,4 +285,7 @@ USERS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (("oidc_role_override", "
 
 USER_SETTINGS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("streaming_platform_order", "TEXT NOT NULL DEFAULT 'deezer,tidal,qobuz,spotify,apple_music'"),
+    ("search_scope", "TEXT NOT NULL DEFAULT 'global'"),
 )
+
+DISCOVERED_RELEASES_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (("library_track_id", "TEXT"),)

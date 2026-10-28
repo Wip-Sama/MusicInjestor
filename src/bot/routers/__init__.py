@@ -6,6 +6,7 @@ from src.bot.routers.admin import admin_router
 from src.bot.routers.commands import commands_router
 from src.bot.routers.files import files_router
 from src.bot.routers.radar import radar_router
+from src.bot.routers.search import search_router
 from src.bot.routers.songs import songs_router
 from src.bot.routers.verification import verification_router
 
@@ -20,6 +21,7 @@ def build_root_router() -> Router:
         radar_router,
         files_router,
         verification_router,
+        search_router,
     ):
         if sub_router.parent_router is not None:
             sub_router._parent_router = None
@@ -33,6 +35,7 @@ __all__ = [
     "commands_router",
     "files_router",
     "radar_router",
+    "search_router",
     "songs_router",
     "verification_router",
 ]

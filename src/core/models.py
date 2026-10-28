@@ -168,6 +168,7 @@ class UserPreferences:
     auto_lyrics_search: bool = True
     theme: str = "system"
     streaming_platform_order: str = "deezer,tidal,qobuz,spotify,apple_music"
+    search_scope: str = "global"
 
     @property
     def platform_priority_list(self) -> list[str]:
@@ -431,6 +432,7 @@ class DiscoveredRelease:
     provider_release_id: str = ""
     track_count: int = 1
     in_library: bool = False
+    library_track_id: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -455,3 +457,77 @@ class ReleaseTrackPreview:
     preview_url: str
     duration_seconds: int = 30
     track_position: int = 1
+    library_track_id: str | None = None
+
+
+@dataclass(slots=True)
+class AlbumTrackGap:
+    """Individual track within an album gap analysis, indicating library possession or missing preview."""
+
+    position: int
+    title: str
+    duration_seconds: int = 30
+    is_owned: bool = False
+    library_track_id: str | None = None
+    preview_url: str | None = None
+    disk_number: int = 1
+
+
+@dataclass(slots=True)
+class AlbumGapAnalysis:
+    """Album gap analysis revealing library coverage and missing track preview snippets."""
+
+    album_id: str
+    title: str
+    artist: str
+    cover_url: str | None = None
+    release_date: str | None = None
+    total_tracks: int = 0
+    owned_tracks_count: int = 0
+    missing_tracks_count: int = 0
+    tracks: list[AlbumTrackGap] = field(default_factory=list)
+    provider: str = "deezer"
+    external_url: str | None = None
+
+    @property
+    def coverage_percent(self) -> int:
+        """Return percentage of album tracks present in local library."""
+        if self.total_tracks <= 0:
+            return 100 if self.owned_tracks_count > 0 else 0
+        return int((self.owned_tracks_count / self.total_tracks) * 100)
+
+    @property
+    def is_complete(self) -> bool:
+        """Return True if all album tracks are owned in local library."""
+        return self.missing_tracks_count == 0 and self.owned_tracks_count > 0
+
+
+@dataclass(slots=True)
+class SearchResultItem:
+    """Unified search result item representing either an album or a single audio track."""
+
+    item_type: str  # "album" or "track"
+    id: str
+    title: str
+    artist: str
+    album: str = ""
+    cover_url: str | None = None
+    in_library: bool = False
+    library_track_id: str | None = None
+    preview_url: str | None = None
+    total_tracks: int = 1
+    owned_tracks_count: int = 0
+    missing_tracks_count: int = 0
+    duration_seconds: int = 0
+    release_date: str | None = None
+    external_url: str | None = None
+
+
+@dataclass(slots=True)
+class UnifiedSearchResult:
+    """Consolidated search results containing matched albums and tracks under an active scope."""
+
+    query: str
+    scope: str  # "global" or "library"
+    albums: list[SearchResultItem] = field(default_factory=list)
+    tracks: list[SearchResultItem] = field(default_factory=list)

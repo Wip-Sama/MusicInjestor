@@ -48,6 +48,7 @@ const AppContent: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<TabType>('catalog');
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
+  const [initialReleaseId, setInitialReleaseId] = useState<string | null>(null);
   const handledDeepLinkRef = useRef<boolean>(false);
 
   useEffect(() => {
@@ -66,8 +67,9 @@ const AppContent: React.FC = () => {
             urlParams.get('tgWebAppStartParam') ||
             '';
 
-          if (startParam.startsWith('track_')) {
-            const trackId = startParam.replace('track_', '').trim();
+          if (startParam.startsWith('track_') || startParam.startsWith('song_')) {
+            const trackId = startParam.replace(/^(track_|song_)/, '').trim();
+
             setActiveTab('catalog');
             apiFetch(`/api/v1/app/tracks/${trackId}`)
               .then((res) => {
@@ -89,6 +91,9 @@ const AppContent: React.FC = () => {
             setActiveTab('ingest');
           } else if (startParam === 'radar' || startParam.startsWith('release_')) {
             setActiveTab('radar');
+            if (startParam.startsWith('release_')) {
+              setInitialReleaseId(startParam.replace('release_', '').trim());
+            }
           } else if (
             (startParam === 'governance' || startParam === 'admin') &&
             canManageUsers(data)
@@ -491,7 +496,7 @@ const GuestCatalogLockedCard: React.FC<{ profile: UserProfile }> = ({ profile: _
         )}
 
         {!loading && profile && activeTab === 'radar' && (
-          <RadarView profile={profile} />
+          <RadarView profile={profile} initialReleaseId={initialReleaseId} />
         )}
 
         {!loading && profile && activeTab === 'ingest' && (

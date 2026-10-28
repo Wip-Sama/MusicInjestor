@@ -136,6 +136,21 @@ class ReleaseRadarService:
             if isinstance(res, list):
                 discovered_releases.extend(res)
 
+        if discovered_releases and hasattr(self._repository, "list_followers_of_artist"):
+            for rel in discovered_releases:
+                followers = await self._repository.list_followers_of_artist(rel.artist_name)
+                if isinstance(followers, (list, tuple)):
+                    for uid in followers:
+                        new_notifications.append(
+                            ReleaseNotification(
+                                id=0,
+                                telegram_id=uid,
+                                release_id=rel.id,
+                            )
+                        )
+            if new_notifications and hasattr(self._repository, "create_release_notifications"):
+                await self._repository.create_release_notifications(new_notifications)
+
         logger.info(
             "Release Radar scan complete: processed %d artists, discovered %d recent releases.",
             len(monitored_artists),

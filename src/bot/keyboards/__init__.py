@@ -38,6 +38,12 @@ from src.bot.keyboards.admin import (
     build_user_list_keyboard,
     format_toggle_label,
 )
+from src.bot.keyboards.search import (
+    AlbumGapCallback,
+    SearchActionCallback,
+    build_album_gap_keyboard,
+    build_search_results_keyboard,
+)
 from src.bot.keyboards.songs import (
     SORT_DESCRIPTIONS,
     SORT_LABELS,
@@ -72,6 +78,7 @@ from src.bot.keyboards.verification import (
 
 __all__ = [
     "AccessReqApproveCallback",
+    "AlbumGapCallback",
     "AccessReqDenyCallback",
     "AccessReqSimpleCallback",
     "AdminActionCallback",
@@ -92,6 +99,7 @@ __all__ = [
     "RESERVED_MENU_BUTTONS",
     "SORT_DESCRIPTIONS",
     "SORT_LABELS",
+    "SearchActionCallback",
     "SongsFieldCallback",
     "SongsMenuCallback",
     "SongsPageCallback",
@@ -103,6 +111,7 @@ __all__ = [
     "VerifySelectCallback",
     "append_escape_row",
     "build_access_request_approval_keyboard",
+    "build_album_gap_keyboard",
     "build_admin_dashboard_keyboard",
     "build_admin_subscreen_keyboard",
     "build_back_to_home_keyboard",
@@ -124,6 +133,7 @@ __all__ = [
     "build_queued_job_keyboard",
     "build_rescan_confirmation_keyboard",
     "build_research_mode_keyboard",
+    "build_search_results_keyboard",
     "build_search_prompt_keyboard",
     "build_selective_changes_keyboard",
     "build_song_action_keyboard",

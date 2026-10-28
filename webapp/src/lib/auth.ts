@@ -15,6 +15,7 @@ export interface UserProfile {
   permissions: string[];
   is_owner: boolean;
   start_param: string;
+  bot_username?: string | null;
 }
 
 const STORAGE_KEY = 'tg_init_data';

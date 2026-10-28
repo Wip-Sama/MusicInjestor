@@ -209,6 +209,14 @@ class GovernanceRepositoryPort(Protocol):
         """Return all library tracks matching `artist` and `album` ordered by track number."""
         ...
 
+    async def search_library_albums(
+        self,
+        query: str,
+        limit: int = 20,
+    ) -> list[tuple[str, str, int, int | None]]:
+        """Return distinct `(artist, album, track_count, min_year)` matching query."""
+        ...
+
     async def create_tag_correction_request(
         self,
         request: TagCorrectionRequest,
@@ -321,6 +329,18 @@ class GovernanceRepositoryPort(Protocol):
 
     async def list_all_monitored_artists(self) -> list[str]:
         """Return the union of distinct artists in library_tracks and followed artists."""
+        ...
+
+    async def list_followers_of_artist(self, artist_name: str) -> list[int]:
+        """Return telegram_ids of users who follow artist_name and have notifications enabled."""
+        ...
+
+    async def find_library_tracks_for_release(
+        self,
+        artist_name: str,
+        release_title: str,
+    ) -> list[LibraryTrackRecord]:
+        """Find ingested library tracks corresponding to a discovered release by artist and album/title."""
         ...
 
     async def upsert_discovered_releases(
@@ -521,4 +541,20 @@ class ReleaseRadarProviderPort(Protocol):
         provider_release_id: str,
     ) -> list[ReleaseTrackPreview]:
         """Fetch all available 30-second audio preview tracks for an album or release."""
+        ...
+
+    async def search_albums(
+        self,
+        query: str,
+        limit: int = 10,
+    ) -> list[DiscoveredRelease]:
+        """Search external provider for albums matching query."""
+        ...
+
+    async def search_tracks(
+        self,
+        query: str,
+        limit: int = 10,
+    ) -> list[ReleaseTrackPreview]:
+        """Search external provider for individual tracks with 30-second audio previews."""
         ...

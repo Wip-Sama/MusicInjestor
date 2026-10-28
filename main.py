@@ -2,7 +2,6 @@
 
 import asyncio
 import contextlib
-import html
 import logging
 import shutil
 from pathlib import Path
@@ -11,6 +10,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.types import BotCommand, MenuButtonWebApp, WebAppInfo
 
 from src.bot.api_server import build_bot_instance
+from src.bot.keyboards.radar import build_release_notification_keyboard
 from src.bot.middlewares.rbac import RbacMiddleware
 from src.bot.notifier import TelegramAdminLogNotifier
 from src.bot.oidc_server import (
@@ -18,6 +18,8 @@ from src.bot.oidc_server import (
     run_hourly_oidc_sync_loop,
 )
 from src.bot.routers import build_root_router
+from src.bot.routers.radar import format_release_notification_card
+from src.bot.tunnel import CloudflareQuickTunnel
 from src.bot.webapp_server import BotWebServer
 from src.config.settings import AppSettings, load_settings
 from src.core.deezer import DeezerReleaseProvider
@@ -31,6 +33,7 @@ from src.core.pipeline import IngestionPipeline
 from src.core.queue import IngestionQueueWorker
 from src.core.radar import ReleaseRadarService
 from src.core.rbac import GovernanceService
+from src.core.search import AlbumSearchService
 from src.db.database import SqliteDatabaseManager
 from src.db.repository import SqliteCatalogRepository
 
@@ -172,6 +175,7 @@ async def run_periodic_release_radar_loop(
     interval_seconds: int = 43200,
     stop_event: asyncio.Event | None = None,
     run_on_startup: bool = False,
+    settings: AppSettings | None = None,
 ) -> None:
     """Periodically scan monitored artists and notify users of new releases."""
     effective_stop = stop_event or asyncio.Event()
@@ -196,14 +200,25 @@ async def run_periodic_release_radar_loop(
                     rel = await repository.get_discovered_release(notif.release_id)
                     if rel is not None:
                         try:
-                            text = (
-                                f"🌟 <b>New Music Drop Alert!</b>\n\n"
-                                f"🎤 Artist: <b>{html.escape(rel.artist_name)}</b>\n"
-                                f"💿 Release: <b>{html.escape(rel.title)}</b> [{rel.release_type.upper()}]\n"
-                                f"📅 Date: <code>{html.escape(rel.release_date)}</code>\n\n"
-                                f"<i>Use /radar to listen to a 30s audio preview!</i>"
+                            matching_tracks = await repository.find_library_tracks_for_release(
+                                rel.artist_name, rel.title
                             )
-                            await bot.send_message(chat_id=notif.telegram_id, text=text, parse_mode="HTML")
+                            lib_track = matching_tracks[0] if matching_tracks else None
+                            prefs = await repository.get_user_preferences(notif.telegram_id)
+                            web_url = settings.web_app_url if settings else None
+                            text = format_release_notification_card(rel, lib_track)
+                            keyboard = build_release_notification_keyboard(
+                                release=rel,
+                                lib_track=lib_track,
+                                web_app_url=web_url,
+                                platform_priority=prefs.platform_priority_list,
+                            )
+                            await bot.send_message(
+                                chat_id=notif.telegram_id,
+                                text=text,
+                                reply_markup=keyboard,
+                                parse_mode="HTML",
+                            )
                         except Exception as n_exc:
                             logger.warning(
                                 "Failed to send release alert to user %d: %s", notif.telegram_id, n_exc
@@ -258,6 +273,18 @@ async def run_app(settings: AppSettings | None = None) -> None:
 
     vite_proc = await start_vite_dev_server_if_needed(resolved_settings)
 
+    quick_tunnel: CloudflareQuickTunnel | None = None
+    if resolved_settings.use_cloudflared_tunnel and not resolved_settings.cloudflared_tunnel_url.strip():
+        local_target = f"http://127.0.0.1:{resolved_settings.web_listen_port}"
+        quick_tunnel = CloudflareQuickTunnel(target_url=local_target)
+        discovered_url = await quick_tunnel.start(timeout_seconds=20.0)
+        if discovered_url:
+            resolved_settings.update_cloudflared_tunnel_url(discovered_url)
+            logger.info("Cloudflare Quick Tunnel active. Web App URL: %s", resolved_settings.web_app_url)
+            logger.info("Cloudflare Quick Tunnel OIDC Redirect URI: %s", resolved_settings.oidc_redirect_uri)
+        else:
+            logger.warning("Cloudflare Quick Tunnel could not be established; continuing with fallback URLs.")
+
     db_manager = SqliteDatabaseManager(resolved_settings.database_path)
     await db_manager.initialize()
     repository = SqliteCatalogRepository(db_manager=db_manager)
@@ -274,6 +301,7 @@ async def run_app(settings: AppSettings | None = None) -> None:
     bot = build_bot_instance(resolved_settings)
     deezer_provider = DeezerReleaseProvider()
     radar_service = ReleaseRadarService(provider=deezer_provider, repository=repository)
+    album_search_service = AlbumSearchService(catalog_repository=repository, radar_provider=deezer_provider)
     notifier = TelegramAdminLogNotifier(
         bot=bot,
         admin_log_channel_id=resolved_settings.admin_log_channel_id,
@@ -323,6 +351,7 @@ async def run_app(settings: AppSettings | None = None) -> None:
     dispatcher["notifier"] = notifier
     dispatcher["organizer"] = organizer
     dispatcher["radar_service"] = radar_service
+    dispatcher["album_search_service"] = album_search_service
     dispatcher.include_router(build_root_router())
 
     web_server: BotWebServer | None = None
@@ -361,12 +390,18 @@ async def run_app(settings: AppSettings | None = None) -> None:
                 bot=bot,
                 interval_seconds=resolved_settings.radar_sync_interval_seconds,
                 stop_event=background_stop_event,
+                settings=resolved_settings,
             )
         )
 
     if resolved_settings.web_app_enabled or resolved_settings.oidc_enabled:
         meta_service = getattr(pipeline, "_metadata", None)
         lyrics_client = getattr(pipeline, "_lyrics", None)
+        bot_username: str | None = None
+        with contextlib.suppress(Exception):
+            bot_info = await bot.get_me()
+            bot_username = bot_info.username
+
         web_server = BotWebServer(
             bot_token=resolved_settings.telegram_bot_token,
             governance_service=governance_service,
@@ -384,6 +419,9 @@ async def run_app(settings: AppSettings | None = None) -> None:
             pipeline=pipeline,
             scratch_dir=resolved_settings.storage_scratch_dir,
             radar_service=radar_service,
+            album_search_service=album_search_service,
+            bot=bot,
+            bot_username=bot_username,
         )
         await web_server.start()
 
@@ -416,6 +454,8 @@ async def run_app(settings: AppSettings | None = None) -> None:
             except Exception:
                 with contextlib.suppress(Exception):
                     vite_proc.kill()
+        if quick_tunnel is not None:
+            await quick_tunnel.stop()
         await bot.session.close()
 
 

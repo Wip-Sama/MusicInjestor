@@ -1,18 +1,21 @@
 import React, { useEffect, useState, useCallback } from 'react';
-import { Search, SlidersHorizontal, Music2, RefreshCw, Sparkles } from 'lucide-react';
+import { Search, SlidersHorizontal, Music2, RefreshCw, Sparkles, Disc } from 'lucide-react';
+import { AlbumGapModal } from '../components/catalog/AlbumGapModal';
 import { TrackCard } from '../components/catalog/TrackCard';
 import { SongStudioModal } from '../components/studio/SongStudioModal';
 import { BulkResearchModal } from '../components/bulk/BulkResearchModal';
 import { useAudioPlayer } from '../context/AudioPlayerContext';
 import { apiFetch, UserProfile, canSubmitIngestion } from '../lib/auth';
-import { TrackItem, TracksResponse } from '../types/music';
+import { TrackItem, TracksResponse, SearchResultAlbum, AppSearchResponse } from '../types/music';
 
 interface CatalogViewProps {
   profile?: UserProfile | null;
 }
 
 export const CatalogView: React.FC<CatalogViewProps> = ({ profile }) => {
-  const { updateTrackData } = useAudioPlayer();
+  const { updateTrackData, searchScope } = useAudioPlayer();
+  const [matchedAlbums, setMatchedAlbums] = useState<SearchResultAlbum[]>([]);
+  const [selectedAlbumForGap, setSelectedAlbumForGap] = useState<{ id: string; artist: string; title: string } | null>(null);
   const canEdit = canSubmitIngestion(profile ?? null);
   const [tracks, setTracks] = useState<TrackItem[]>([]);
   const [total, setTotal] = useState<number>(0);
@@ -48,6 +51,14 @@ export const CatalogView: React.FC<CatalogViewProps> = ({ profile }) => {
     });
     if (debouncedQuery.trim()) {
       params.set('query', debouncedQuery.trim());
+      apiFetch(`/api/v1/app/search?query=${encodeURIComponent(debouncedQuery.trim())}&scope=${searchScope}`)
+        .then((res) => res.json())
+        .then((data: AppSearchResponse) => {
+          setMatchedAlbums(data.albums || []);
+        })
+        .catch(() => setMatchedAlbums([]));
+    } else {
+      setMatchedAlbums([]);
     }
 
     apiFetch(`/api/v1/app/tracks?${params.toString()}`)
@@ -61,7 +72,7 @@ export const CatalogView: React.FC<CatalogViewProps> = ({ profile }) => {
         console.error('Failed to load library tracks:', err);
         setLoading(false);
       });
-  }, [debouncedQuery, sortBy, page]);
+  }, [debouncedQuery, sortBy, page, searchScope]);
 
   useEffect(() => {
     loadTracks();
@@ -141,6 +152,65 @@ export const CatalogView: React.FC<CatalogViewProps> = ({ profile }) => {
           </select>
         </div>
       </div>
+
+      {/* Matched Albums from Search */}
+      {matchedAlbums.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+          <div style={{ fontSize: '12px', fontWeight: 700, textTransform: 'uppercase', color: '#8e8e93', letterSpacing: '0.5px' }}>
+            Albums &amp; Gap Analysis ({matchedAlbums.length})
+          </div>
+          <div style={{ display: 'flex', gap: '10px', overflowX: 'auto', paddingBottom: '6px' }}>
+            {matchedAlbums.map((alb) => (
+              <div
+                key={alb.id}
+                onClick={() => setSelectedAlbumForGap({ id: alb.id, artist: alb.artist, title: alb.title })}
+                style={{
+                  flexShrink: 0,
+                  width: '136px',
+                  backgroundColor: 'var(--tg-theme-secondary-bg-color, #2c2c2e)',
+                  borderRadius: '10px',
+                  padding: '8px',
+                  cursor: 'pointer',
+                  border: '1px solid rgba(255, 255, 255, 0.06)',
+                  display: 'flex',
+                  flexDirection: 'column',
+                }}
+              >
+                {alb.cover_url ? (
+                  <img
+                    src={alb.cover_url}
+                    alt={alb.title}
+                    style={{ width: '100%', height: '120px', borderRadius: '6px', objectFit: 'cover' }}
+                  />
+                ) : (
+                  <div
+                    style={{
+                      width: '100%',
+                      height: '120px',
+                      borderRadius: '6px',
+                      backgroundColor: 'rgba(255, 255, 255, 0.06)',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                    }}
+                  >
+                    <Disc size={32} color="#8e8e93" />
+                  </div>
+                )}
+                <div style={{ fontSize: '13px', fontWeight: 600, color: '#fff', marginTop: '6px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {alb.title}
+                </div>
+                <div style={{ fontSize: '11px', color: '#8e8e93', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {alb.artist}
+                </div>
+                <div style={{ fontSize: '10px', fontWeight: 700, color: alb.in_library ? '#30d158' : 'var(--tg-theme-button-color, #0a84ff)', marginTop: '4px' }}>
+                  {alb.owned_tracks_count} / {alb.total_tracks} Owned
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Multi-Selection Control Bar */}
       {isSelectMode && (
@@ -355,6 +425,15 @@ export const CatalogView: React.FC<CatalogViewProps> = ({ profile }) => {
           );
           updateTrackData(updatedTrack);
         }}
+      />
+
+      {/* Album Gap Analysis Modal */}
+      <AlbumGapModal
+        isOpen={Boolean(selectedAlbumForGap)}
+        onClose={() => setSelectedAlbumForGap(null)}
+        albumId={selectedAlbumForGap?.id || null}
+        artistName={selectedAlbumForGap?.artist}
+        albumTitle={selectedAlbumForGap?.title}
       />
 
       {/* Bulk Operations Modal */}

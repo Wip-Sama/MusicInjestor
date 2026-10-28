@@ -5,7 +5,8 @@ from aiogram.types import CopyTextButton, InlineKeyboardButton, InlineKeyboardMa
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from src.bot.keyboards.admin import append_escape_row
-from src.core.models import DiscoveredRelease, FollowedArtist, ReleaseTrackPreview
+from src.bot.keyboards.songs import SongsTrackCallback
+from src.core.models import DiscoveredRelease, FollowedArtist, LibraryTrackRecord, ReleaseTrackPreview
 from src.core.platform_links import (
     PLATFORM_ICONS,
     PLATFORM_LABELS,
@@ -94,17 +95,27 @@ def build_release_detail_keyboard(
     web_app_url: str | None = None,
     page: int = 1,
     platform_priority: list[str] | None = None,
+    lib_track_id: str | None = None,
 ) -> InlineKeyboardMarkup:
     """Build action buttons for inspecting a single discovered release."""
+    resolved_track = lib_track_id or release.library_track_id
     builder = InlineKeyboardBuilder()
 
-    # Audio preview button
+    # Audio playback options row: Stream Complete Track vs 30s Audio Preview
     preview_row: list[InlineKeyboardButton] = [
         InlineKeyboardButton(
             text="🎧 30s Audio Preview",
             callback_data=RadarCallback(action="preview", target_id=release.id, page=page).pack(),
         )
     ]
+    if release.in_library or resolved_track:
+        preview_row.insert(
+            0,
+            InlineKeyboardButton(
+                text="▶️ Play Full Track",
+                callback_data=RadarCallback(action="play_full", target_id=release.id, page=page).pack(),
+            ),
+        )
     if release.track_count > 1 or release.release_type == "album":
         preview_row.append(
             InlineKeyboardButton(
@@ -113,6 +124,14 @@ def build_release_detail_keyboard(
             )
         )
     builder.row(*preview_row)
+
+    if resolved_track:
+        builder.row(
+            InlineKeyboardButton(
+                text="🎵 View Song in Bot",
+                callback_data=SongsTrackCallback(action="view", track_id=resolved_track).pack(),
+            )
+        )
 
     # Follow/Unfollow toggle
     follow_text = f"🔕 Unfollow {release.artist_name}" if is_followed else f"🔔 Follow {release.artist_name}"
@@ -154,8 +173,13 @@ def build_release_detail_keyboard(
     if web_app_url and web_app_url.strip():
         extra_row.append(
             InlineKeyboardButton(
-                text="🎵 Mini App",
-                web_app=WebAppInfo(url=f"{web_app_url.strip().rstrip('/')}?startapp=release_{release.id}"),
+                text="🎵 Play in Mini App" if resolved_track else "🎵 Mini App",
+                web_app=WebAppInfo(
+                    url=(
+                        f"{web_app_url.strip().rstrip('/')}?startapp="
+                        f"{'track_' + resolved_track if resolved_track else 'release_' + release.id}"
+                    )
+                ),
             )
         )
     builder.row(*extra_row)
@@ -173,9 +197,26 @@ def build_preview_audio_keyboard(
     release: DiscoveredRelease,
     web_app_url: str | None = None,
     platform_priority: list[str] | None = None,
+    lib_track_id: str | None = None,
 ) -> InlineKeyboardMarkup:
     """Build inline buttons attached to the 30-second audio preview file sent in chat."""
     builder = InlineKeyboardBuilder()
+    resolved_track = lib_track_id or release.library_track_id
+    if release.in_library or resolved_track:
+        full_row: list[InlineKeyboardButton] = [
+            InlineKeyboardButton(
+                text="▶️ Play Full Track",
+                callback_data=RadarCallback(action="play_full", target_id=release.id).pack(),
+            )
+        ]
+        if resolved_track:
+            full_row.append(
+                InlineKeyboardButton(
+                    text="🎵 Song in Bot",
+                    callback_data=SongsTrackCallback(action="view", track_id=resolved_track).pack(),
+                )
+            )
+        builder.row(*full_row)
     links = build_streaming_platform_links(
         release.artist_name, release.title, deezer_url=release.external_url
     )
@@ -206,12 +247,110 @@ def build_preview_audio_keyboard(
     if web_app_url and web_app_url.strip():
         sec_row.append(
             InlineKeyboardButton(
-                text="🎵 Mini App",
-                web_app=WebAppInfo(url=f"{web_app_url.strip().rstrip('/')}?startapp=release_{release.id}"),
+                text="🎵 Play in Mini App" if resolved_track else "🎵 Mini App",
+                web_app=WebAppInfo(
+                    url=(
+                        f"{web_app_url.strip().rstrip('/')}?startapp="
+                        f"{'track_' + resolved_track if resolved_track else 'release_' + release.id}"
+                    )
+                ),
             )
         )
     if sec_row:
         builder.row(*sec_row)
+    return builder.as_markup()
+
+
+def build_release_notification_keyboard(
+    release: DiscoveredRelease,
+    lib_track: LibraryTrackRecord | None = None,
+    web_app_url: str | None = None,
+    platform_priority: list[str] | None = None,
+) -> InlineKeyboardMarkup:
+    """Build inline keyboard for a new release drop alert notification."""
+    builder = InlineKeyboardBuilder()
+    resolved_track_id = lib_track.id if lib_track else release.library_track_id
+
+    if release.in_library or resolved_track_id:
+        row1: list[InlineKeyboardButton] = [
+            InlineKeyboardButton(
+                text="▶️ Play Full Track",
+                callback_data=RadarCallback(action="play_full", target_id=release.id).pack(),
+            )
+        ]
+        if resolved_track_id:
+            row1.append(
+                InlineKeyboardButton(
+                    text="🎵 View Song in Bot",
+                    callback_data=SongsTrackCallback(action="view", track_id=resolved_track_id).pack(),
+                )
+            )
+        builder.row(*row1)
+
+        row2: list[InlineKeyboardButton] = []
+        if release.preview_url:
+            row2.append(
+                InlineKeyboardButton(
+                    text="🎧 30s Audio Preview",
+                    callback_data=RadarCallback(action="preview", target_id=release.id).pack(),
+                )
+            )
+        if web_app_url and web_app_url.strip() and resolved_track_id:
+            row2.append(
+                InlineKeyboardButton(
+                    text="🎵 Play in Mini App",
+                    web_app=WebAppInfo(
+                        url=f"{web_app_url.strip().rstrip('/')}?startapp=track_{resolved_track_id}"
+                    ),
+                )
+            )
+        if row2:
+            builder.row(*row2)
+    else:
+        row1 = []
+        if release.preview_url:
+            row1.append(
+                InlineKeyboardButton(
+                    text="🎧 30s Audio Preview",
+                    callback_data=RadarCallback(action="preview", target_id=release.id).pack(),
+                )
+            )
+        row1.append(
+            InlineKeyboardButton(
+                text="📡 View on Radar",
+                callback_data=RadarCallback(action="view", target_id=release.id).pack(),
+            )
+        )
+        builder.row(*row1)
+
+        if web_app_url and web_app_url.strip():
+            builder.row(
+                InlineKeyboardButton(
+                    text="🎵 Open in Mini App",
+                    web_app=WebAppInfo(
+                        url=f"{web_app_url.strip().rstrip('/')}?startapp=release_{release.id}"
+                    ),
+                )
+            )
+
+    links = build_streaming_platform_links(
+        release.artist_name, release.title, deezer_url=release.external_url
+    )
+    primary_plat, primary_url = resolve_primary_platform_link(links, platform_priority or ["deezer"])
+    plat_icon = PLATFORM_ICONS.get(primary_plat, "🌐")
+    plat_label = PLATFORM_LABELS.get(primary_plat, primary_plat.title())
+    builder.row(
+        InlineKeyboardButton(
+            text=f"{plat_icon} Open {plat_label}",
+            url=primary_url,
+        ),
+        InlineKeyboardButton(
+            text="📋 Copy Link",
+            copy_text=CopyTextButton(text=primary_url),
+        ),
+    )
+
+    return builder.as_markup()
 
     return builder.as_markup()
 

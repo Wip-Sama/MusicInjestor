@@ -2,11 +2,19 @@
 
 import contextlib
 import html
+import re
 
 from aiogram import F, Router
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command, CommandObject, Filter, StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    MenuButtonWebApp,
+    Message,
+    WebAppInfo,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from src.bot.keyboards.admin import (
@@ -26,12 +34,16 @@ from src.bot.keyboards.admin import (
     build_queued_job_keyboard,
     build_tag_correction_review_keyboard,
 )
+from src.bot.keyboards.radar import build_release_detail_keyboard
+from src.bot.keyboards.search import build_album_gap_keyboard
 from src.bot.keyboards.songs import (
     SettingsCallback,
     build_cancel_platform_order_keyboard,
     build_song_action_keyboard,
     build_user_settings_keyboard,
 )
+from src.bot.routers.radar import format_release_detail_card
+from src.bot.routers.search import format_album_gap_card
 from src.bot.routers.songs import format_song_detail_card
 from src.bot.states import SettingsStates
 from src.bot.ui import (
@@ -57,6 +69,7 @@ from src.core.platform_links import PLATFORM_LABELS, parse_platform_order_input
 from src.core.ports import CatalogRepositoryPort, GovernanceRepositoryPort
 from src.core.queue import IngestionQueueWorker
 from src.core.rbac import GovernanceService, has_permission
+from src.core.search import AlbumSearchService
 
 commands_router = Router(name="commands")
 
@@ -302,10 +315,12 @@ def _render_settings_card(prefs: UserPreferences, current_user: UserAccount | No
     }
     fmt_text = fmt_labels.get(prefs.stream_format, prefs.stream_format)
     lyr_status = "Enabled" if prefs.auto_lyrics_search else "Disabled"
+    scope_desc = "Global (Deezer + Library)" if prefs.search_scope == "global" else "Library Only"
     context = [
         f"• <b>Streaming Format:</b> <code>{html.escape(fmt_text)}</code>",
         f"• <b>Transcoding Bitrate:</b> <code>{prefs.stream_bitrate} kbps</code>",
         f"• <b>Auto-Search Online Lyrics:</b> <code>{lyr_status}</code>",
+        f"• <b>Search Scope:</b> <code>{scope_desc}</code>",
     ]
     platform_names = [PLATFORM_LABELS.get(p, p.title()) for p in prefs.platform_priority_list]
     context.append(f"• <b>Platform Links Priority:</b> <code>{' → '.join(platform_names)}</code>")
@@ -482,14 +497,29 @@ def _parse_tag_correction_spec(
 @commands_router.message(Command("start"))
 async def handle_start(
     message: Message,
+    command: CommandObject | None = None,
     current_user: UserAccount | None = None,
     oidc_service: AuthentikOidcService | None = None,
     settings: AppSettings | None = None,
     state: FSMContext | None = None,
+    catalog_repository: CatalogRepositoryPort | None = None,
+    governance_repository: GovernanceRepositoryPort | None = None,
+    album_search_service: AlbumSearchService | None = None,
 ) -> None:
-    """Intercept GUEST users with the onboarding screen or present the upload prompt & bottom menu."""
+    """Intercept GUEST users with the onboarding screen or navigate deep links / present upload prompt."""
     await reset_fsm_state(state, clear_nav=True)
     await resolve_back_callback(state, None, "menu:home", reset_to_home=True)
+
+    # Immediately refresh this chat's Mini App menu button to bypass client-side cache staleness
+    if settings is not None and settings.web_app_url.strip() and message.bot is not None:
+        with contextlib.suppress(Exception):
+            await message.bot.set_chat_menu_button(
+                chat_id=message.chat.id,
+                menu_button=MenuButtonWebApp(
+                    text="🎵 Web App",
+                    web_app=WebAppInfo(url=settings.web_app_url.strip()),
+                ),
+            )
 
     if current_user is not None and current_user.role == UserRole.GUEST:
         oidc_url = _resolve_oidc_url(current_user, oidc_service, settings)
@@ -502,6 +532,92 @@ async def handle_start(
             ),
         )
         return
+
+    # Bot Deep-Linking: /start song_<track_id>, /start track_<track_id>, /start release_<release_id>,
+    # /start album_<album_id>
+    raw_args = command.args.strip() if command and command.args else ""
+    if raw_args and governance_repository is not None:
+        if raw_args.startswith(("song_", "track_")):
+            track_id = raw_args.split("_", 1)[1].strip()
+            track = await governance_repository.get_library_track(track_id)
+            if track is not None:
+                has_lrc = track.storage_path.with_suffix(".lrc").is_file()
+                has_cover = (track.storage_path.parent / "cover.jpg").is_file()
+                card = format_song_detail_card(
+                    track,
+                    has_lrc_file=has_lrc,
+                    has_cover_file=has_cover,
+                )
+                uid = current_user.telegram_id if current_user else 0
+                is_followed = False
+                if governance_repository:
+                    is_followed = await governance_repository.is_artist_followed(uid, track.artist)
+                web_url = settings.web_app_url.strip() if settings and settings.web_app_url else None
+                markup = build_song_action_keyboard(
+                    track.id,
+                    can_edit=bool(
+                        current_user and has_permission(current_user, Permission.REQUEST_TAG_CORRECTION)
+                    ),
+                    back_callback="songs:list",
+                    web_app_url=web_url,
+                    is_followed=is_followed,
+                )
+                await message.answer(card, reply_markup=markup, parse_mode="HTML")
+                return
+            await message.answer("⚠️ Song not found in the music library.")
+            return
+
+        if raw_args.startswith(("album_", "gap_")):
+            album_id = raw_args.split("_", 1)[1].strip()
+            art_name = ""
+            alb_name = ""
+            provider_id = None
+            if album_id.startswith("deezer:"):
+                provider_id = album_id.replace("deezer:", "", 1)
+            elif album_id.startswith("local:"):
+                parts = album_id.split(":", 2)
+                if len(parts) >= 3:
+                    art_name, alb_name = parts[1], parts[2]
+            if album_search_service is not None:
+                gap = await album_search_service.analyze_album_gap(
+                    artist=art_name,
+                    album=alb_name,
+                    provider_release_id=provider_id,
+                )
+                card = format_album_gap_card(gap)
+                markup = build_album_gap_keyboard(
+                    gap,
+                    web_app_url=settings.web_app_url if settings else None,
+                )
+                await message.answer(card, reply_markup=markup, parse_mode="HTML")
+                return
+            await message.answer("⚠️ Album gap analysis unavailable.")
+            return
+
+        if raw_args.startswith(("release_", "radar_")) and governance_repository:
+            rel_id = raw_args.split("_", 1)[1].strip()
+            release = await governance_repository.get_discovered_release(rel_id)
+            if release is not None:
+                uid = current_user.telegram_id if current_user else 0
+                is_followed = await governance_repository.is_artist_followed(uid, release.artist_name)
+                prefs = await governance_repository.get_user_preferences(uid)
+                lib_tracks = await governance_repository.find_library_tracks_for_release(
+                    release.artist_name, release.title
+                )
+                lib_track_id = lib_tracks[0].id if lib_tracks else release.library_track_id
+                card = format_release_detail_card(release, is_followed)
+                markup = build_release_detail_keyboard(
+                    release=release,
+                    is_followed=is_followed,
+                    web_app_url=settings.web_app_url if settings else None,
+                    page=1,
+                    platform_priority=prefs.platform_priority_list,
+                    lib_track_id=lib_track_id,
+                )
+                await message.answer(card, reply_markup=markup, parse_mode="HTML")
+                return
+            await message.answer("⚠️ Discovered release not found.")
+            return
 
     reply_kb = build_main_menu_keyboard(current_user) if current_user is not None else None
     await message.answer(
@@ -715,6 +831,10 @@ async def handle_settings_callback(
     elif callback_data.action == "lyrics":
         await ack_callback(callback)
         prefs.auto_lyrics_search = not prefs.auto_lyrics_search
+        await governance_repository.update_user_preferences(prefs)
+    elif callback_data.action == "scope":
+        await ack_callback(callback)
+        prefs.search_scope = "library" if prefs.search_scope == "global" else "global"
         await governance_repository.update_user_preferences(prefs)
     elif callback_data.action == "platforms":
         await ack_callback(callback)
@@ -1120,11 +1240,44 @@ async def handle_job_command(
         )
 
 
+_ID_PATTERN = re.compile(
+    r"^(?:(?:job|pending[-_]?job|trk|track)[-_][a-zA-Z0-9_-]+|"
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$",
+    re.IGNORECASE,
+)
+
+
+class JobOrTrackIdFilter(Filter):
+    """Filter matching messages containing a valid Job ID or Library Track ID."""
+
+    async def __call__(
+        self,
+        message: Message,
+        catalog_repository: CatalogRepositoryPort | None = None,
+        governance_repository: GovernanceRepositoryPort | None = None,
+        pipeline: IngestionPipeline | None = None,
+    ) -> bool:
+        text = (message.text or "").strip()
+        if not text or len(text) < 4 or " " in text or text.startswith("/") or text in RESERVED_MENU_BUTTONS:
+            return False
+
+        if _ID_PATTERN.match(text):
+            return True
+
+        if catalog_repository is not None and await catalog_repository.get_job(text) is not None:
+            return True
+        if pipeline is not None and await pipeline.get_job(text) is not None:
+            return True
+        return (
+            governance_repository is not None
+            and await governance_repository.get_library_track(text) is not None
+        )
+
+
 @commands_router.message(
     StateFilter(None),
     F.text,
-    ~F.text.startswith("/"),
-    ~F.text.in_(RESERVED_MENU_BUTTONS),
+    JobOrTrackIdFilter(),
 )
 async def handle_idle_id_lookup_text(
     message: Message,

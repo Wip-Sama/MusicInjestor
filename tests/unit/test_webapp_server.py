@@ -23,14 +23,18 @@ from src.core.lyrics import LrclibLyricsClient
 from src.core.metadata import MusicBrainzMetadataService
 from src.core.models import (
     AccessRequestStatus,
+    AlbumGapAnalysis,
+    AlbumTrackGap,
     IngestionJob,
     IngestionResult,
     JobState,
     LibraryTrackRecord,
     LyricsData,
     MetadataCandidate,
+    SearchResultItem,
     SourceType,
     TrackMetadata,
+    UnifiedSearchResult,
     UserAccount,
     UserRole,
 )
@@ -55,6 +59,9 @@ async def _setup_test_server(
     pipeline: Any = None,
     scratch_dir: Path | None = None,
     coordinator: Any = None,
+    album_search_service: Any = None,
+    bot: Any = None,
+    bot_username: str | None = None,
 ) -> tuple[BotWebServer, SqliteCatalogRepository]:
     """Helper bootstrapping SQLite persistence, GovernanceService, and BotWebServer on an ephemeral port."""
     db_manager = SqliteDatabaseManager(tmp_path / "webapp_test.db")
@@ -78,6 +85,9 @@ async def _setup_test_server(
         queue_worker=queue_worker,
         pipeline=pipeline,
         scratch_dir=scratch_dir,
+        album_search_service=album_search_service,
+        bot=bot,
+        bot_username=bot_username,
     )
     await server.start()
     return server, repo
@@ -2487,6 +2497,7 @@ async def test_user_settings_api_endpoints(tmp_path: Path) -> None:
             assert data["stream_format"] == "auto"
             assert data["stream_bitrate"] == 128
             assert data["auto_lyrics_search"] is True
+            assert data["search_scope"] == "global"
 
             # 2. POST updated settings
             update_payload = {
@@ -2494,6 +2505,7 @@ async def test_user_settings_api_endpoints(tmp_path: Path) -> None:
                 "stream_bitrate": 160,
                 "auto_lyrics_search": False,
                 "theme": "dark",
+                "search_scope": "library",
             }
             post_resp = await client.post(
                 f"{base_url}/api/v1/app/user/settings",
@@ -2506,11 +2518,13 @@ async def test_user_settings_api_endpoints(tmp_path: Path) -> None:
             assert updated_data["stream_bitrate"] == 160
             assert updated_data["auto_lyrics_search"] is False
             assert updated_data["theme"] == "dark"
+            assert updated_data["search_scope"] == "library"
 
             # 3. Verify persistence
             reloaded_resp = await client.get(f"{base_url}/api/v1/app/user/settings", headers=headers)
             assert reloaded_resp.status_code == 200
             assert reloaded_resp.json()["stream_format"] == "opus"
+            assert reloaded_resp.json()["search_scope"] == "library"
     finally:
         await server.stop()
 
@@ -2692,5 +2706,350 @@ async def test_oidc_disconnect_and_override_endpoints(tmp_path: Path) -> None:
             admin_disc_data = admin_disc_resp.json()
             assert admin_disc_data["success"] is True
             assert admin_disc_data["user"]["authentik_linked"] is False
+    finally:
+        await server.stop()
+
+
+@pytest.mark.anyio
+async def test_webapp_search_endpoint(tmp_path: Path) -> None:
+    """Verify GET /api/v1/app/search with permissions, query scopes, and empty service handling."""
+    mock_search_service = AsyncMock()
+    mock_search_service.search.return_value = UnifiedSearchResult(
+        query="Discovery",
+        scope="global",
+        albums=[
+            SearchResultItem(
+                item_type="album",
+                id="deezer:302127",
+                title="Discovery",
+                artist="Daft Punk",
+                cover_url="https://cover.jpg",
+                in_library=True,
+                total_tracks=14,
+                owned_tracks_count=10,
+                missing_tracks_count=4,
+                external_url="https://deezer.com/album/302127",
+            )
+        ],
+        tracks=[
+            SearchResultItem(
+                item_type="track",
+                id="trk_1",
+                title="One More Time",
+                artist="Daft Punk",
+                album="Discovery",
+                in_library=True,
+                library_track_id="trk_1",
+                duration_seconds=320,
+            ),
+            SearchResultItem(
+                item_type="track",
+                id="preview:102",
+                title="Aerodynamic",
+                artist="Daft Punk",
+                album="Discovery",
+                in_library=False,
+                preview_url="https://preview.mp3",
+                duration_seconds=30,
+            ),
+        ],
+    )
+
+    server, repo = await _setup_test_server(
+        tmp_path,
+        owner_telegram_ids=(123456,),
+        dev_mode=True,
+        album_search_service=mock_search_service,
+    )
+    try:
+        base_url = f"http://127.0.0.1:{server.bound_port}"
+        owner_headers = {"Authorization": f"tma {_make_dev_token(123456)}"}
+
+        async with httpx.AsyncClient() as client:
+            # 1. Successful search with query and scope
+            resp = await client.get(
+                f"{base_url}/api/v1/app/search?query=Discovery&scope=global",
+                headers=owner_headers,
+            )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["query"] == "Discovery"
+            assert data["scope"] == "global"
+            assert len(data["albums"]) == 1
+            assert data["albums"][0]["id"] == "deezer:302127"
+            assert data["albums"][0]["owned_tracks_count"] == 10
+            assert len(data["tracks"]) == 2
+            assert data["tracks"][0]["in_library"] is True
+            assert data["tracks"][1]["preview_url"] == "https://preview.mp3"
+
+            # 2. Scope fallback from user preferences
+            await client.get(f"{base_url}/api/v1/app/search?query=Discovery", headers=owner_headers)
+            mock_search_service.search.assert_called_with(query="Discovery", scope="global", limit=25)
+
+            # 3. GUEST user gets 403 Forbidden
+            guest_id = 999999
+            await repo.upsert_user(
+                UserAccount(
+                    telegram_id=guest_id,
+                    role=UserRole.GUEST,
+                    display_name="Guest User",
+                )
+            )
+            guest_headers = {"Authorization": f"tma {_make_dev_token(guest_id)}"}
+            guest_resp = await client.get(
+                f"{base_url}/api/v1/app/search?query=test",
+                headers=guest_headers,
+            )
+            assert guest_resp.status_code == 403
+    finally:
+        await server.stop()
+
+    # 4. Service unavailable / None returns empty lists gracefully
+    server_no_svc, _ = await _setup_test_server(
+        tmp_path / "nosvc",
+        owner_telegram_ids=(123456,),
+        dev_mode=True,
+        album_search_service=None,
+    )
+    try:
+        base_url_no_svc = f"http://127.0.0.1:{server_no_svc.bound_port}"
+        owner_headers = {"Authorization": f"tma {_make_dev_token(123456)}"}
+        async with httpx.AsyncClient() as client:
+            resp_empty = await client.get(
+                f"{base_url_no_svc}/api/v1/app/search?query=test",
+                headers=owner_headers,
+            )
+            assert resp_empty.status_code == 200
+            empty_data = resp_empty.json()
+            assert empty_data["albums"] == []
+            assert empty_data["tracks"] == []
+    finally:
+        await server_no_svc.stop()
+
+
+@pytest.mark.anyio
+async def test_webapp_album_gap_analysis_endpoint(tmp_path: Path) -> None:
+    """Verify GET /api/v1/app/albums/{album_id}/gap-analysis endpoint."""
+    mock_search_service = AsyncMock()
+    mock_search_service.analyze_album_gap.return_value = AlbumGapAnalysis(
+        album_id="deezer:302127",
+        title="Discovery",
+        artist="Daft Punk",
+        cover_url="https://cover.jpg",
+        release_date="2001-03-12",
+        total_tracks=2,
+        owned_tracks_count=1,
+        missing_tracks_count=1,
+        provider="deezer",
+        external_url="https://www.deezer.com/album/302127",
+        tracks=[
+            AlbumTrackGap(
+                position=1,
+                title="One More Time",
+                duration_seconds=320,
+                is_owned=True,
+                library_track_id="trk_1",
+            ),
+            AlbumTrackGap(
+                position=2,
+                title="Aerodynamic",
+                duration_seconds=212,
+                is_owned=False,
+                preview_url="https://preview.mp3",
+            ),
+        ],
+    )
+
+    server, repo = await _setup_test_server(
+        tmp_path,
+        owner_telegram_ids=(123456,),
+        dev_mode=True,
+        album_search_service=mock_search_service,
+    )
+    try:
+        base_url = f"http://127.0.0.1:{server.bound_port}"
+        owner_headers = {"Authorization": f"tma {_make_dev_token(123456)}"}
+
+        async with httpx.AsyncClient() as client:
+            # 1. Deezer album ID
+            resp = await client.get(
+                f"{base_url}/api/v1/app/albums/deezer:302127/gap-analysis",
+                headers=owner_headers,
+            )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["album_id"] == "deezer:302127"
+            assert data["title"] == "Discovery"
+            assert data["total_tracks"] == 2
+            assert data["coverage_percent"] == 50.0
+            assert len(data["tracks"]) == 2
+            assert data["tracks"][0]["is_owned"] is True
+            assert data["tracks"][1]["preview_url"] == "https://preview.mp3"
+            mock_search_service.analyze_album_gap.assert_called_with(
+                artist="",
+                album="",
+                provider_release_id="302127",
+            )
+
+            # 2. Local album ID
+            await client.get(
+                f"{base_url}/api/v1/app/albums/local:Daft%20Punk:Discovery/gap-analysis",
+                headers=owner_headers,
+            )
+            mock_search_service.analyze_album_gap.assert_called_with(
+                artist="Daft Punk",
+                album="Discovery",
+                provider_release_id=None,
+            )
+
+            # 3. Guest user gets 403 Forbidden
+            guest_id = 999999
+            await repo.upsert_user(
+                UserAccount(
+                    telegram_id=guest_id,
+                    role=UserRole.GUEST,
+                    display_name="Guest User",
+                )
+            )
+            guest_headers = {"Authorization": f"tma {_make_dev_token(guest_id)}"}
+            guest_resp = await client.get(
+                f"{base_url}/api/v1/app/albums/deezer:302127/gap-analysis",
+                headers=guest_headers,
+            )
+            assert guest_resp.status_code == 403
+    finally:
+        await server.stop()
+
+    # 4. Service unavailable when album_search_service is None -> 503
+    server_no_svc, _ = await _setup_test_server(
+        tmp_path / "nosvc2",
+        owner_telegram_ids=(123456,),
+        dev_mode=True,
+        album_search_service=None,
+    )
+    try:
+        base_url_no_svc = f"http://127.0.0.1:{server_no_svc.bound_port}"
+        owner_headers = {"Authorization": f"tma {_make_dev_token(123456)}"}
+        async with httpx.AsyncClient() as client:
+            resp_503 = await client.get(
+                f"{base_url_no_svc}/api/v1/app/albums/deezer:302127/gap-analysis",
+                headers=owner_headers,
+            )
+            assert resp_503.status_code == 503
+    finally:
+        await server_no_svc.stop()
+
+
+@pytest.mark.anyio
+async def test_get_me_returns_bot_username(tmp_path: Path) -> None:
+    """Verify GET /api/v1/app/auth/me includes bot_username when provided."""
+    server, repo = await _setup_test_server(
+        tmp_path,
+        owner_telegram_ids=(123456,),
+        dev_mode=True,
+        bot_username="music_ingest_bot",
+    )
+    try:
+        base_url = f"http://127.0.0.1:{server.bound_port}"
+        headers = {"Authorization": f"tma {_make_dev_token(123456)}"}
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{base_url}/api/v1/app/auth/me", headers=headers)
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["bot_username"] == "music_ingest_bot"
+    finally:
+        await server.stop()
+
+
+@pytest.mark.anyio
+async def test_send_track_and_album_to_chat(tmp_path: Path) -> None:
+    """Verify POST /api/v1/app/tracks/{id}/send-to-chat and albums/{id}/send-to-chat deliver audio files."""
+    audio_path = tmp_path / "song.flac"
+    audio_path.write_bytes(b"fLaC-content")
+    lrc_path = tmp_path / "song.lrc"
+    lrc_path.write_text("[00:01.00] Synced lyric\n", encoding="utf-8")
+    cover_path = tmp_path / "cover.jpg"
+    cover_path.write_bytes(b"\xff\xd8\xff\xe0-fake-jpeg")
+
+    bot_mock = AsyncMock()
+    bot_mock.send_audio = AsyncMock()
+    bot_mock.send_document = AsyncMock()
+    bot_mock.send_photo = AsyncMock()
+
+    server, repo = await _setup_test_server(
+        tmp_path,
+        owner_telegram_ids=(123456,),
+        dev_mode=True,
+        bot=bot_mock,
+        bot_username="music_ingest_bot",
+    )
+    try:
+        base_url = f"http://127.0.0.1:{server.bound_port}"
+        headers = {"Authorization": f"tma {_make_dev_token(123456)}"}
+
+        track = LibraryTrackRecord(
+            id="trk_send_123",
+            job_id=None,
+            uploaded_by=123456,
+            storage_path=audio_path,
+            fingerprint="fp123",
+            duration_seconds=200,
+            artist="Artist A",
+            album="Album B",
+            title="Track 1",
+            track_number=1,
+            has_synced_lyrics=True,
+        )
+        await repo.upsert_scanned_library_track(track)
+
+        async with httpx.AsyncClient() as client:
+            # 1. Send single track to chat
+            resp = await client.post(
+                f"{base_url}/api/v1/app/tracks/trk_send_123/send-to-chat",
+                headers=headers,
+            )
+            assert resp.status_code == 200
+            assert resp.json()["status"] == "ok"
+            assert bot_mock.send_audio.await_count == 1
+            assert bot_mock.send_document.await_count == 1
+
+            # 2. Send album to chat
+            album_resp = await client.post(
+                f"{base_url}/api/v1/app/albums/local:artist a:album b/send-to-chat",
+                headers=headers,
+                json={"artist": "Artist A", "album": "Album B"},
+            )
+            assert album_resp.status_code == 200
+            assert album_resp.json()["tracks_sent"] == 1
+            assert bot_mock.send_photo.await_count == 1
+
+            # 3. Nonexistent track returns 404
+            bad_resp = await client.post(
+                f"{base_url}/api/v1/app/tracks/trk_nonexistent/send-to-chat",
+                headers=headers,
+            )
+            assert bad_resp.status_code == 404
+    finally:
+        await server.stop()
+
+
+@pytest.mark.anyio
+async def test_send_track_to_chat_without_bot_returns_503(tmp_path: Path) -> None:
+    """Verify send-to-chat returns 503 when bot is not attached."""
+    server, repo = await _setup_test_server(
+        tmp_path,
+        owner_telegram_ids=(123456,),
+        dev_mode=True,
+        bot=None,
+    )
+    try:
+        base_url = f"http://127.0.0.1:{server.bound_port}"
+        headers = {"Authorization": f"tma {_make_dev_token(123456)}"}
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{base_url}/api/v1/app/tracks/trk_123/send-to-chat",
+                headers=headers,
+            )
+            assert resp.status_code == 503
     finally:
         await server.stop()

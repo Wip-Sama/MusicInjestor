@@ -78,8 +78,18 @@ async def test_sqlite_radar_follows_and_releases(tmp_path: Path) -> None:
     assert len(persisted) == 2
     # rel1 should have in_library == True because Future Nostalgia exists in library_tracks!
     assert persisted[0].in_library is True
+    assert persisted[0].library_track_id == "t1"
     # rel2 is not in library
     assert persisted[1].in_library is False
+
+    # Verify find_library_tracks_for_release
+    lib_matches = await repo.find_library_tracks_for_release("Dua Lipa", "Future Nostalgia")
+    assert len(lib_matches) == 1
+    assert lib_matches[0].id == "t1"
+
+    # Verify list_followers_of_artist
+    followers = await repo.list_followers_of_artist("Dua Lipa")
+    assert followers == [12345]
 
     # 5. List releases and get by ID
     all_rels = await repo.list_discovered_releases()

@@ -13,6 +13,8 @@ import {
   Sliders,
   Bell,
   Check,
+  Send,
+  Bot,
 } from 'lucide-react';
 import { useAudioPlayer } from '../../context/AudioPlayerContext';
 import { formatTime } from '../../lib/lrc';
@@ -44,7 +46,28 @@ export const FullscreenPlayer: React.FC = () => {
     updateTrackData,
     isArtistFollowed,
     toggleFollowArtist,
+    sendTrackToChat,
+    openInTelegramBot,
   } = useAudioPlayer();
+  const [isSendingToChat, setIsSendingToChat] = useState<boolean>(false);
+  const [chatStatusText, setChatStatusText] = useState<string | null>(null);
+
+  const handleSendToChat = async () => {
+    if (!currentTrack || isSendingToChat) return;
+    setIsSendingToChat(true);
+    setChatStatusText('Sending...');
+    const res = await sendTrackToChat(currentTrack.id);
+    setChatStatusText(res.ok ? 'Sent to chat!' : 'Failed');
+    setTimeout(() => {
+      setIsSendingToChat(false);
+      setChatStatusText(null);
+    }, 2500);
+  };
+
+  const handleOpenInBot = () => {
+    if (!currentTrack) return;
+    openInTelegramBot(`song_${currentTrack.id}`);
+  };
 
   if (!isPlayerOpen || !currentTrack) return null;
 
@@ -454,6 +477,64 @@ export const FullscreenPlayer: React.FC = () => {
         >
           <Sliders size={16} />
           <span>Studio</span>
+        </button>
+      </div>
+
+      {/* Telegram Actions Bar: Request Song File & Open in Bot */}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          gap: '12px',
+          paddingTop: '8px',
+        }}
+      >
+        <button
+          onClick={handleSendToChat}
+          disabled={isSendingToChat}
+          title="Send audio file and lyrics to Telegram chat"
+          style={{
+            background: 'rgba(255, 255, 255, 0.08)',
+            border: 'none',
+            color: chatStatusText?.includes('Sent')
+              ? '#30d158'
+              : 'var(--tg-theme-button-color, #0a84ff)',
+            borderRadius: '20px',
+            padding: '7px 14px',
+            fontSize: '12px',
+            fontWeight: 600,
+            display: 'flex',
+            alignItems: 'center',
+            gap: '6px',
+            cursor: isSendingToChat ? 'default' : 'pointer',
+            transition: 'all 0.15s ease',
+          }}
+        >
+          <Send size={14} />
+          <span>{chatStatusText || 'Send to Chat'}</span>
+        </button>
+
+        <button
+          onClick={handleOpenInBot}
+          title="Open this song's control page in Telegram bot"
+          style={{
+            background: 'rgba(255, 255, 255, 0.08)',
+            border: 'none',
+            color: 'var(--tg-theme-subtitle-text-color, #8e8e93)',
+            borderRadius: '20px',
+            padding: '7px 14px',
+            fontSize: '12px',
+            fontWeight: 600,
+            display: 'flex',
+            alignItems: 'center',
+            gap: '6px',
+            cursor: 'pointer',
+            transition: 'all 0.15s ease',
+          }}
+        >
+          <Bot size={14} />
+          <span>Open in Bot</span>
         </button>
       </div>
 

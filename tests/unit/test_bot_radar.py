@@ -1,5 +1,6 @@
 """Unit tests for the `/radar` Telegram bot router and keyboards."""
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -13,20 +14,31 @@ from src.bot.keyboards.radar import (
     build_preview_audio_keyboard,
     build_radar_home_keyboard,
     build_release_detail_keyboard,
+    build_release_notification_keyboard,
 )
 from src.bot.routers.radar import (
     format_radar_home_card,
     format_release_detail_card,
+    format_release_notification_card,
     handle_cmd_radar,
     handle_radar_album_tracks,
     handle_radar_other_links,
+    handle_radar_play_full_track,
     handle_radar_preview_audio,
     handle_radar_preview_individual_track,
     handle_radar_toggle_follow,
     handle_radar_view_release,
 )
 from src.config.settings import AppSettings
-from src.core.models import DiscoveredRelease, FollowedArtist, ReleaseTrackPreview, UserAccount, UserRole
+from src.core.models import (
+    DiscoveredRelease,
+    FollowedArtist,
+    LibraryTrackRecord,
+    ReleaseTrackPreview,
+    UserAccount,
+    UserPreferences,
+    UserRole,
+)
 from src.core.ports import GovernanceRepositoryPort
 from src.core.radar import ReleaseRadarService
 
@@ -114,6 +126,8 @@ async def test_handle_radar_view_and_preview() -> None:
     mock_repo = AsyncMock(spec=GovernanceRepositoryPort)
     mock_repo.get_discovered_release.return_value = release
     mock_repo.is_artist_followed.return_value = False
+    mock_repo.get_user_preferences.return_value = UserPreferences(telegram_id=1001)
+    mock_repo.find_library_tracks_for_release.return_value = []
 
     settings = AppSettings()
     mock_radar = AsyncMock(spec=ReleaseRadarService)
@@ -222,6 +236,8 @@ async def test_handle_radar_album_tracks_and_other_platforms() -> None:
 
     mock_repo = AsyncMock(spec=GovernanceRepositoryPort)
     mock_repo.get_discovered_release.return_value = album_release
+    mock_repo.get_user_preferences.return_value = UserPreferences(telegram_id=1001)
+    mock_repo.find_library_tracks_for_release.return_value = []
     mock_radar = AsyncMock(spec=ReleaseRadarService)
     mock_radar.get_release_track_previews.return_value = track_previews
     mock_radar.get_preview_audio_bytes.return_value = b"TRACK_AUDIO_BYTES"
@@ -264,3 +280,113 @@ async def test_handle_radar_album_tracks_and_other_platforms() -> None:
         governance_repository=mock_repo,
     )
     query.message.edit_text.assert_awaited()
+
+
+@pytest.mark.anyio
+async def test_handle_radar_play_full_track(tmp_path: Path) -> None:
+    """Test playing a complete track when in library vs fallback error."""
+    query = MagicMock(spec=CallbackQuery)
+    query.from_user = User(id=1001, is_bot=False, first_name="Test")
+    query.answer = AsyncMock()
+    msg = MagicMock(spec=Message)
+    msg.answer_audio = AsyncMock()
+    query.message = msg
+    user = UserAccount(telegram_id=1001, display_name="Test User", role=UserRole.LISTENER)
+
+    release = DiscoveredRelease(
+        id="deezer:10",
+        artist_name="Ado",
+        title="Show",
+        release_type="single",
+        release_date="2023-09-06",
+        in_library=True,
+    )
+    fake_audio = tmp_path / "Ado - Show.flac"
+    fake_audio.write_bytes(b"FLAC_DATA")
+    fake_lrc = tmp_path / "Ado - Show.lrc"
+    fake_lrc.write_text("[00:01.00] Show lyrics", encoding="utf-8")
+
+    lib_track = LibraryTrackRecord(
+        id="tr_full_123",
+        job_id="job_1",
+        uploaded_by=1001,
+        storage_path=fake_audio,
+        fingerprint="fp_show",
+        duration_seconds=190.0,
+        artist="Ado",
+        album="Show - Single",
+        title="Show",
+        telegram_file_id="tg_file_ado_show",
+    )
+
+    mock_repo = AsyncMock(spec=GovernanceRepositoryPort)
+    mock_repo.get_discovered_release.return_value = release
+    mock_repo.find_library_tracks_for_release.return_value = [lib_track]
+    mock_repo.get_user_preferences.return_value = UserPreferences(telegram_id=1001)
+
+    settings = AppSettings(web_app_url="https://app.example.com")
+
+    # 1. Successful playback using telegram_file_id
+    await handle_radar_play_full_track(
+        query=query,
+        callback_data=RadarCallback(action="play_full", target_id="deezer:10"),
+        governance_repository=mock_repo,
+        settings=settings,
+        current_user=user,
+    )
+    query.message.answer_audio.assert_awaited_once()
+    assert query.message.answer_audio.call_args[0][0] == "tg_file_ado_show"
+
+    # 2. Track not in library
+    mock_repo.find_library_tracks_for_release.return_value = []
+    await handle_radar_play_full_track(
+        query=query,
+        callback_data=RadarCallback(action="play_full", target_id="deezer:10"),
+        governance_repository=mock_repo,
+        settings=settings,
+        current_user=user,
+    )
+    query.answer.assert_awaited_with("Full track not found in library.", show_alert=True)
+
+
+def test_radar_notification_formatting_and_keyboard(tmp_path: Path) -> None:
+    """Test release notification card and keyboard with both full track and preview links."""
+    release = DiscoveredRelease(
+        id="deezer:55",
+        artist_name="YOASOBI",
+        title="Biri-Biri",
+        release_type="single",
+        release_date="2023-11-18",
+        in_library=True,
+        library_track_id="tr_biri_1",
+    )
+    lib_track = LibraryTrackRecord(
+        id="tr_biri_1",
+        job_id="job_2",
+        uploaded_by=1001,
+        storage_path=tmp_path / "biri.mp3",
+        fingerprint="fp_biri",
+        duration_seconds=200.0,
+        artist="YOASOBI",
+        album="Biri-Biri - Single",
+        title="Biri-Biri",
+    )
+
+    # Card formatting
+    card = format_release_notification_card(release, lib_track=lib_track)
+    assert "Available in Library (Full Track)" in card
+    assert "YOASOBI" in card
+    assert "Biri-Biri" in card
+
+    # Keyboard building with Mini App deep-link
+    kb = build_release_notification_keyboard(
+        release,
+        lib_track=lib_track,
+        web_app_url="https://app.example.com",
+    )
+    assert kb.inline_keyboard
+    # Verify Play Full Track and Song in Bot buttons are present
+    button_texts = [btn.text for row in kb.inline_keyboard for btn in row]
+    assert any("Play Full Track" in t for t in button_texts)
+    assert any("Song in Bot" in t for t in button_texts)
+    assert any("Play in Mini App" in t for t in button_texts)

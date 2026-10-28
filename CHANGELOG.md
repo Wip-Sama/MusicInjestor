@@ -12,6 +12,72 @@
 
 ## Completed Milestones
 
+### M39: Telegram Bot Chat Search Routing, Dynamic Tunnel Cache-Busting & Mini App Song Delivery
+- **Telegram Client Menu Button Cache-Busting (`src/bot/routers/commands.py`):**
+  - Added proactive `bot.set_chat_menu_button` invocation during `/start` execution to immediately update the user's client-side Telegram `MenuButtonWebApp` URL whenever Cloudflare quick tunnel generates an ephemeral domain upon restart.
+  - Added `/start album_<album_id>` and `/start gap_<album_id>` bot deep-linking handlers opening album gap inspection cards directly from links.
+- **Telegram Bot Plain Text Search Routing & ID Lookup Refinement (`src/bot/routers/commands.py`, `src/bot/routers/search.py`, `src/bot/ui.py`):**
+  - Created `JobOrTrackIdFilter` replacing greedy regex matching so arbitrary single-word or multi-word search queries fall through cleanly to `search_router` while continuing to support instant inspection of job prefixes (`job-`, `job_`, `pending-job-`), track prefixes (`trk-`, `trk_`, `track-`), UUIDs, and database-registered IDs.
+  - Added external URL pattern recognition in `handle_chat_text_message` presenting informative notices advising direct audio/archive file uploads.
+  - Extracted shared `resolve_oidc_url` helper into `src/bot/ui.py` to decouple router modules and eliminate circular import cycles.
+  - Ensured guest onboarding cards and SSO access links are cleanly rendered across search interactions.
+- **Mini App Audio File Delivery & Bot Deep-Linking (`src/bot/webapp_server.py`, `main.py`, `webapp/`):**
+  - Implemented backend REST endpoints `POST /api/v1/app/tracks/{track_id}/send-to-chat` and `POST /api/v1/app/albums/{album_id}/send-to-chat` in `src/bot/webapp_server.py`.
+  - Added `deliver_track_to_user_chat` helper delivering complete audio files, cover art, and `.lrc` synchronized lyrics sidecars directly to the user's private Telegram chat, automatically persisting Telegram `file_id` cache identifiers.
+  - Attached live `Bot` instance and exposed `bot_username` through `GET /api/v1/app/auth/me`.
+  - Updated React Web Mini App `AudioPlayerContext` with `openInTelegramBot`, `sendTrackToChat`, `sendAlbumToChat`, and `botUsername`.
+  - Added "Send to Chat" and "Open in Bot" actions in `FullscreenPlayer.tsx`, `AlbumGapModal.tsx`, and `TrackCard.tsx` with Telegram SDK haptic feedback.
+
+### M38: Album Search, Library Gap Analysis, Missing Track Previews & Cloudflared Configuration
+- **Cloudflared Tunnel Support & Automated Quick Tunnel (`src/config/settings.py`, `src/bot/tunnel.py`, `.env.example`):**
+  - Added `use_cloudflared_tunnel: bool = False`, `cloudflared_tunnel_url: str = ""`, and `oidc_redirect_path: str = "/api/v1/auth/callback"` to `AppSettings`.
+  - Implemented `update_cloudflared_tunnel_url(tunnel_url)` and model validator automatically deriving `web_app_url` and `oidc_redirect_uri` based on `cloudflared_tunnel_url` and `oidc_redirect_path`.
+  - Created `CloudflareQuickTunnel` process manager in `src/bot/tunnel.py` to auto-discover and spawn `cloudflared tunnel --url http://127.0.0.1:<port>` when `CLOUDFLARED_TUNNEL_URL` is left blank, extracting ephemeral `https://<random>.trycloudflare.com` URLs in real-time and cleaning up on shutdown.
+  - Documented automatic vs fixed tunnel configuration in `.env.example`.
+- **Search Scope Persistence & User Preferences (`src/core/models.py`, `src/db/`):**
+  - Added `search_scope: str = "global"` to `UserPreferences` in `src/core/models.py`.
+  - Added `search_scope` column to SQLite table schema DDL and migrations in `src/db/models.py` and `src/db/database.py`.
+  - Updated `SqliteCatalogRepository` in `src/db/repository.py` to persist and retrieve `search_scope`.
+  - Added search scope toggle to `/settings` in Telegram Bot (`src/bot/routers/commands.py`, `src/bot/keyboards/songs.py`) and Web Mini App (`webapp/src/components/settings/SettingsModal.tsx`).
+- **Domain Models & External/Library Search Interfaces (`src/core/models.py`, `src/core/ports.py`):**
+  - Defined pure dataclasses `AlbumTrackGap`, `AlbumGapAnalysis`, `SearchResultItem`, and `UnifiedSearchResult` in `src/core/models.py`.
+  - Extended `GovernanceRepositoryPort` with `search_library_albums(query, limit)`.
+  - Extended `ReleaseRadarProviderPort` with `search_albums(query, limit)` and `search_tracks(query, limit)`.
+  - Implemented album and track search on `DeezerReleaseProvider` (`src/core/deezer.py`) extracting 30s preview streams and album metadata.
+- **Album Search & Library Gap Service (`src/core/search.py`):**
+  - Created domain service `AlbumSearchService` orchestrating album gap calculation (`analyze_album_gap`) and unified search (`search`).
+  - Reconciles tracks between local library storage and external release providers (Deezer), computing coverage percentage and possession status.
+  - Generates 30-second audio preview snippets for unowned tracks and links library tracks for owned songs.
+- **Chat Search Routing & External URL Detection (`src/bot/routers/search.py`, `src/bot/keyboards/search.py`):**
+  - Preserved standard media upload ingestion for music files and archives.
+  - Added URL pattern recognition notifying users that external web link downloading is not supported and advising direct audio upload.
+  - Converted plain chat text into unified search queries returning matched albums and tracks with coverage badges (`[X/Y owned]`).
+  - Created `AlbumGapCallback` and `SearchActionCallback` (`sep="~"`) supporting interactive album gap overview and on-demand 30s audio previews for missing tracks.
+- **Telegram Web Mini App Integration (`webapp/`):**
+  - Added backend REST endpoints `GET /api/v1/app/search` and `GET /api/v1/app/albums/{album_id}/gap-analysis` in `src/bot/webapp_server.py`.
+  - Created `AlbumGapModal.tsx` in `webapp/src/components/catalog/` displaying album coverage progress bars, track possession indicators, "Play Full" buttons for owned tracks, and "30s Preview" buttons for missing songs.
+  - Integrated album search carousel with gap badges and tap-to-open gap modal into `webapp/src/views/CatalogView.tsx`.
+
+### M37: Full Track Playback vs. Previews & Deep-Linking Across Telegram Bot & Web Mini App
+- **Full Track Playback vs. Previews for Library Releases:**
+  - Extended domain model `DiscoveredRelease` and `ReleaseTrackPreview` in `src/core/models.py` with `library_track_id: str | None = None`.
+  - Added SQLite schema migration for `discovered_releases.library_track_id` in `src/db/models.py` and automatic column migration in `src/db/database.py`.
+  - Added `find_library_tracks_for_release` and `list_followers_of_artist` query ports to `GovernanceRepositoryPort` in `src/core/ports.py` and implemented them in `SqliteCatalogRepository` in `src/db/repository.py` to match releases by artist and album/title.
+  - Updated `ReleaseRadarService.scan_monitored_artists` and background periodic loop in `main.py` to resolve followers with notifications enabled, link matched library track IDs, and dispatch interactive alerts.
+  - **Telegram Bot Playback (`src/bot/routers/radar.py`, `src/bot/keyboards/radar.py`):**
+    - Added `▶️ Play Full Track` action button when a release or preview track is available in the library, delivering complete lossless/transcoded audio along with `.lrc` synced lyrics sidecar directly in chat via `handle_radar_play_full_track`.
+    - Added `🎵 Song in Bot` navigation button navigating directly to the track view in `/songs`.
+  - **Telegram Web Mini App Playback (`webapp/`):**
+    - Updated `handle_get_radar_releases` and `handle_get_radar_release_tracks` in `src/bot/webapp_server.py` to populate and return `library_track_id` for both album releases and individual tracks.
+    - Added `handlePlayFullTrack` in `webapp/src/views/RadarView.tsx` fetching `/api/v1/app/tracks/{id}` to load the full track, audio stream, and synchronized karaoke lyrics into the active player.
+    - Updated release cards and album preview tracklists to display side-by-side `Play Full` and `30s Preview` options with visual badges (`Full`) and primary cover click prioritization for library tracks.
+- **Cross-Platform Bot Deep-Linking (`src/bot/routers/commands.py`, `webapp/src/App.tsx`):**
+  - Extended `/start` handler in `src/bot/routers/commands.py` to support deep links:
+    - `/start song_<track_id>` and `/start track_<track_id>`: Navigates immediately to the song detail card and playback actions in Telegram chat.
+    - `/start release_<release_id>` and `/start radar_<release_id>`: Navigates immediately to the release radar detail card in Telegram chat.
+  - Updated `webapp/src/App.tsx` deep-link parsing to accept both `track_` and `song_` prefixes from `startapp` or `tgWebAppStartParam` query parameters, automatically opening and playing the referenced song.
+  - Attached dynamic `startapp=track_{id}` and `startapp=release_{id}` Mini App launch URLs across Telegram release notifications and preview audio message keyboards.
+
 ### M36: Multi-Track Album Previews, External Streaming Platform Ordering & Clipboard Link Copy
 - **Zero Test Warnings & 100% Radar Test Coverage:**
   - Eliminated 40 `aiohttp.web.NotAppKeyWarning` warnings by introducing typed `EVENT_BUS_KEY: web.AppKey[QueueEventBus] = web.AppKey("event_bus", QueueEventBus)` in `src/bot/webapp_server.py`.

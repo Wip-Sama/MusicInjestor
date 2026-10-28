@@ -25,6 +25,7 @@ import { RadarRelease, RadarFollowItem, TrackItem, ReleaseTrackPreview } from '.
 
 interface RadarViewProps {
   profile?: unknown;
+  initialReleaseId?: string | null;
 }
 
 const triggerHaptic = (style: 'light' | 'medium' | 'heavy' = 'medium') => {
@@ -53,7 +54,7 @@ const triggerNotificationHaptic = (type: 'error' | 'success' | 'warning' = 'succ
   }
 };
 
-export const RadarView: React.FC<RadarViewProps> = () => {
+export const RadarView: React.FC<RadarViewProps> = ({ initialReleaseId }) => {
   const { currentTrack, isPlaying, playTrack, togglePlay, toggleFollowArtist } = useAudioPlayer();
   const [releases, setReleases] = useState<RadarRelease[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
@@ -85,9 +86,16 @@ export const RadarView: React.FC<RadarViewProps> = () => {
     apiFetch(`/api/v1/app/radar/releases?${params.toString()}`)
       .then((res) => res.json())
       .then((data) => {
-        setReleases(data.items || []);
+        const items = data.items || [];
+        setReleases(items);
         setFollowedCount(data.followed_count || 0);
         setLoading(false);
+        if (initialReleaseId) {
+          const matched = items.find((r: RadarRelease) => r.id === initialReleaseId);
+          if (matched && (matched.track_count > 1 || matched.release_type === 'album')) {
+            setExpandedReleaseId(matched.id);
+          }
+        }
       })
       .catch((err) => {
         console.error('Failed to load radar releases:', err);
@@ -252,6 +260,28 @@ export const RadarView: React.FC<RadarViewProps> = () => {
       return;
     }
     window.open(url, '_blank', 'noreferrer');
+  };
+
+  const handlePlayFullTrack = async (release: RadarRelease, trackId?: string | null) => {
+    const targetId = trackId || release.library_track_id;
+    if (!targetId) return;
+
+    if (currentTrack?.id === targetId) {
+      togglePlay();
+      return;
+    }
+
+    try {
+      const res = await apiFetch(`/api/v1/app/tracks/${targetId}`);
+      if (res.ok) {
+        const fullTrack: TrackItem = await res.json();
+        playTrack(fullTrack, [fullTrack]);
+      } else {
+        console.warn('Failed to load full track details from library');
+      }
+    } catch (err) {
+      console.error('Error fetching full track for playback:', err);
+    }
   };
 
   const handlePlayPreview = (release: RadarRelease) => {
@@ -481,10 +511,29 @@ export const RadarView: React.FC<RadarViewProps> = () => {
                         <Music size={28} color="#8e8e93" />
                       )}
 
-                      {/* Play Preview Overlay Button */}
-                      {rel.preview_url && (
+                      {/* Play Overlay Button: Complete Track if available in library, else 30s preview */}
+                      {(rel.in_library && rel.library_track_id) ? (
+                        <button
+                          onClick={() => handlePlayFullTrack(rel)}
+                          title="Stream complete track from library"
+                          style={{
+                            position: 'absolute',
+                            inset: 0,
+                            backgroundColor: currentTrack?.id === rel.library_track_id && isPlaying ? 'rgba(48, 209, 88, 0.7)' : 'rgba(0, 0, 0, 0.35)',
+                            border: 'none',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            cursor: 'pointer',
+                            color: '#fff',
+                          }}
+                        >
+                          {currentTrack?.id === rel.library_track_id && isPlaying ? <Pause size={22} /> : <Play size={22} style={{ marginLeft: '2px' }} />}
+                        </button>
+                      ) : rel.preview_url ? (
                         <button
                           onClick={() => handlePlayPreview(rel)}
+                          title="Listen to 30s preview"
                           style={{
                             position: 'absolute',
                             inset: 0,
@@ -499,7 +548,7 @@ export const RadarView: React.FC<RadarViewProps> = () => {
                         >
                           {isCurrentlyPlaying ? <Pause size={22} /> : <Play size={22} style={{ marginLeft: '2px' }} />}
                         </button>
-                      )}
+                      ) : null}
                     </div>
 
                     {/* Metadata */}
@@ -621,10 +670,35 @@ export const RadarView: React.FC<RadarViewProps> = () => {
                         </button>
                       )}
 
-                      {/* Single preview button */}
+                      {/* Complete Track streaming option for releases in library */}
+                      {rel.in_library && rel.library_track_id && (
+                        <button
+                          onClick={() => handlePlayFullTrack(rel)}
+                          title="Stream complete track from library"
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '4px',
+                            padding: '5px 8px',
+                            borderRadius: '6px',
+                            border: 'none',
+                            backgroundColor: currentTrack?.id === rel.library_track_id && isPlaying ? 'rgba(48, 209, 88, 0.25)' : 'rgba(48, 209, 88, 0.15)',
+                            color: '#30d158',
+                            cursor: 'pointer',
+                            fontSize: '12px',
+                            fontWeight: 600,
+                          }}
+                        >
+                          {currentTrack?.id === rel.library_track_id && isPlaying ? <Pause size={13} /> : <Play size={13} />}
+                          <span>{currentTrack?.id === rel.library_track_id && isPlaying ? 'Pause' : 'Play Full'}</span>
+                        </button>
+                      )}
+
+                      {/* 30-Second audio preview snippet option */}
                       {rel.preview_url && (
                         <button
                           onClick={() => handlePlayPreview(rel)}
+                          title="Listen to 30-second preview snippet"
                           style={{
                             display: 'flex',
                             alignItems: 'center',
@@ -839,24 +913,47 @@ export const RadarView: React.FC<RadarViewProps> = () => {
                                 }}
                               >
                                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
-                                  <button
-                                    onClick={() => handlePlayAlbumTrackPreview(rel, trk, releaseTracksCache[rel.id] || [])}
-                                    style={{
-                                      width: '24px',
-                                      height: '24px',
-                                      borderRadius: '50%',
-                                      border: 'none',
-                                      backgroundColor: isTrkPlaying ? 'var(--tg-theme-button-color, #0a84ff)' : 'rgba(255, 255, 255, 0.12)',
-                                      color: '#fff',
-                                      display: 'flex',
-                                      alignItems: 'center',
-                                      justifyContent: 'center',
-                                      cursor: 'pointer',
-                                      flexShrink: 0,
-                                    }}
-                                  >
-                                    {isTrkPlaying ? <Pause size={11} /> : <Play size={11} style={{ marginLeft: '1px' }} />}
-                                  </button>
+                                  {trk.library_track_id ? (
+                                    <button
+                                      onClick={() => handlePlayFullTrack(rel, trk.library_track_id)}
+                                      title="Play complete track from library"
+                                      style={{
+                                        width: '24px',
+                                        height: '24px',
+                                        borderRadius: '50%',
+                                        border: 'none',
+                                        backgroundColor: currentTrack?.id === trk.library_track_id && isPlaying ? '#30d158' : 'rgba(48, 209, 88, 0.25)',
+                                        color: currentTrack?.id === trk.library_track_id && isPlaying ? '#fff' : '#30d158',
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        justifyContent: 'center',
+                                        cursor: 'pointer',
+                                        flexShrink: 0,
+                                      }}
+                                    >
+                                      {currentTrack?.id === trk.library_track_id && isPlaying ? <Pause size={11} /> : <Play size={11} style={{ marginLeft: '1px' }} />}
+                                    </button>
+                                  ) : (
+                                    <button
+                                      onClick={() => handlePlayAlbumTrackPreview(rel, trk, releaseTracksCache[rel.id] || [])}
+                                      title="Listen to 30s preview snippet"
+                                      style={{
+                                        width: '24px',
+                                        height: '24px',
+                                        borderRadius: '50%',
+                                        border: 'none',
+                                        backgroundColor: isTrkPlaying ? 'var(--tg-theme-button-color, #0a84ff)' : 'rgba(255, 255, 255, 0.12)',
+                                        color: '#fff',
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        justifyContent: 'center',
+                                        cursor: 'pointer',
+                                        flexShrink: 0,
+                                      }}
+                                    >
+                                      {isTrkPlaying ? <Pause size={11} /> : <Play size={11} style={{ marginLeft: '1px' }} />}
+                                    </button>
+                                  )}
                                   <span style={{ fontSize: '11px', color: '#8e8e93', width: '18px' }}>
                                     {trk.track_position}.
                                   </span>
@@ -873,9 +970,16 @@ export const RadarView: React.FC<RadarViewProps> = () => {
                                     {trk.title}
                                   </span>
                                 </div>
-                                <span style={{ fontSize: '11px', color: '#8e8e93', flexShrink: 0 }}>
-                                  30s
-                                </span>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexShrink: 0 }}>
+                                  {trk.library_track_id && (
+                                    <span style={{ fontSize: '10px', fontWeight: 700, padding: '1px 4px', borderRadius: '4px', backgroundColor: 'rgba(48, 209, 88, 0.2)', color: '#30d158' }}>
+                                      Full
+                                    </span>
+                                  )}
+                                  <span style={{ fontSize: '11px', color: '#8e8e93' }}>
+                                    {trk.library_track_id ? 'Library' : '30s'}
+                                  </span>
+                                </div>
                               </div>
                             );
                           })}

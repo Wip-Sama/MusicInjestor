@@ -6,6 +6,7 @@ from pathlib import Path
 import aiosqlite
 
 from src.db.models import (
+    DISCOVERED_RELEASES_MIGRATION_COLUMNS,
     INDEX_DDL_STATEMENTS,
     INGESTION_JOBS_MIGRATION_COLUMNS,
     LIBRARY_TRACKS_MIGRATION_COLUMNS,
@@ -96,6 +97,22 @@ async def _migrate_user_settings_table(conn: aiosqlite.Connection) -> None:
         logger.info("Migrated user_settings table; added columns: %s", ", ".join(added_columns))
 
 
+async def _migrate_discovered_releases_table(conn: aiosqlite.Connection) -> None:
+    """Add any missing columns to an existing `discovered_releases` table."""
+    cursor = await conn.execute("PRAGMA table_info(discovered_releases);")
+    rows = await cursor.fetchall()
+    existing_columns = {str(row[1]) for row in rows}
+
+    added_columns: list[str] = []
+    for col_name, col_ddl in DISCOVERED_RELEASES_MIGRATION_COLUMNS:
+        if col_name not in existing_columns:
+            await conn.execute(f"ALTER TABLE discovered_releases ADD COLUMN {col_name} {col_ddl};")
+            added_columns.append(col_name)
+
+    if added_columns:
+        logger.info("Migrated discovered_releases table; added columns: %s", ", ".join(added_columns))
+
+
 class SqliteDatabaseManager:
     """Manages SQLite connections in WAL mode and initializes/migrates schema tables."""
 
@@ -118,6 +135,7 @@ class SqliteDatabaseManager:
                 await conn.execute(statement)
             await _migrate_users_table(conn)
             await _migrate_user_settings_table(conn)
+            await _migrate_discovered_releases_table(conn)
             await _migrate_ingestion_jobs_table(conn)
             await _migrate_library_tracks_table(conn)
             for statement in INDEX_DDL_STATEMENTS:

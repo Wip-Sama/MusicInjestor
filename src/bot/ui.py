@@ -8,6 +8,10 @@ from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 
+from src.config.settings import AppSettings
+from src.core.models import UserAccount
+from src.core.oidc import AuthentikOidcService
+
 logger = logging.getLogger(__name__)
 
 
@@ -355,3 +359,15 @@ async def resolve_back_callback(
     if len(stack) >= 2:
         return stack[-2]
     return default_back
+
+
+def resolve_oidc_url(
+    user: UserAccount | None,
+    oidc_service: AuthentikOidcService | None,
+    settings: AppSettings | None,
+) -> str | None:
+    """Build an Authentik OAuth2 authorization URL for `user` if OIDC is enabled."""
+    if user is not None and oidc_service is not None and (settings is None or settings.oidc_enabled):
+        url, _ = oidc_service.build_authorization_url(user.telegram_id)
+        return url
+    return None

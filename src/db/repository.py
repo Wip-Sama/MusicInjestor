@@ -691,7 +691,7 @@ class SqliteCatalogRepository:
             cursor = await conn.execute(
                 """
                 SELECT telegram_id, stream_format, stream_bitrate, auto_lyrics_search,
-                       theme, streaming_platform_order
+                       theme, streaming_platform_order, search_scope, search_scope
                 FROM user_settings
                 WHERE telegram_id = ?
                 """,
@@ -706,14 +706,17 @@ class SqliteCatalogRepository:
                     auto_lyrics_search=bool(row[3]),
                     theme=str(row[4]),
                     streaming_platform_order=str(row[5] or "deezer,tidal,qobuz,spotify,apple_music"),
+                    search_scope=str(row[6])
+                    if len(row) > 6 and row[6] is not None and str(row[6]).strip()
+                    else "global",
                 )
             default_prefs = UserPreferences(telegram_id=telegram_id)
             await conn.execute(
                 """
                 INSERT OR IGNORE INTO user_settings (
                     telegram_id, stream_format, stream_bitrate, auto_lyrics_search,
-                    theme, streaming_platform_order
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    theme, streaming_platform_order, search_scope
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     telegram_id,
@@ -722,6 +725,7 @@ class SqliteCatalogRepository:
                     1 if default_prefs.auto_lyrics_search else 0,
                     default_prefs.theme,
                     default_prefs.streaming_platform_order,
+                    default_prefs.search_scope,
                 ),
             )
             await conn.commit()
@@ -734,14 +738,15 @@ class SqliteCatalogRepository:
                 """
                 INSERT INTO user_settings (
                     telegram_id, stream_format, stream_bitrate, auto_lyrics_search,
-                    theme, streaming_platform_order, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    theme, streaming_platform_order, search_scope, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(telegram_id) DO UPDATE SET
                     stream_format = excluded.stream_format,
                     stream_bitrate = excluded.stream_bitrate,
                     auto_lyrics_search = excluded.auto_lyrics_search,
                     theme = excluded.theme,
                     streaming_platform_order = excluded.streaming_platform_order,
+                    search_scope = excluded.search_scope,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
@@ -751,6 +756,7 @@ class SqliteCatalogRepository:
                     1 if preferences.auto_lyrics_search else 0,
                     preferences.theme,
                     preferences.streaming_platform_order,
+                    preferences.search_scope,
                 ),
             )
             await conn.commit()
@@ -1224,6 +1230,28 @@ class SqliteCatalogRepository:
             )
             rows = await cursor.fetchall()
         return [_row_to_library_track(tuple(r)) for r in rows]
+
+    async def search_library_albums(
+        self,
+        query: str,
+        limit: int = 20,
+    ) -> list[tuple[str, str, int, int | None]]:
+        """Return distinct `(artist, album, track_count, min_year)` matching query."""
+        clean_q = f"%{query.strip().lower()}%"
+        async with self._db.connect() as conn:
+            cursor = await conn.execute(
+                """
+                SELECT artist, album, COUNT(*), MIN(year)
+                FROM library_tracks
+                WHERE (lower(artist) LIKE ? OR lower(album) LIKE ?) AND album != ''
+                GROUP BY lower(artist), lower(album)
+                ORDER BY album ASC
+                LIMIT ?
+                """,
+                (clean_q, clean_q, max(1, limit)),
+            )
+            rows = await cursor.fetchall()
+            return [(str(r[0]), str(r[1]), int(r[2]), int(r[3]) if r[3] is not None else None) for r in rows]
 
     async def create_tag_correction_request(
         self,
@@ -1706,6 +1734,42 @@ class SqliteCatalogRepository:
             rows = await cur.fetchall()
             return [str(r[0]).strip() for r in rows if r[0] and str(r[0]).strip()]
 
+    async def find_library_tracks_for_release(
+        self,
+        artist_name: str,
+        release_title: str,
+    ) -> list[LibraryTrackRecord]:
+        """Find ingested library tracks corresponding to a discovered release by artist and album/title."""
+        clean_artist = artist_name.strip()
+        clean_title = release_title.strip()
+        async with self._db.connect() as conn:
+            cursor = await conn.execute(
+                f"""
+                SELECT {_LIBRARY_TRACK_COLUMNS}
+                FROM library_tracks
+                WHERE LOWER(artist) = LOWER(?)
+                  AND (LOWER(album) = LOWER(?) OR LOWER(title) = LOWER(?))
+                ORDER BY COALESCE(track_number, 1) ASC, title ASC
+                """,
+                (clean_artist, clean_title, clean_title),
+            )
+            rows = await cursor.fetchall()
+            return [_row_to_library_track(tuple(r)) for r in rows]
+
+    async def list_followers_of_artist(self, artist_name: str) -> list[int]:
+        """Return telegram_ids of users who follow artist_name and have notifications enabled."""
+        clean = artist_name.strip()
+        async with (
+            self._db.connect() as conn,
+            conn.execute(
+                "SELECT telegram_id FROM artist_follows "
+                "WHERE LOWER(artist_name) = LOWER(?) AND notify_telegram = 1",
+                (clean,),
+            ) as cur,
+        ):
+            rows = await cur.fetchall()
+            return [int(r[0]) for r in rows]
+
     async def upsert_discovered_releases(
         self,
         releases: Sequence[DiscoveredRelease],
@@ -1722,15 +1786,17 @@ class SqliteCatalogRepository:
                     "WHERE LOWER(artist) = LOWER(?) AND LOWER(album) = LOWER(?) LIMIT 1",
                     (rel.artist_name.strip(), rel.title.strip()),
                 ) as cur:
-                    in_lib = (await cur.fetchone()) is not None or rel.in_library
+                    matching = await self.find_library_tracks_for_release(rel.artist_name, rel.title)
+                    in_lib = (await cur.fetchone()) is not None or bool(matching) or rel.in_library
+                    lib_track_id = matching[0].id if matching else rel.library_track_id
 
                 await conn.execute(
                     """
                     INSERT INTO discovered_releases (
                         id, artist_name, title, release_type, release_date,
                         cover_url, preview_url, external_url, provider,
-                        provider_release_id, track_count, in_library, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        provider_release_id, track_count, in_library, library_track_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     ON CONFLICT(id) DO UPDATE SET
                         title = excluded.title,
                         release_date = excluded.release_date,
@@ -1738,7 +1804,10 @@ class SqliteCatalogRepository:
                         preview_url = coalesce(excluded.preview_url, discovered_releases.preview_url),
                         external_url = coalesce(excluded.external_url, discovered_releases.external_url),
                         track_count = excluded.track_count,
-                        in_library = excluded.in_library
+                        in_library = excluded.in_library,
+                        library_track_id = coalesce(
+                            excluded.library_track_id, discovered_releases.library_track_id
+                        )
                     """,
                     (
                         rel.id,
@@ -1753,6 +1822,7 @@ class SqliteCatalogRepository:
                         rel.provider_release_id,
                         rel.track_count,
                         1 if in_lib else 0,
+                        lib_track_id,
                     ),
                 )
                 persisted.append(
@@ -1769,6 +1839,7 @@ class SqliteCatalogRepository:
                         provider_release_id=rel.provider_release_id,
                         track_count=rel.track_count,
                         in_library=in_lib,
+                        library_track_id=lib_track_id,
                         created_at=rel.created_at,
                     )
                 )
@@ -1785,7 +1856,7 @@ class SqliteCatalogRepository:
         query = (
             "SELECT id, artist_name, title, release_type, release_date, cover_url, "
             "preview_url, external_url, provider, provider_release_id, track_count, "
-            "in_library, created_at FROM discovered_releases "
+            "in_library, created_at, library_track_id FROM discovered_releases "
         )
         params: list[object] = []
         if artist_name and artist_name.strip():
@@ -1807,7 +1878,7 @@ class SqliteCatalogRepository:
                 """
                 SELECT id, artist_name, title, release_type, release_date, cover_url,
                        preview_url, external_url, provider, provider_release_id, track_count,
-                       in_library, created_at
+                       in_library, created_at, library_track_id
                 FROM discovered_releases
                 WHERE id = ?
                 """,
@@ -1855,7 +1926,7 @@ class SqliteCatalogRepository:
             "SELECT rn.id, rn.telegram_id, rn.release_id, rn.is_read, rn.delivered_at, rn.created_at, "
             "dr.id, dr.artist_name, dr.title, dr.release_type, dr.release_date, dr.cover_url, "
             "dr.preview_url, dr.external_url, dr.provider, dr.provider_release_id, dr.track_count, "
-            "dr.in_library, dr.created_at "
+            "dr.in_library, dr.created_at, dr.library_track_id "
             "FROM release_notifications rn "
             "JOIN discovered_releases dr ON rn.release_id = dr.id "
             "WHERE rn.telegram_id = ? "
@@ -2005,4 +2076,5 @@ def _row_to_discovered_release(row: Sequence[object]) -> DiscoveredRelease:
         track_count=int(str(row[10])),
         in_library=bool(int(str(row[11]))),
         created_at=_parse_iso_datetime(row[12]) or datetime.now(UTC),
+        library_track_id=str(row[13]) if len(row) > 13 and row[13] is not None else None,
     )

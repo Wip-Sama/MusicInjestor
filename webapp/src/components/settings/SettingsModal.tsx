@@ -15,6 +15,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, p
     streamBitrate,
     autoLyricsSearch,
     streamingPlatformOrder,
+    searchScope,
     updateUserSettings,
   } = useAudioPlayer();
   const [draggedIdx, setDraggedIdx] = React.useState<number | null>(null);
@@ -308,7 +309,62 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, p
             </div>
           </div>
 
-                    {/* Section: Platform Link Priority */}
+          {/* Section: Search Preferences */}
+          <div>
+            <div
+              style={{
+                fontSize: '13px',
+                fontWeight: 700,
+                textTransform: 'uppercase',
+                color: 'var(--tg-theme-subtitle-text-color, #8e8e93)',
+                letterSpacing: '0.5px',
+                marginBottom: '8px',
+              }}
+            >
+              Search Scope &amp; Discovery
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+              <button
+                type="button"
+                onClick={() => updateUserSettings({ search_scope: 'global' })}
+                style={{
+                  padding: '10px 12px',
+                  borderRadius: '10px',
+                  border: searchScope === 'global' ? '1px solid var(--tg-theme-button-color, #0a84ff)' : '1px solid rgba(255, 255, 255, 0.08)',
+                  backgroundColor: searchScope === 'global' ? 'rgba(10, 132, 255, 0.15)' : 'var(--tg-theme-secondary-bg-color, #2c2c2e)',
+                  color: searchScope === 'global' ? 'var(--tg-theme-button-color, #0a84ff)' : 'var(--tg-theme-text-color, #fff)',
+                  cursor: 'pointer',
+                  textAlign: 'left',
+                }}
+              >
+                <div style={{ fontSize: '13px', fontWeight: 600 }}>🌐 Global Search</div>
+                <div style={{ fontSize: '11px', color: 'var(--tg-theme-subtitle-text-color, #8e8e93)', marginTop: '2px' }}>
+                  Deezer + Library with audio previews
+                </div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => updateUserSettings({ search_scope: 'library' })}
+                style={{
+                  padding: '10px 12px',
+                  borderRadius: '10px',
+                  border: searchScope === 'library' ? '1px solid var(--tg-theme-button-color, #0a84ff)' : '1px solid rgba(255, 255, 255, 0.08)',
+                  backgroundColor: searchScope === 'library' ? 'rgba(10, 132, 255, 0.15)' : 'var(--tg-theme-secondary-bg-color, #2c2c2e)',
+                  color: searchScope === 'library' ? 'var(--tg-theme-button-color, #0a84ff)' : 'var(--tg-theme-text-color, #fff)',
+                  cursor: 'pointer',
+                  textAlign: 'left',
+                }}
+              >
+                <div style={{ fontSize: '13px', fontWeight: 600 }}>📚 Library Only</div>
+                <div style={{ fontSize: '11px', color: 'var(--tg-theme-subtitle-text-color, #8e8e93)', marginTop: '2px' }}>
+                  Local collection only
+                </div>
+              </button>
+            </div>
+          </div>
+
+          {/* Section: Platform Link Priority */}
           <div>
             <div
               style={{

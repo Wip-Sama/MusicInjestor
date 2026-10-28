@@ -231,3 +231,114 @@ class DeezerReleaseProvider(ReleaseRadarProviderPort):
                 "Failed to fetch Deezer releases for artist %s (%s): %s", artist_name, cleaned_id, exc
             )
             return []
+
+    async def search_albums(
+        self,
+        query: str,
+        limit: int = 10,
+    ) -> list[DiscoveredRelease]:
+        """Search Deezer for albums matching query."""
+        cleaned_query = query.strip()
+        if not cleaned_query:
+            return []
+
+        url = f"{self._base_url}/search/album?q={quote_plus(cleaned_query)}&limit={max(1, limit)}"
+        try:
+            client = await self._get_client()
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                logger.warning(
+                    "Deezer album search returned HTTP %d for '%s'", resp.status_code, cleaned_query
+                )
+                return []
+
+            payload: dict[str, Any] = resp.json()
+            albums_data: list[dict[str, Any]] = payload.get("data", [])
+            results: list[DiscoveredRelease] = []
+            for item in albums_data:
+                alb_id = str(item.get("id", "")).strip()
+                if not alb_id:
+                    continue
+                title = str(item.get("title", "")).strip()
+                artist_info = item.get("artist", {})
+                artist_name = (
+                    str(artist_info.get("name", "")).strip() if isinstance(artist_info, dict) else ""
+                )
+                record_type = str(item.get("record_type", "album")).lower()
+                cover_url = (
+                    str(
+                        item.get("cover_xl") or item.get("cover_big") or item.get("cover_medium") or ""
+                    ).strip()
+                    or None
+                )
+                external_url = str(item.get("link", "")).strip() or f"https://www.deezer.com/album/{alb_id}"
+                track_count = int(item.get("nb_tracks") or 1)
+
+                results.append(
+                    DiscoveredRelease(
+                        id=f"deezer:{alb_id}",
+                        artist_name=artist_name,
+                        title=title,
+                        release_type=record_type,
+                        release_date="",
+                        cover_url=cover_url,
+                        preview_url=None,
+                        external_url=external_url,
+                        provider="deezer",
+                        provider_release_id=alb_id,
+                        track_count=track_count,
+                        in_library=False,
+                        created_at=datetime.now(UTC),
+                    )
+                )
+            return results
+        except Exception as exc:
+            logger.warning("Failed to search Deezer albums for '%s': %s", cleaned_query, exc)
+            return []
+
+    async def search_tracks(
+        self,
+        query: str,
+        limit: int = 10,
+    ) -> list[ReleaseTrackPreview]:
+        """Search Deezer for individual tracks with 30-second audio previews."""
+        cleaned_query = query.strip()
+        if not cleaned_query:
+            return []
+
+        url = f"{self._base_url}/search/track?q={quote_plus(cleaned_query)}&limit={max(1, limit)}"
+        try:
+            client = await self._get_client()
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                logger.warning(
+                    "Deezer track search returned HTTP %d for '%s'", resp.status_code, cleaned_query
+                )
+                return []
+
+            payload: dict[str, Any] = resp.json()
+            tracks_data: list[dict[str, Any]] = payload.get("data", [])
+            results: list[ReleaseTrackPreview] = []
+            for idx, track in enumerate(tracks_data):
+                preview = str(track.get("preview", "")).strip()
+                title = str(track.get("title", "")).strip()
+                tr_id = str(track.get("id") or idx + 1)
+                pos = int(track.get("track_position") or idx + 1)
+                dur = int(track.get("duration") or 30)
+                artist_info = track.get("artist", {})
+                art_name = str(artist_info.get("name", "")).strip() if isinstance(artist_info, dict) else ""
+                full_title = f"{art_name} - {title}" if art_name else title
+                if preview and preview.startswith("http"):
+                    results.append(
+                        ReleaseTrackPreview(
+                            track_id=tr_id,
+                            title=full_title,
+                            preview_url=preview,
+                            duration_seconds=dur,
+                            track_position=pos,
+                        )
+                    )
+            return results
+        except Exception as exc:
+            logger.warning("Failed to search Deezer tracks for '%s': %s", cleaned_query, exc)
+            return []

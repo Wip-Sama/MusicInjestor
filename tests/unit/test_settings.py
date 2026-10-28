@@ -190,3 +190,31 @@ def test_load_settings_oidc_role_mapping(tmp_path: Path) -> None:
         "authentik-admins": "ADMIN",
         "authentik-curators": "UPLOADER",
     }
+
+
+def test_cloudflared_tunnel_configuration_derives_webapp_and_oidc() -> None:
+    """Verify USE_CLOUDFLARED_TUNNEL automatically derives web_app_url and oidc_redirect_uri."""
+    settings = AppSettings(
+        use_cloudflared_tunnel=True,
+        cloudflared_tunnel_url="https://music-tunnel.trycloudflare.com/",
+        oidc_redirect_path="/api/v1/auth/callback",
+    )
+    assert settings.web_app_url == "https://music-tunnel.trycloudflare.com"
+    assert settings.oidc_redirect_uri == "https://music-tunnel.trycloudflare.com/api/v1/auth/callback"
+
+
+def test_apply_cloudflared_tunnel_overrides_dynamic_url() -> None:
+    """Verify dynamic quick tunnel URL updates both web_app_url and oidc_redirect_uri."""
+    settings = AppSettings(
+        use_cloudflared_tunnel=True,
+        cloudflared_tunnel_url="",
+        oidc_redirect_path="/api/v1/auth/callback",
+        web_app_url="http://localhost:8080",
+    )
+    assert settings.cloudflared_tunnel_url == ""
+    assert settings.web_app_url == "http://localhost:8080"
+
+    settings.update_cloudflared_tunnel_url("https://dynamic-quick.trycloudflare.com")
+    assert settings.cloudflared_tunnel_url == "https://dynamic-quick.trycloudflare.com"
+    assert settings.web_app_url == "https://dynamic-quick.trycloudflare.com"
+    assert settings.oidc_redirect_uri == "https://dynamic-quick.trycloudflare.com/api/v1/auth/callback"

@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aiogram.filters import CommandObject
 from aiogram.types import CallbackQuery, Message, User
 
 from src.bot.routers.commands import (
@@ -25,12 +26,14 @@ from src.bot.routers.commands import (
 from src.config.settings import AppSettings
 from src.core.bulk_research import BulkResearchProgress, set_active_bulk_research
 from src.core.models import (
+    DiscoveredRelease,
     IngestionJob,
     JobState,
     LibraryTrackRecord,
     TagCorrectionRequest,
     TagCorrectionStatus,
     UserAccount,
+    UserPreferences,
     UserRole,
 )
 
@@ -417,3 +420,123 @@ async def test_handle_cmd_app() -> None:
     msg_ok = _make_msg("/app")
     await handle_cmd_app(msg_ok, settings=settings)
     assert msg_ok.answer.called
+
+
+@pytest.mark.anyio
+async def test_handle_start_deep_link_song_and_track(tmp_path: Path) -> None:
+    """Verify /start song_<id> and /start track_<id> deep links display the song detail card."""
+    user = UserAccount(telegram_id=100, display_name="Listener", role=UserRole.LISTENER)
+    fake_audio = tmp_path / "song.mp3"
+    fake_audio.write_bytes(b"MP3_DATA")
+    track = LibraryTrackRecord(
+        id="trk_999",
+        job_id="job_1",
+        uploaded_by=100,
+        storage_path=fake_audio,
+        fingerprint="fp123",
+        duration_seconds=180.0,
+        artist="Yoasobi",
+        album="The Book",
+        title="Racing into the Night",
+    )
+    gov_repo = MagicMock()
+    gov_repo.get_library_track = AsyncMock(return_value=track)
+    gov_repo.is_artist_followed = AsyncMock(return_value=True)
+
+    settings = AppSettings(
+        bot_token="fake:token",
+        telegram_api_id=1,
+        telegram_api_hash="0123456789abcdef",
+        web_app_url="https://app.example.com",
+    )
+
+    # 1. /start song_trk_999
+    msg1 = _make_msg("/start song_trk_999")
+    cmd1 = CommandObject(prefix="/", command="start", args="song_trk_999")
+    await handle_start(
+        msg1,
+        command=cmd1,
+        current_user=user,
+        settings=settings,
+        governance_repository=gov_repo,
+    )
+    assert msg1.answer.called
+    assert "Racing into the Night" in msg1.answer.call_args[0][0]
+
+    # 2. /start track_trk_999
+    msg2 = _make_msg("/start track_trk_999")
+    cmd2 = CommandObject(prefix="/", command="start", args="track_trk_999")
+    await handle_start(
+        msg2,
+        command=cmd2,
+        current_user=user,
+        settings=settings,
+        governance_repository=gov_repo,
+    )
+    assert msg2.answer.called
+    assert "Racing into the Night" in msg2.answer.call_args[0][0]
+
+    # 3. Not found
+    gov_repo.get_library_track = AsyncMock(return_value=None)
+    msg3 = _make_msg("/start song_unknown")
+    cmd3 = CommandObject(prefix="/", command="start", args="song_unknown")
+    await handle_start(
+        msg3,
+        command=cmd3,
+        current_user=user,
+        settings=settings,
+        governance_repository=gov_repo,
+    )
+    assert "Song not found in the music library" in msg3.answer.call_args[0][0]
+
+
+@pytest.mark.anyio
+async def test_handle_start_deep_link_release() -> None:
+    """Verify /start release_<id> deep links display the release detail card."""
+    user = UserAccount(telegram_id=100, display_name="Listener", role=UserRole.LISTENER)
+    release = DiscoveredRelease(
+        id="deezer:12345",
+        artist_name="Ado",
+        title="Kura Kura",
+        release_type="single",
+        release_date="2023-10-05",
+        in_library=False,
+    )
+    gov_repo = MagicMock()
+    gov_repo.get_discovered_release = AsyncMock(return_value=release)
+    gov_repo.is_artist_followed = AsyncMock(return_value=False)
+    gov_repo.get_user_preferences = AsyncMock(return_value=UserPreferences(telegram_id=100))
+    gov_repo.find_library_tracks_for_release = AsyncMock(return_value=[])
+
+    settings = AppSettings(
+        bot_token="fake:token",
+        telegram_api_id=1,
+        telegram_api_hash="0123456789abcdef",
+        web_app_url="https://app.example.com",
+    )
+
+    # 1. Successful release lookup
+    msg = _make_msg("/start release_deezer:12345")
+    cmd = CommandObject(prefix="/", command="start", args="release_deezer:12345")
+    await handle_start(
+        msg,
+        command=cmd,
+        current_user=user,
+        settings=settings,
+        governance_repository=gov_repo,
+    )
+    assert msg.answer.called
+    assert "Kura Kura" in msg.answer.call_args[0][0]
+
+    # 2. Not found
+    gov_repo.get_discovered_release = AsyncMock(return_value=None)
+    msg_err = _make_msg("/start release_unknown")
+    cmd_err = CommandObject(prefix="/", command="start", args="release_unknown")
+    await handle_start(
+        msg_err,
+        command=cmd_err,
+        current_user=user,
+        settings=settings,
+        governance_repository=gov_repo,
+    )
+    assert "Discovered release not found" in msg_err.answer.call_args[0][0]

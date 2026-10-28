@@ -1,6 +1,6 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { hapticFeedback } from '@telegram-apps/sdk-react';
-import { getRawInitData, apiFetch } from '../lib/auth';
+import { getRawInitData, apiFetch, fetchCurrentProfile } from '../lib/auth';
 import { TrackItem } from '../types/music';
 
 export type RepeatMode = 'off' | 'all' | 'one';
@@ -22,6 +22,8 @@ interface AudioPlayerContextType {
   streamBitrate: number;
   autoLyricsSearch: boolean;
   streamingPlatformOrder: string;
+  searchScope: 'global' | 'library';
+  setSearchScope: (scope: 'global' | 'library') => void;
   followedArtists: Set<string>;
   isArtistFollowed: (artistName: string) => boolean;
   toggleFollowArtist: (artistName: string) => Promise<boolean>;
@@ -38,11 +40,16 @@ interface AudioPlayerContextType {
   setIsQueueOpen: (open: boolean) => void;
   updateTrackData: (updated: TrackItem) => void;
   switchStreamQuality: (format: string, bitrate: number) => void;
+  botUsername: string | null;
+  openInTelegramBot: (startParam: string) => void;
+  sendTrackToChat: (trackId: string) => Promise<{ ok: boolean; message: string }>;
+  sendAlbumToChat: (albumId: string, artist?: string, album?: string) => Promise<{ ok: boolean; message: string }>;
   updateUserSettings: (settings: {
     stream_format?: string;
     stream_bitrate?: number;
     auto_lyrics_search?: boolean;
     streaming_platform_order?: string;
+    search_scope?: 'global' | 'library';
   }) => Promise<void>;
 }
 
@@ -69,8 +76,18 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
   const [streamBitrate, setStreamBitrate] = useState<number>(192);
   const [autoLyricsSearch, setAutoLyricsSearch] = useState<boolean>(true);
   const [streamingPlatformOrder, setStreamingPlatformOrder] = useState<string>('deezer,tidal,qobuz,spotify,apple_music');
+  const [searchScope, setSearchScope] = useState<'global' | 'library'>('global');
 
   const [followedArtists, setFollowedArtists] = useState<Set<string>>(new Set());
+  const [botUsername, setBotUsername] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetchCurrentProfile()
+      .then((p) => {
+        if (p.bot_username) setBotUsername(p.bot_username);
+      })
+      .catch(() => {});
+  }, []);
 
   // Fetch followed artists on mount for instant synchronous follow status checks
   const refreshFollows = useCallback(async () => {
@@ -171,6 +188,9 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
         if (data.streaming_platform_order) {
           setStreamingPlatformOrder(data.streaming_platform_order);
+        }
+        if (data.search_scope === 'global' || data.search_scope === 'library') {
+          setSearchScope(data.search_scope);
         }
       })
       .catch((err) => {
@@ -349,17 +369,20 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
     stream_bitrate?: number;
     auto_lyrics_search?: boolean;
     streaming_platform_order?: string;
+    search_scope?: 'global' | 'library';
   }) => {
     triggerHaptic();
     const newFormat = settings.stream_format ?? streamFormat;
     const newBitrate = settings.stream_bitrate ?? streamBitrate;
     const newLyrics = settings.auto_lyrics_search ?? autoLyricsSearch;
     const newOrder = settings.streaming_platform_order ?? streamingPlatformOrder;
+    const newScope = settings.search_scope ?? searchScope;
 
     setStreamFormat(newFormat);
     setStreamBitrate(newBitrate);
     setAutoLyricsSearch(newLyrics);
     setStreamingPlatformOrder(newOrder);
+    setSearchScope(newScope);
 
     try {
       await apiFetch('/api/v1/app/user/settings', {
@@ -370,6 +393,7 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
           stream_bitrate: newBitrate,
           auto_lyrics_search: newLyrics,
           streaming_platform_order: newOrder,
+          search_scope: newScope,
         }),
       });
     } catch (err) {
@@ -389,6 +413,87 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
       }
     }
   };
+
+  const openInTelegramBot = useCallback(
+    (startParam: string) => {
+      if (hapticFeedback.impactOccurred.isAvailable()) {
+        hapticFeedback.impactOccurred('light');
+      }
+      const tgGlobal = (window as unknown as { Telegram?: { WebApp?: { openTelegramLink?: (url: string) => void } } })
+        ?.Telegram?.WebApp;
+      const cleanParam = startParam.startsWith('?') ? startParam.slice(1) : startParam;
+      const botName = botUsername || 'bot';
+      const tgUrl = `https://t.me/${botName}?start=${encodeURIComponent(cleanParam)}`;
+      if (tgGlobal?.openTelegramLink) {
+        tgGlobal.openTelegramLink(tgUrl);
+      } else {
+        window.open(tgUrl, '_blank');
+      }
+    },
+    [botUsername]
+  );
+
+  const sendTrackToChat = useCallback(
+    async (trackId: string): Promise<{ ok: boolean; message: string }> => {
+      if (hapticFeedback.impactOccurred.isAvailable()) {
+        hapticFeedback.impactOccurred('medium');
+      }
+      try {
+        const res = await apiFetch(`/api/v1/app/tracks/${encodeURIComponent(trackId)}/send-to-chat`, {
+          method: 'POST',
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          if (hapticFeedback.notificationOccurred.isAvailable()) {
+            hapticFeedback.notificationOccurred('success');
+          }
+          return { ok: true, message: data.message || 'Track sent to your Telegram chat!' };
+        }
+        if (hapticFeedback.notificationOccurred.isAvailable()) {
+          hapticFeedback.notificationOccurred('error');
+        }
+        return { ok: false, message: data.error || 'Failed to send track to Telegram chat.' };
+      } catch (err: unknown) {
+        if (hapticFeedback.notificationOccurred.isAvailable()) {
+          hapticFeedback.notificationOccurred('error');
+        }
+        return { ok: false, message: (err as Error).message || 'Network error.' };
+      }
+    },
+    []
+  );
+
+  const sendAlbumToChat = useCallback(
+    async (albumId: string, artist?: string, album?: string): Promise<{ ok: boolean; message: string }> => {
+      if (hapticFeedback.impactOccurred.isAvailable()) {
+        hapticFeedback.impactOccurred('medium');
+      }
+      try {
+        const res = await apiFetch(`/api/v1/app/albums/${encodeURIComponent(albumId)}/send-to-chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ artist, album }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          if (hapticFeedback.notificationOccurred.isAvailable()) {
+            hapticFeedback.notificationOccurred('success');
+          }
+          return { ok: true, message: data.message || 'Album tracks sent to your Telegram chat!' };
+        }
+        if (hapticFeedback.notificationOccurred.isAvailable()) {
+          hapticFeedback.notificationOccurred('error');
+        }
+        return { ok: false, message: data.error || 'Failed to send album tracks to chat.' };
+      } catch (err: unknown) {
+        if (hapticFeedback.notificationOccurred.isAvailable()) {
+          hapticFeedback.notificationOccurred('error');
+        }
+        return { ok: false, message: (err as Error).message || 'Network error.' };
+      }
+    },
+    []
+  );
 
   const togglePlay = () => {
     triggerHaptic();
@@ -527,7 +632,13 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
         setIsQueueOpen,
         updateTrackData,
         switchStreamQuality,
+        searchScope,
+        setSearchScope,
         updateUserSettings,
+        botUsername,
+        openInTelegramBot,
+        sendTrackToChat,
+        sendAlbumToChat,
       }}
     >
       {children}

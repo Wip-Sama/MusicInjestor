@@ -5,9 +5,10 @@ import json
 import logging
 import os
 from pathlib import Path
+from typing import Self
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,11 @@ _YAML_SECTION_KEY_MAP: dict[str, dict[str, str]] = {
         "dev_mode": "WEB_APP_DEV_MODE",
         "listen_host": "WEB_LISTEN_HOST",
         "listen_port": "WEB_LISTEN_PORT",
+    },
+    "cloudflare": {
+        "use_tunnel": "USE_CLOUDFLARED_TUNNEL",
+        "tunnel_url": "CLOUDFLARED_TUNNEL_URL",
+        "oidc_redirect_path": "OIDC_REDIRECT_PATH",
     },
     "radar": {
         "enabled": "RADAR_ENABLED",
@@ -205,6 +211,11 @@ class AppSettings(BaseModel):
     web_listen_host: str = Field(default="0.0.0.0")
     web_listen_port: int = Field(default=8080, ge=0, le=65535)
 
+    # Cloudflare Tunnel (cloudflared) settings
+    use_cloudflared_tunnel: bool = Field(default=False)
+    cloudflared_tunnel_url: str = Field(default="")
+    oidc_redirect_path: str = Field(default="/api/v1/auth/callback")
+
     # Release Radar & Artist Monitoring settings
     radar_enabled: bool = Field(default=True)
     radar_sync_interval_seconds: int = Field(default=43200, ge=60)
@@ -225,11 +236,43 @@ class AppSettings(BaseModel):
         "oidc_token_url",
         "oidc_userinfo_url",
         "web_app_url",
+        "cloudflared_tunnel_url",
     )
     @classmethod
     def strip_trailing_slash(cls, value: str) -> str:
         """Normalize base URLs by stripping trailing slashes."""
         return value.rstrip("/")
+
+    def update_cloudflared_tunnel_url(self, tunnel_url: str) -> Self:
+        """Dynamically update the active tunnel URL and re-derive public endpoints."""
+        cleaned = tunnel_url.strip().rstrip("/")
+        if cleaned:
+            self.cloudflared_tunnel_url = cleaned
+
+        if self.use_cloudflared_tunnel and self.cloudflared_tunnel_url:
+            tunnel_base = self.cloudflared_tunnel_url.strip().rstrip("/")
+            if (
+                not self.web_app_url
+                or not self.web_app_url.strip()
+                or "localhost" in self.web_app_url
+                or "127.0.0.1" in self.web_app_url
+            ):
+                self.web_app_url = tunnel_base
+            default_oidc_redirect = "http://localhost:8080/api/v1/auth/callback"
+            if (
+                not self.oidc_redirect_uri
+                or self.oidc_redirect_uri == default_oidc_redirect
+                or "localhost" in self.oidc_redirect_uri
+                or "127.0.0.1" in self.oidc_redirect_uri
+            ):
+                path_part = self.oidc_redirect_path.strip().lstrip("/")
+                self.oidc_redirect_uri = f"{tunnel_base}/{path_part}"
+        return self
+
+    @model_validator(mode="after")
+    def _validate_cloudflared_tunnel(self) -> Self:
+        """Derive web_app_url and oidc_redirect_uri when Cloudflare Tunnel mode is enabled."""
+        return self.update_cloudflared_tunnel_url(self.cloudflared_tunnel_url)
 
     def ensure_directories(self) -> None:
         """Apply optional process umask and create required scratch, library, and DB directories."""
@@ -341,6 +384,8 @@ def load_settings(
         "OIDC_LISTEN_HOST": "oidc_listen_host",
         "WEB_APP_URL": "web_app_url",
         "WEB_LISTEN_HOST": "web_listen_host",
+        "CLOUDFLARED_TUNNEL_URL": "cloudflared_tunnel_url",
+        "OIDC_REDIRECT_PATH": "oidc_redirect_path",
     }
     for env_key, field_name in str_mappings.items():
         if env_key in merged_env and merged_env[env_key] != "":
@@ -369,6 +414,9 @@ def load_settings(
 
     if "WEB_APP_DEV_MODE" in merged_env and merged_env["WEB_APP_DEV_MODE"] != "":
         raw_kwargs["web_app_dev_mode"] = _parse_bool(merged_env["WEB_APP_DEV_MODE"])
+
+    if "USE_CLOUDFLARED_TUNNEL" in merged_env and merged_env["USE_CLOUDFLARED_TUNNEL"] != "":
+        raw_kwargs["use_cloudflared_tunnel"] = _parse_bool(merged_env["USE_CLOUDFLARED_TUNNEL"])
 
     if "AUTO_APPROVE_CONFIDENCE" in merged_env and merged_env["AUTO_APPROVE_CONFIDENCE"] != "":
         raw_kwargs["auto_approve_confidence"] = float(merged_env["AUTO_APPROVE_CONFIDENCE"])

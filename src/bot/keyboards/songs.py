@@ -659,6 +659,15 @@ def build_user_settings_keyboard(
             callback_data=SettingsCallback(action="platforms", value="order").pack(),
         )
     )
+    scope_btn_label = (
+        "🔍 Scope: 🌐 Global Search" if prefs.search_scope == "global" else "🔍 Scope: 📚 Library Only"
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text=scope_btn_label,
+            callback_data=SettingsCallback(action="scope", value="toggle").pack(),
+        )
+    )
 
     if user is not None and user.is_oidc_linked:
         builder.row(

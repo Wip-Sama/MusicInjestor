@@ -14,6 +14,8 @@ from typing import Any
 from urllib.parse import urlencode
 
 import mutagen
+from aiogram import Bot
+from aiogram.types import FSInputFile
 from aiohttp import BodyPartReader, ClientSession, WSMsgType, web
 from mutagen.mp4 import MP4Cover
 
@@ -34,6 +36,7 @@ from src.core.models import (
     AuditLogEntry,
     IngestionJob,
     JobState,
+    LibraryTrackRecord,
     LyricsData,
     Permission,
     TrackMetadata,
@@ -57,6 +60,7 @@ from src.core.rbac import (
     has_permission,
     require_permission,
 )
+from src.core.search import AlbumSearchService
 from src.core.transcoder import (
     async_transcode_audio,
     default_transcode_cache,
@@ -339,6 +343,81 @@ async def authenticate_tma_request(
     return user, validated_data
 
 
+async def deliver_track_to_user_chat(
+    bot: Bot,
+    chat_id: int,
+    track: LibraryTrackRecord,
+    governance_repository: GovernanceRepositoryPort | None = None,
+) -> None:
+    """Deliver a library track audio file and optional synced lyrics sidecar to a user's Telegram chat."""
+    sent = None
+    if track.source_chat_id is not None and track.source_message_id is not None:
+        try:
+            sent = await bot.forward_message(
+                chat_id=chat_id,
+                from_chat_id=track.source_chat_id,
+                message_id=track.source_message_id,
+            )
+            return
+        except Exception as exc:
+            logger.debug("Forwarding track %s failed, falling back to audio send: %s", track.id, exc)
+
+    if track.telegram_file_id:
+        try:
+            sent = await bot.send_audio(
+                chat_id=chat_id,
+                audio=track.telegram_file_id,
+                title=track.title,
+                performer=track.artist,
+                caption=(
+                    f"🎵 <b>{html.escape(track.artist)} - {html.escape(track.title)}</b>\n"
+                    f"<blockquote>Album: <code>{html.escape(track.album)}</code></blockquote>"
+                ),
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            logger.debug("Cached file_id send for %s failed, uploading from disk: %s", track.id, exc)
+
+    if sent is None:
+        if not track.storage_path.is_file():
+            raise FileNotFoundError(f"Audio file for track {track.id} not found on disk.")
+        sent = await bot.send_audio(
+            chat_id=chat_id,
+            audio=FSInputFile(track.storage_path),
+            title=track.title,
+            performer=track.artist,
+            caption=(
+                f"🎵 <b>{html.escape(track.artist)} - {html.escape(track.title)}</b>\n"
+                f"<blockquote>Album: <code>{html.escape(track.album)}</code></blockquote>"
+            ),
+            parse_mode="HTML",
+        )
+
+    file_id = getattr(getattr(sent, "audio", None), "file_id", None)
+    sent_msg_id = getattr(sent, "message_id", None)
+    if governance_repository is not None and (file_id or sent_msg_id):
+        with contextlib.suppress(Exception):
+            await governance_repository.cache_track_telegram_file(
+                track.id,
+                telegram_file_id=file_id if isinstance(file_id, str) else None,
+                source_chat_id=chat_id,
+                source_message_id=sent_msg_id if isinstance(sent_msg_id, int) else None,
+            )
+
+    lrc_path = track.storage_path.with_suffix(".lrc")
+    if lrc_path.is_file():
+        with contextlib.suppress(Exception):
+            await bot.send_document(
+                chat_id=chat_id,
+                document=FSInputFile(lrc_path),
+                caption=(
+                    f"📝 <b>Synced Lyrics</b>\n"
+                    f"<blockquote>{html.escape(track.artist)} - {html.escape(track.title)}</blockquote>"
+                ),
+                parse_mode="HTML",
+            )
+
+
 def build_webapp_api(
     bot_token: str,
     governance_service: GovernanceService,
@@ -355,6 +434,9 @@ def build_webapp_api(
     scratch_dir: Path | None = None,
     event_bus: QueueEventBus | None = None,
     radar_service: ReleaseRadarService | None = None,
+    album_search_service: AlbumSearchService | None = None,
+    bot: Bot | None = None,
+    bot_username: str | None = None,
 ) -> web.Application:
     """Construct an `aiohttp.web.Application` exposing TMA API, OIDC callbacks, and static assets."""
     app = web.Application()
@@ -441,6 +523,7 @@ def build_webapp_api(
             "permissions": permissions,
             "is_owner": is_owner,
             "start_param": validated_data.get("start_param", ""),
+            "bot_username": bot_username,
         }
         return web.json_response(response_payload)
 
@@ -492,6 +575,7 @@ def build_webapp_api(
                 "auto_lyrics_search": prefs.auto_lyrics_search,
                 "theme": prefs.theme,
                 "streaming_platform_order": prefs.streaming_platform_order,
+                "search_scope": prefs.search_scope,
             }
         )
 
@@ -539,6 +623,10 @@ def build_webapp_api(
         else:
             new_platform_order = current.streaming_platform_order
 
+        new_search_scope = str(body.get("search_scope") or current.search_scope).strip().lower()
+        if new_search_scope not in {"global", "library"}:
+            new_search_scope = current.search_scope
+
         updated = UserPreferences(
             telegram_id=user.telegram_id,
             stream_format=new_format,
@@ -546,6 +634,7 @@ def build_webapp_api(
             auto_lyrics_search=new_auto_lyrics,
             theme=new_theme,
             streaming_platform_order=new_platform_order,
+            search_scope=new_search_scope,
         )
         saved = await governance_service._repo.update_user_preferences(updated)
         return web.json_response(
@@ -556,6 +645,7 @@ def build_webapp_api(
                 "auto_lyrics_search": saved.auto_lyrics_search,
                 "theme": saved.theme,
                 "streaming_platform_order": saved.streaming_platform_order,
+                "search_scope": saved.search_scope,
             }
         )
 
@@ -928,6 +1018,137 @@ def build_webapp_api(
         )
 
     app.router.add_get("/api/v1/app/tracks/{track_id}/lyrics", handle_get_lyrics)
+
+    # 2.5b Deliver track to Telegram Chat
+    async def handle_send_track_to_chat(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        if bot is None:
+            raise web.HTTPServiceUnavailable(
+                text=json.dumps({"error": "Telegram Bot instance is not attached to Web Server."}),
+                content_type="application/json",
+            )
+        if catalog_repository is None:
+            raise web.HTTPServiceUnavailable(
+                text=json.dumps({"error": "Catalog repository unavailable."}),
+                content_type="application/json",
+            )
+        track_id = request.match_info.get("track_id", "").strip()
+        record = await catalog_repository.get_library_track(track_id)
+        if record is None:
+            raise web.HTTPNotFound(
+                text=json.dumps({"error": "Track not found."}),
+                content_type="application/json",
+            )
+        try:
+            await deliver_track_to_user_chat(
+                bot=bot,
+                chat_id=user.telegram_id,
+                track=record,
+                governance_repository=catalog_repository,
+            )
+        except Exception as exc:
+            logger.error("Failed to send track %s to chat %s: %s", track_id, user.telegram_id, exc)
+            return web.json_response({"error": str(exc)}, status=500)
+
+        return web.json_response(
+            {
+                "status": "ok",
+                "message": f"Track '{record.title}' sent to your Telegram chat.",
+                "track_id": record.id,
+            }
+        )
+
+    app.router.add_post("/api/v1/app/tracks/{track_id}/send-to-chat", handle_send_track_to_chat)
+
+    # 2.5c Deliver full album tracks to Telegram Chat
+    async def handle_send_album_to_chat(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        if bot is None:
+            raise web.HTTPServiceUnavailable(
+                text=json.dumps({"error": "Telegram Bot instance is not attached to Web Server."}),
+                content_type="application/json",
+            )
+        if catalog_repository is None:
+            raise web.HTTPServiceUnavailable(
+                text=json.dumps({"error": "Catalog repository unavailable."}),
+                content_type="application/json",
+            )
+
+        album_id = request.match_info.get("album_id", "").strip()
+        body: dict[str, Any] = {}
+        with contextlib.suppress(Exception):
+            body = await request.json()
+
+        artist = str(body.get("artist", "")).strip()
+        album = str(body.get("album", "")).strip()
+
+        if not artist or not album:
+            if album_id.startswith("local:"):
+                parts = album_id.split(":", 2)
+                if len(parts) == 3:
+                    artist, album = parts[1], parts[2]
+            elif album_search_service is not None and album_id.startswith("deezer:"):
+                deezer_id = album_id.split(":", 1)[1]
+                gap = await album_search_service.analyze_album_gap("", "", provider_release_id=deezer_id)
+                artist, album = gap.artist, gap.title
+
+        if not artist or not album:
+            raise web.HTTPBadRequest(
+                text=json.dumps({"error": "Artist and album parameters are required."}),
+                content_type="application/json",
+            )
+
+        tracks = await catalog_repository.list_album_tracks(artist, album)
+        if not tracks:
+            raise web.HTTPNotFound(
+                text=json.dumps({"error": f"No library tracks found for '{artist} - {album}'."}),
+                content_type="application/json",
+            )
+
+        first_track = tracks[0]
+        cover_path = first_track.storage_path.parent / "cover.jpg"
+        if cover_path.is_file():
+            with contextlib.suppress(Exception):
+                await bot.send_photo(
+                    chat_id=user.telegram_id,
+                    photo=FSInputFile(cover_path),
+                    caption=(
+                        f"💿 <b>{html.escape(artist)} - {html.escape(album)}</b>\n"
+                        f"<blockquote><code>{len(tracks)}</code> track(s) from your library</blockquote>"
+                    ),
+                    parse_mode="HTML",
+                )
+
+        sent_count = 0
+        for trk in tracks:
+            try:
+                await deliver_track_to_user_chat(
+                    bot=bot,
+                    chat_id=user.telegram_id,
+                    track=trk,
+                    governance_repository=catalog_repository,
+                )
+                sent_count += 1
+            except Exception as exc:
+                logger.warning("Failed to send track %s of album to chat: %s", trk.id, exc)
+
+        return web.json_response(
+            {
+                "status": "ok",
+                "message": f"Sent {sent_count} track(s) for '{album}' to your Telegram chat.",
+                "tracks_sent": sent_count,
+            }
+        )
+
+    app.router.add_post("/api/v1/app/albums/{album_id}/send-to-chat", handle_send_album_to_chat)
 
     # 2.6 Propose song edit (dry-run preview calculating diff and target filesystem path)
     async def handle_propose_edit(request: web.Request) -> web.Response:
@@ -2911,6 +3132,15 @@ def build_webapp_api(
         for r in items_slice:
             links = build_streaming_platform_links(r.artist_name, r.title, deezer_url=r.external_url)
             prim_plat, prim_url = resolve_primary_platform_link(links, prefs.platform_priority_list)
+            lib_track_id = r.library_track_id
+            if (
+                r.in_library
+                and not lib_track_id
+                and hasattr(catalog_repository, "find_library_tracks_for_release")
+            ):
+                matching = await catalog_repository.find_library_tracks_for_release(r.artist_name, r.title)
+                if matching:
+                    lib_track_id = matching[0].id
             serialized.append(
                 {
                     "id": r.id,
@@ -2924,6 +3154,7 @@ def build_webapp_api(
                     "provider": r.provider,
                     "track_count": r.track_count,
                     "in_library": r.in_library,
+                    "library_track_id": lib_track_id,
                     "is_followed": r.artist_name.strip().lower() in followed_names,
                     "external_links": links,
                     "primary_platform": prim_plat,
@@ -3027,16 +3258,33 @@ def build_webapp_api(
         if radar_service is not None:
             tracks = await radar_service.get_release_track_previews(release.provider_release_id)
 
-        serialized = [
-            {
-                "track_id": trk.track_id,
-                "title": trk.title,
-                "preview_url": trk.preview_url,
-                "duration_seconds": trk.duration_seconds,
-                "track_position": trk.track_position,
-            }
-            for trk in tracks
-        ]
+        lib_tracks = []
+        if release.in_library and hasattr(catalog_repository, "find_library_tracks_for_release"):
+            lib_tracks = await catalog_repository.find_library_tracks_for_release(
+                release.artist_name, release.title
+            )
+
+        serialized = []
+        for trk in tracks:
+            matched_lib = None
+            if lib_tracks:
+                for lt in lib_tracks:
+                    if (
+                        lt.track_number == trk.track_position
+                        or lt.title.strip().lower() == trk.title.strip().lower()
+                    ):
+                        matched_lib = lt
+                        break
+            serialized.append(
+                {
+                    "track_id": trk.track_id,
+                    "title": trk.title,
+                    "preview_url": trk.preview_url,
+                    "duration_seconds": trk.duration_seconds,
+                    "track_position": trk.track_position,
+                    "library_track_id": matched_lib.id if matched_lib else None,
+                }
+            )
         return web.json_response({"release_id": release_id, "tracks": serialized})
 
     app.router.add_get("/api/v1/app/radar/releases", handle_get_radar_releases)
@@ -3044,6 +3292,130 @@ def build_webapp_api(
     app.router.add_get("/api/v1/app/radar/follows", handle_get_radar_follows)
     app.router.add_post("/api/v1/app/radar/follow", handle_post_radar_follow)
     app.router.add_post("/api/v1/app/radar/scan", handle_post_radar_scan)
+
+    # 2.15 Unified Album/Track Search and Album Gap Analysis
+    async def handle_get_app_search(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        if not has_permission(user, Permission.VIEW_CATALOG):
+            raise web.HTTPForbidden(
+                text=json.dumps({"error": "Catalog access restricted. Permission VIEW_CATALOG is required."}),
+                content_type="application/json",
+            )
+        if album_search_service is None:
+            return web.json_response({"query": "", "scope": "global", "albums": [], "tracks": []})
+
+        query = request.query.get("query", "").strip()
+        scope = request.query.get("scope", "").strip()
+        if not scope and governance_service and hasattr(governance_service, "_repo"):
+            prefs = await governance_service._repo.get_user_preferences(user.telegram_id)
+            scope = prefs.search_scope or "global"
+        scope = "library" if scope.lower() in ("library", "local") else "global"
+
+        result = await album_search_service.search(query=query, scope=scope, limit=25)
+        return web.json_response(
+            {
+                "query": result.query,
+                "scope": result.scope,
+                "albums": [
+                    {
+                        "id": alb.id,
+                        "title": alb.title,
+                        "artist": alb.artist,
+                        "cover_url": alb.cover_url,
+                        "in_library": alb.in_library,
+                        "total_tracks": alb.total_tracks,
+                        "owned_tracks_count": alb.owned_tracks_count,
+                        "missing_tracks_count": alb.missing_tracks_count,
+                        "external_url": alb.external_url,
+                    }
+                    for alb in result.albums
+                ],
+                "tracks": [
+                    {
+                        "id": trk.id,
+                        "title": trk.title,
+                        "artist": trk.artist,
+                        "album": trk.album,
+                        "in_library": trk.in_library,
+                        "library_track_id": trk.library_track_id,
+                        "preview_url": trk.preview_url,
+                        "duration_seconds": trk.duration_seconds,
+                    }
+                    for trk in result.tracks
+                ],
+            }
+        )
+
+    app.router.add_get("/api/v1/app/search", handle_get_app_search)
+
+    async def handle_get_album_gap_analysis(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        if not has_permission(user, Permission.VIEW_CATALOG):
+            raise web.HTTPForbidden(
+                text=json.dumps({"error": "Catalog access restricted. Permission VIEW_CATALOG is required."}),
+                content_type="application/json",
+            )
+        if album_search_service is None:
+            raise web.HTTPServiceUnavailable(
+                text=json.dumps({"error": "Album search service unavailable."}),
+                content_type="application/json",
+            )
+
+        album_id = request.match_info.get("album_id", "").strip()
+        provider_id: str | None = None
+        art_name = request.query.get("artist", "").strip()
+        alb_name = request.query.get("album", "").strip()
+
+        if album_id.startswith("deezer:"):
+            provider_id = album_id.replace("deezer:", "", 1)
+        elif album_id.startswith("local:"):
+            parts = album_id.split(":", 2)
+            if len(parts) >= 3:
+                art_name, alb_name = parts[1], parts[2]
+
+        gap = await album_search_service.analyze_album_gap(
+            artist=art_name,
+            album=alb_name,
+            provider_release_id=provider_id,
+        )
+        return web.json_response(
+            {
+                "album_id": gap.album_id,
+                "title": gap.title,
+                "artist": gap.artist,
+                "cover_url": gap.cover_url,
+                "release_date": gap.release_date,
+                "total_tracks": gap.total_tracks,
+                "owned_tracks_count": gap.owned_tracks_count,
+                "missing_tracks_count": gap.missing_tracks_count,
+                "coverage_percent": gap.coverage_percent,
+                "is_complete": gap.is_complete,
+                "provider": gap.provider,
+                "external_url": gap.external_url,
+                "tracks": [
+                    {
+                        "position": t.position,
+                        "title": t.title,
+                        "duration_seconds": t.duration_seconds,
+                        "is_owned": t.is_owned,
+                        "library_track_id": t.library_track_id,
+                        "preview_url": t.preview_url,
+                        "disk_number": t.disk_number,
+                    }
+                    for t in gap.tracks
+                ],
+            }
+        )
+
+    app.router.add_get("/api/v1/app/albums/{album_id}/gap-analysis", handle_get_album_gap_analysis)
 
     # 4. SPA Static Files & Fallback Handler (with Vite dev proxy support in dev_mode)
     resolved_static = static_dir.resolve() if static_dir else None
@@ -3182,6 +3554,9 @@ class BotWebServer:
         scratch_dir: Path | None = None,
         event_bus: QueueEventBus | None = None,
         radar_service: ReleaseRadarService | None = None,
+        album_search_service: AlbumSearchService | None = None,
+        bot: Bot | None = None,
+        bot_username: str | None = None,
     ) -> None:
         self._bot_token = bot_token
         self._governance_service = governance_service
@@ -3200,6 +3575,9 @@ class BotWebServer:
         self._scratch_dir = scratch_dir
         self._event_bus = event_bus
         self._radar_service = radar_service
+        self._album_search_service = album_search_service
+        self._bot = bot
+        self._bot_username = bot_username
 
         self._app = build_webapp_api(
             bot_token=bot_token,
@@ -3217,6 +3595,9 @@ class BotWebServer:
             scratch_dir=scratch_dir,
             event_bus=event_bus,
             radar_service=radar_service,
+            album_search_service=album_search_service,
+            bot=bot,
+            bot_username=bot_username,
         )
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
