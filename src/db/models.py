@@ -138,6 +138,7 @@ CREATE TABLE IF NOT EXISTS user_settings (
     theme TEXT NOT NULL DEFAULT 'system',
     streaming_platform_order TEXT NOT NULL DEFAULT 'deezer,tidal,qobuz,spotify,apple_music',
     search_scope TEXT NOT NULL DEFAULT 'global',
+    notifications_enabled INTEGER NOT NULL DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -286,6 +287,7 @@ USERS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (("oidc_role_override", "
 USER_SETTINGS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("streaming_platform_order", "TEXT NOT NULL DEFAULT 'deezer,tidal,qobuz,spotify,apple_music'"),
     ("search_scope", "TEXT NOT NULL DEFAULT 'global'"),
+    ("notifications_enabled", "INTEGER NOT NULL DEFAULT 1"),
 )
 
 DISCOVERED_RELEASES_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (("library_track_id", "TEXT"),)

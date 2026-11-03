@@ -20,6 +20,7 @@ import {
   cancelJob,
   selectCandidate,
   manualSearch,
+  setJobReleaseLink,
   connectQueueEvents,
 } from '../lib/queueApi';
 import { QueueJob, QueueResponse, QueueEvent, ActiveBulkResearch, CandidateItem } from '../types/queue';
@@ -186,6 +187,19 @@ export const IngestQueueView: React.FC<IngestQueueViewProps> = ({ profile }) => 
       await loadQueue();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Failed to select release candidate');
+      await loadQueue();
+    }
+  };
+
+  const handleSetReleaseLink = async (jobId: string, link: string) => {
+    try {
+      const updated = await setJobReleaseLink(jobId, link);
+      setQueueData((prev) =>
+        prev ? { ...prev, jobs: prev.jobs.map((j) => (j.job_id === jobId ? updated : j)) } : null
+      );
+      await loadQueue();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Failed to set release link');
       await loadQueue();
     }
   };
@@ -538,6 +552,7 @@ export const IngestQueueView: React.FC<IngestQueueViewProps> = ({ profile }) => 
               onSelectCandidate={handleSelectCandidate}
               onManualSearch={handleManualSearch}
               onOpenEdit={handleOpenEdit}
+              onSetReleaseLink={handleSetReleaseLink}
             />
           ))
         ) : (

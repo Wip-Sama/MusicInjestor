@@ -16,6 +16,7 @@ from src.bot.routers.admin import (
     handle_adduser_command,
     handle_admin_command,
     handle_admin_dashboard_callback,
+    handle_job_link_input,
     handle_new_user_id_input,
     handle_queue_cancel_callback,
     handle_queue_job_control_callback,
@@ -527,6 +528,30 @@ async def test_handle_admin_dashboard_callback_actions(tmp_path: Path):
     await handle_admin_dashboard_callback(cb, current_user=admin, governance_repository=gov_repo)
     assert "Audit Logs" in cb.message.edit_text.call_args[0][0]
 
+    # admin:debug
+    cb = _make_callback("admin:debug")
+    await handle_admin_dashboard_callback(cb, current_user=admin, governance_repository=gov_repo)
+    assert "Debug & Tests" in cb.message.edit_text.call_args[0][0]
+
+    # admin:debug_test_radar
+    cb = _make_callback("admin:debug_test_radar")
+    cb.bot.send_message = AsyncMock()
+    await handle_admin_dashboard_callback(
+        cb, current_user=admin, governance_repository=gov_repo, settings=AppSettings(bot_token="123:abc")
+    )
+    cb.bot.send_message.assert_awaited()
+
+    # admin:log_channel
+    cb = _make_callback("admin:log_channel")
+    cb.bot.get_chat = AsyncMock(return_value=MagicMock(username="my_log_channel", invite_link=None))
+    await handle_admin_dashboard_callback(
+        cb,
+        current_user=admin,
+        governance_repository=gov_repo,
+        settings=AppSettings(bot_token="123:abc", admin_log_channel_id=-100123),
+    )
+    assert "Admin Log Channel" in cb.message.edit_text.call_args[0][0]
+
 
 @pytest.mark.anyio
 async def test_handle_wipe_command_and_queue_controls(tmp_path: Path):
@@ -632,3 +657,45 @@ async def test_handle_wipe_command_and_queue_controls(tmp_path: Path):
     await handle_queue_job_control_callback(cb_err, current_user=guest, pipeline=pipeline)
     assert "download another user's" in cb_err.answer.call_args[0][0]
     assert cb.message.edit_text.await_count >= 1
+
+    # queue:set_link:j1
+    cb_set_link = _make_callback("queue:set_link:j1", user_id=1)
+    state = _make_context(cb_set_link.bot, 1, 1)
+    pipeline.get_job.return_value = cancelled_job
+    await handle_queue_job_control_callback(cb_set_link, current_user=admin, pipeline=pipeline, state=state)
+    assert "Guide Ingestion with Release Link" in cb_set_link.message.edit_text.call_args[0][0]
+    assert await state.get_state() == AdminStates.awaiting_job_link
+
+    # handle_job_link_input with valid MusicBrainz link
+    cat_repo = AsyncMock()
+    cat_repo.get_job.return_value = cancelled_job
+    pipeline.search_manual_candidates.return_value = IngestionResult(job=cancelled_job)
+    link_msg = _make_message(
+        "https://musicbrainz.org/release/12345678-1234-1234-1234-123456789abc", user_id=1
+    )
+    await state.set_state(AdminStates.awaiting_job_link)
+    await state.update_data(job_id="j1")
+    await handle_job_link_input(
+        link_msg,
+        state=state,
+        current_user=admin,
+        catalog_repository=cat_repo,
+        pipeline=pipeline,
+    )
+    assert cancelled_job.matched_release_mbid == "12345678-1234-1234-1234-123456789abc"
+    cat_repo.save_job.assert_awaited()
+    assert "Release Link Guided" in link_msg.answer.call_args[0][0]
+
+    # handle_job_link_input with clear
+    clear_msg = _make_message("clear", user_id=1)
+    await state.set_state(AdminStates.awaiting_job_link)
+    await state.update_data(job_id="j1")
+    await handle_job_link_input(
+        clear_msg,
+        state=state,
+        current_user=admin,
+        catalog_repository=cat_repo,
+        pipeline=pipeline,
+    )
+    assert cancelled_job.matched_release_mbid is None
+    assert "Cleared release guide" in clear_msg.answer.call_args[0][0]

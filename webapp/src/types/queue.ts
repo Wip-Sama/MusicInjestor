@@ -99,11 +99,13 @@ export interface QueueEvent {
     | 'job_failed'
     | 'job_state_changed'
     | 'bulk_research_progress'
+    | 'radar_scan_progress'
     | 'connected';
   job_id?: string;
   user_id?: number;
   state?: string;
   job?: QueueJob;
-  data?: ActiveBulkResearch | null;
+  data?: any;
+  progress?: any;
 }
 

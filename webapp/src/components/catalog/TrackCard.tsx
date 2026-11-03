@@ -31,6 +31,7 @@ export const TrackCard: React.FC<TrackCardProps> = ({
     isArtistFollowed,
     toggleFollowArtist,
     sendTrackToChat,
+    openArtistPage,
   } = useAudioPlayer();
   const isCurrent = currentTrack?.id === track.id;
   const [isSending, setIsSending] = useState<boolean>(false);
@@ -240,7 +241,22 @@ export const TrackCard: React.FC<TrackCardProps> = ({
             marginTop: '2px',
           }}
         >
-          {track.artist} • {track.album}
+          <span
+            onClick={(e) => {
+              e.stopPropagation();
+              openArtistPage(track.artist);
+            }}
+            style={{
+              cursor: 'pointer',
+              color: 'var(--tg-theme-button-color, #0a84ff)',
+              textDecoration: 'underline',
+              textUnderlineOffset: '2px',
+            }}
+            title={`View artist page for ${track.artist}`}
+          >
+            {track.artist}
+          </span>
+          {track.album ? ` • ${track.album}` : ''}
         </div>
       </div>
 

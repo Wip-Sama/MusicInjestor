@@ -1,6 +1,7 @@
 import React from 'react';
-import { X, Sliders, Music, CheckCircle2, Shield, ChevronUp, ChevronDown, GripVertical } from 'lucide-react';
+import { X, Sliders, Music, CheckCircle2, Shield, ChevronUp, ChevronDown, GripVertical, Bell } from 'lucide-react';
 import { useAudioPlayer } from '../../context/AudioPlayerContext';
+
 import { UserProfile } from '../../lib/auth';
 
 interface SettingsModalProps {
@@ -16,10 +17,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, p
     autoLyricsSearch,
     streamingPlatformOrder,
     searchScope,
+    notificationsEnabled,
     updateUserSettings,
   } = useAudioPlayer();
   const [draggedIdx, setDraggedIdx] = React.useState<number | null>(null);
-
   const ALL_PLATFORMS: Record<string, { label: string; icon: string }> = {
     deezer: { label: 'Deezer', icon: '🌐' },
     tidal: { label: 'Tidal', icon: '🌊' },
@@ -298,6 +299,58 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, p
               <input
                 type="checkbox"
                 checked={autoLyricsSearch}
+                readOnly
+                style={{
+                  width: '18px',
+                  height: '18px',
+                  accentColor: 'var(--tg-theme-button-color, #0a84ff)',
+                  cursor: 'pointer',
+                }}
+              />
+            </div>
+          </div>
+
+          {/* Section: Release Radar Drop Alerts */}
+          <div>
+            <div
+              style={{
+                fontSize: '13px',
+                fontWeight: 700,
+                textTransform: 'uppercase',
+                color: 'var(--tg-theme-subtitle-text-color, #8e8e93)',
+                letterSpacing: '0.5px',
+                marginBottom: '8px',
+              }}
+            >
+              Release Radar &amp; Notifications
+            </div>
+            <div
+              onClick={() => updateUserSettings({ notifications_enabled: !notificationsEnabled })}
+              style={{
+                padding: '12px 14px',
+                borderRadius: '12px',
+                backgroundColor: 'var(--tg-theme-secondary-bg-color, #2c2c2e)',
+                border: '1px solid rgba(255, 255, 255, 0.08)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                cursor: 'pointer',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <Bell size={18} color="var(--tg-theme-button-color, #0a84ff)" />
+                <div>
+                  <div style={{ fontSize: '14px', fontWeight: 600, color: 'var(--tg-theme-text-color, #fff)' }}>
+                    Release Drop Alerts
+                  </div>
+                  <div style={{ fontSize: '11px', color: 'var(--tg-theme-subtitle-text-color, #8e8e93)' }}>
+                    Receive real-time Telegram bot notifications when followed artists release new music.
+                  </div>
+                </div>
+              </div>
+              <input
+                type="checkbox"
+                checked={notificationsEnabled}
                 readOnly
                 style={{
                   width: '18px',

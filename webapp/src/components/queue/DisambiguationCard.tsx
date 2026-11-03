@@ -124,15 +124,16 @@ export const DisambiguationCard: React.FC<DisambiguationCardProps> = ({
 
       {/* Manual Search Input Form */}
       {showSearchBox && (
-        <form
-          onSubmit={handleManualSearchSubmit}
-          style={{ display: 'flex', gap: '6px', marginTop: '2px' }}
-        >
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', marginTop: '2px' }}>
+          <form
+            onSubmit={handleManualSearchSubmit}
+            style={{ display: 'flex', gap: '6px' }}
+          >
           <input
             type="text"
             value={manualQuery}
             onChange={(e) => setManualQuery(e.target.value)}
-            placeholder="Search by artist, title, MBID, or URL..."
+            placeholder="MusicBrainz or Streaming Link (optional, guides ingestion)..."
             style={{
               flex: 1,
               backgroundColor: 'var(--tg-theme-secondary-bg-color, #2c2c2e)',
@@ -161,9 +162,13 @@ export const DisambiguationCard: React.FC<DisambiguationCardProps> = ({
             }}
           >
             {searching ? <Loader2 size={12} className="spin" /> : <Search size={12} />}
-            <span>Search</span>
+            <span>Search / Apply</span>
           </button>
         </form>
+          <div style={{ fontSize: '11px', color: 'var(--tg-theme-subtitle-text-color, #8e8e93)', paddingLeft: '2px' }}>
+            💡 If provided, the ingestion engine tags against this exact release instead of cascading search.
+          </div>
+        </div>
       )}
 
       {/* Candidate List */}

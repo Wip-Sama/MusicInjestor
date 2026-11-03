@@ -362,3 +362,45 @@ async def test_handle_incoming_media_batch(tmp_path: Path) -> None:
 
     await handle_incoming_media(msg1, current_user=user, queue_worker=worker, batch_debounce_seconds=0)
     assert msg1.answer.called
+
+
+@pytest.mark.anyio
+async def test_handle_incoming_media_with_caption_link(tmp_path: Path) -> None:
+    """Verify handle_incoming_media extracts manual MBID from caption and avoids concurrent execution
+    when worker loop is active."""
+    audio_file = tmp_path / "song.mp3"
+    audio_file.write_text("dummy")
+
+    aud = MagicMock(spec=Audio)
+    aud.file_id = "aud_mbid_1"
+    aud.file_name = "song.mp3"
+    aud.file_size = 500
+
+    msg = _make_msg(audio=aud)
+    msg.caption = "https://musicbrainz.org/release/12345678-1234-1234-1234-123456789abc"
+
+    tg_file = MagicMock()
+    tg_file.file_path = str(audio_file)
+    bot = MagicMock()
+    bot.get_file = AsyncMock(return_value=tg_file)
+    msg.bot = bot
+
+    user = UserAccount(telegram_id=100, display_name="User", role=UserRole.UPLOADER)
+    worker = MagicMock()
+    worker.is_worker_loop_active = True
+    job = IngestionJob(
+        job_id="j_mbid",
+        source_path=audio_file,
+        original_filename="song.mp3",
+        matched_release_mbid="12345678-1234-1234-1234-123456789abc",
+    )
+    worker.enqueue_job = AsyncMock(return_value=(job, 1))
+    worker.add_progress_callback = MagicMock()
+    worker.execute_job = AsyncMock()
+
+    await handle_incoming_media(msg, current_user=user, queue_worker=worker, batch_debounce_seconds=0)
+
+    worker.enqueue_job.assert_awaited_once()
+    call_kwargs = worker.enqueue_job.await_args.kwargs
+    assert call_kwargs["matched_release_mbid"] == "12345678-1234-1234-1234-123456789abc"
+    worker.execute_job.assert_not_called()

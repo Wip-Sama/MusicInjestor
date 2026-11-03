@@ -27,6 +27,7 @@ import { FullscreenPlayer } from './components/player/FullscreenPlayer';
 import { SyncedLyrics } from './components/player/SyncedLyrics';
 import { QueueDrawer } from './components/player/QueueDrawer';
 import { SettingsModal } from './components/settings/SettingsModal';
+import { ArtistModal } from './components/artist/ArtistModal';
 import { CatalogView } from './views/CatalogView';
 import { RadarView } from './views/RadarView';
 import { IngestQueueView } from './views/IngestQueueView';
@@ -42,7 +43,7 @@ import {
 type TabType = 'catalog' | 'radar' | 'ingest' | 'governance' | 'profile';
 
 const AppContent: React.FC = () => {
-  const { playTrack, setIsPlayerOpen } = useAudioPlayer();
+  const { playTrack, setIsPlayerOpen, selectedArtist, closeArtistPage } = useAudioPlayer();
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
@@ -589,6 +590,13 @@ const GuestCatalogLockedCard: React.FC<{ profile: UserProfile }> = ({ profile: _
         isOpen={isSettingsOpen}
         onClose={() => setIsSettingsOpen(false)}
         profile={profile}
+      />
+
+      {/* Artist Dossier Modal */}
+      <ArtistModal
+        artistName={selectedArtist}
+        isOpen={Boolean(selectedArtist)}
+        onClose={closeArtistPage}
       />
 
       {/* Global Floating Player Components (only if authorized to view catalog) */}

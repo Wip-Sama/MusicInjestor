@@ -3,17 +3,21 @@
 import html
 import inspect
 import logging
+import re
 
-from aiogram import F, Router
+from aiogram import Bot, F, Router
 from aiogram.enums import ChatAction
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, FSInputFile, Message
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from src.bot.keyboards.admin import (
     BTN_MAIN_ADMIN,
     RESERVED_MENU_BUTTONS,
+    AdminActionCallback,
     MenuCallback,
+    append_escape_row,
     build_admin_dashboard_keyboard,
     build_admin_subscreen_keyboard,
     build_back_to_home_keyboard,
@@ -25,13 +29,15 @@ from src.bot.keyboards.admin import (
     build_user_list_keyboard,
     build_user_uploads_keyboard,
 )
-from src.bot.keyboards.verification import build_verification_keyboard
+from src.bot.keyboards.radar import build_release_notification_keyboard
+from src.bot.keyboards.verification import build_manual_search_keyboard, build_verification_keyboard
 from src.bot.routers.commands import (
     render_queue_overview_screen,
     render_sso_card,
     resolve_oidc_url,
 )
 from src.bot.routers.files import format_ingestion_summary
+from src.bot.routers.radar import format_release_notification_card
 from src.bot.states import AdminStates, IngestionStates
 from src.bot.ui import (
     ack_callback,
@@ -53,6 +59,7 @@ from src.core.audit import (
 from src.core.exceptions import PermissionDeniedError
 from src.core.extractor import SUPPORTED_AUDIO_EXTENSIONS
 from src.core.models import (
+    DiscoveredRelease,
     IngestionJob,
     IngestionResult,
     JobState,
@@ -110,6 +117,9 @@ def parse_admin_callback(data: str) -> tuple[str, int | None, UserRole | None]:
         "tags",
         "wipe",
         "close",
+        "log_channel",
+        "debug",
+        "debug_test_radar",
     }:
         return action, None, None
     if (
@@ -163,6 +173,48 @@ async def _render_dashboard_payload(
         queued_jobs_count=len(queued_jobs),
     )
     return text, len(queued_jobs), limit
+
+
+async def _resolve_admin_log_channel_url(
+    settings: AppSettings | None,
+    bot: Bot | None = None,
+) -> str | None:
+    """Derive external HTTP or Telegram client deep-link for the admin log channel."""
+    if settings is None:
+        return None
+    raw_url = getattr(settings, "admin_log_channel_url", "")
+    if isinstance(raw_url, str) and raw_url.strip():
+        return raw_url.strip()
+    channel_id = getattr(settings, "admin_log_channel_id", None)
+    if channel_id is None or not isinstance(channel_id, (int, str)):
+        return None
+    try:
+        numeric_id = int(channel_id)
+    except ValueError, TypeError:
+        return None
+    if bot is not None:
+        try:
+            chat = await bot.get_chat(numeric_id)
+            if chat.username:
+                return f"https://t.me/{chat.username}"
+            if chat.invite_link:
+                return chat.invite_link
+            try:
+                invite = await bot.create_chat_invite_link(numeric_id, name="Admin Log Access")
+                if invite and invite.invite_link:
+                    return invite.invite_link
+            except Exception as inv_exc:
+                logger.debug("create_chat_invite_link failed: %s", inv_exc)
+            try:
+                exported = await bot.export_chat_invite_link(numeric_id)
+                if exported:
+                    return exported
+            except Exception as exp_exc:
+                logger.debug("export_chat_invite_link failed: %s", exp_exc)
+        except Exception as exc:
+            logger.debug("Could not resolve chat details for log channel %d: %s", numeric_id, exc)
+    stripped = str(numeric_id).removeprefix("-100").removeprefix("-")
+    return f"https://t.me/c/{stripped}/1"
 
 
 async def _authorize_user_by_spec(
@@ -239,12 +291,18 @@ async def handle_admin_command(
         queue_worker,
         settings,
     )
+    log_url = await _resolve_admin_log_channel_url(settings, message.bot)
+    log_chan_id = getattr(settings, "admin_log_channel_id", None)
+    log_chan_url = getattr(settings, "admin_log_channel_url", "")
+    has_log = bool(log_chan_id or log_chan_url or log_url)
     await message.answer(
         text,
         reply_markup=build_admin_dashboard_keyboard(
             queued_count,
             limit,
             back_callback=back_cb,
+            log_channel_url=log_url,
+            has_log_channel=has_log,
         ),
     )
 
@@ -379,6 +437,79 @@ async def handle_new_user_id_input(
         message,
         format_user_detail_card(updated, albums_count, tracks_count),
         reply_markup=build_user_detail_keyboard(updated),
+    )
+
+
+@admin_router.message(
+    AdminStates.awaiting_job_link,
+    F.text,
+    ~F.text.startswith("/"),
+    ~F.text.in_(RESERVED_MENU_BUTTONS),
+)
+async def handle_job_link_input(
+    message: Message,
+    state: FSMContext,
+    current_user: UserAccount | None = None,
+    catalog_repository: CatalogRepositoryPort | None = None,
+    pipeline: IngestionPipeline | None = None,
+    settings: AppSettings | None = None,
+) -> None:
+    data = await state.get_data()
+    job_id = data.get("job_id")
+    await state.clear()
+    if not job_id or catalog_repository is None:
+        await message.answer("⚠️ Session expired or invalid job.")
+        return
+
+    job = await catalog_repository.get_job(job_id)
+    if job is None:
+        await message.answer("⚠️ Job not found.")
+        return
+
+    text = message.text.strip() if message.text else ""
+    if text.lower() == "clear":
+        job.matched_release_mbid = None
+        await catalog_repository.save_job(job)
+        await message.answer(
+            f"✅ Cleared release guide for job <code>{html.escape(job_id[:8])}</code>.",
+            reply_markup=build_queued_job_keyboard(
+                job.job_id, state=job.state, web_app_url=settings.web_app_url if settings else None
+            ),
+        )
+        return
+
+    mb_match = re.search(r"musicbrainz\.org/release/([0-9a-fA-F-]{36})", text)
+    matched_mbid = (
+        mb_match.group(1).lower()
+        if mb_match
+        else (text.lower() if re.match(r"^[0-9a-fA-F-]{36}$", text) else text)
+    )
+
+    job.matched_release_mbid = matched_mbid
+    await catalog_repository.save_job(job)
+
+    if pipeline is not None:
+        try:
+            result = await pipeline.search_manual_candidates(job_id=job.job_id, query=text)
+            if (
+                result is not None
+                and getattr(result, "job", None) is not None
+                and isinstance(result.job, IngestionJob)
+            ):
+                job = result.job
+        except Exception as exc:
+            logger.debug("search_manual_candidates failed on handle_job_link_input: %s", exc)
+
+    job_id_str = str(job.job_id) if hasattr(job, "job_id") and isinstance(job.job_id, str) else str(job_id)
+    await message.answer(
+        f"✅ <b>Release Link Guided:</b> <code>{html.escape(str(matched_mbid))}</code>\n\n"
+        f"Job <code>{html.escape(job_id_str[:8])}</code> will tag against "
+        "this exact release instead of cascading search.",
+        reply_markup=build_queued_job_keyboard(
+            job_id_str,
+            state=getattr(job, "state", JobState.QUEUED),
+            web_app_url=settings.web_app_url if settings else None,
+        ),
     )
 
 
@@ -813,6 +944,93 @@ async def handle_admin_dashboard_callback(
                 )
         return
 
+    if action == "log_channel":
+        log_url = await _resolve_admin_log_channel_url(settings, callback.bot)
+        if not log_url:
+            await ack_callback(
+                callback,
+                "⚠️ Admin log channel is not configured in settings.",
+                show_alert=True,
+            )
+            return
+        await ack_callback(callback)
+        kb = InlineKeyboardBuilder()
+        kb.row(
+            InlineKeyboardButton(
+                text="📢 Open Telegram Log Channel",
+                url=log_url,
+            )
+        )
+        append_escape_row(kb, back_callback="admin:panel", include_home=True)
+        await safe_edit_text(
+            msg,
+            format_screen(
+                title="📢 Admin Log Channel",
+                context_lines=[
+                    (
+                        "System audit events, ingestion alerts, and administrative actions "
+                        "are streamed to the dedicated channel."
+                    ),
+                    "",
+                    f'• <b>Direct Link:</b> <a href="{log_url}">Open Channel</a>',
+                ],
+                footer_lines=["<i>🧭 Home › Admin › Log Channel</i>"],
+            ),
+            reply_markup=kb.as_markup(),
+        )
+        return
+
+    if action == "debug":
+        await ack_callback(callback)
+        kb = InlineKeyboardBuilder()
+        kb.row(
+            InlineKeyboardButton(
+                text="🧪 Test Release Notification",
+                callback_data=AdminActionCallback(action="debug_test_radar").pack(),
+            )
+        )
+        append_escape_row(kb, back_callback="admin:panel", include_home=True)
+        await safe_edit_text(
+            msg,
+            format_screen(
+                title="🧪 Administrator Debug & Tests",
+                context_lines=[
+                    "Diagnostics, release drop tests, and admin testing utilities.",
+                    "",
+                    "• <b>Release Drop Alert:</b> Sends a sample release drop "
+                    "notification card to your chat.",
+                ],
+                footer_lines=["<i>🧭 Home › Admin › Debug</i>"],
+            ),
+            reply_markup=kb.as_markup(),
+        )
+        return
+
+    if action == "debug_test_radar":
+        bot = callback.bot
+        user_id = callback.from_user.id
+        if bot is not None:
+            sample_rel = DiscoveredRelease(
+                id="debug_sample_1",
+                artist_name="Daft Punk",
+                title="Random Access Memories (10th Anniversary)",
+                release_type="album",
+                release_date="2023-05-12",
+                cover_url="https://e-cdns-images.dzcdn.net/images/cover/2e018122cb56986277102d2041a592c8/500x500-000000-80-0-0.jpg",
+                track_count=13,
+                external_url="https://www.deezer.com/album/420790897",
+            )
+            card = format_release_notification_card(sample_rel)
+            kb = build_release_notification_keyboard(
+                sample_rel, web_app_url=settings.web_app_url if settings else None
+            )
+            try:
+                await bot.send_message(chat_id=user_id, text=card, reply_markup=kb)
+                await ack_callback(callback, "✅ Test notification sent to your chat!", show_alert=True)
+            except Exception as exc:
+                await ack_callback(callback, f"⚠️ Failed to deliver test notification: {exc}", show_alert=True)
+        return
+
     if action == "panel":
         await ack_callback(callback)
         await reset_fsm_state(state)
@@ -827,6 +1045,10 @@ async def handle_admin_dashboard_callback(
             queue_worker,
             settings,
         )
+        log_url = await _resolve_admin_log_channel_url(settings, callback.bot)
+        log_chan_id = getattr(settings, "admin_log_channel_id", None)
+        log_chan_url = getattr(settings, "admin_log_channel_url", "")
+        has_log = bool(log_chan_id or log_chan_url or log_url)
         await safe_edit_text(
             msg,
             text,
@@ -834,6 +1056,8 @@ async def handle_admin_dashboard_callback(
                 queued_count,
                 limit,
                 back_callback=back_cb,
+                log_channel_url=log_url,
+                has_log_channel=has_log,
             ),
         )
         return
@@ -1539,6 +1763,60 @@ async def handle_queue_job_control_callback(
                 back_callback=back_cb,
                 include_home=back_cb != "menu:home",
             ),
+        )
+        return
+
+    if action == "set_link":
+        target_job = None
+        if pipeline is not None:
+            target_job = await pipeline.get_job(job_id)
+        elif catalog_repository is not None:
+            target_job = await catalog_repository.get_job(job_id)
+
+        if target_job is None:
+            await ack_callback(callback, "Job not found.", show_alert=True)
+            return
+
+        can_control = (
+            has_permission(current_user, Permission.RESOLVE_OTHERS_JOBS)
+            if target_job.user_id != current_user.telegram_id
+            else has_permission(current_user, Permission.RESOLVE_OWN_DISAMBIGUATION)
+        )
+        if not can_control:
+            await ack_callback(callback, "🔒 Permission denied.", show_alert=True)
+            return
+
+        await ack_callback(callback)
+        if state is not None:
+            await state.set_state(AdminStates.awaiting_job_link)
+            await state.update_data(job_id=job_id)
+
+        current_link_info = (
+            f"• <b>Current Guided MBID:</b> <code>{html.escape(target_job.matched_release_mbid)}</code>\n"
+            if target_job.matched_release_mbid
+            else ""
+        )
+        await safe_edit_text(
+            msg,
+            format_screen(
+                title="🔗 Guide Ingestion with Release Link",
+                context_lines=[
+                    "Reply with a MusicBrainz release URL or streaming link "
+                    "to tag this job against an exact release:",
+                    "",
+                    "• <code>https://musicbrainz.org/release/...</code>",
+                    "• <code>https://www.deezer.com/album/...</code>",
+                    "• Or reply with <code>clear</code> to remove the release guide.",
+                    "",
+                    "💡 <i>The ingestion engine will tag against this exact "
+                    "release instead of cascading search.</i>",
+                    current_link_info,
+                ],
+                footer_lines=[
+                    f"<i>Job ID:</i> <code>{html.escape(job_id)}</code> • <i>🧭 Home › Queue › Set Link</i>"
+                ],
+            ),
+            reply_markup=build_manual_search_keyboard(job_id),
         )
         return
 

@@ -28,6 +28,7 @@ from src.core.audit import (
     format_queued_job_card,
 )
 from src.core.extractor import SUPPORTED_ARCHIVE_EXTENSIONS, SUPPORTED_AUDIO_EXTENSIONS
+from src.core.metadata import parse_manual_search_query
 from src.core.models import IngestionJob, IngestionResult, JobState, UserAccount
 from src.core.pipeline import IngestionPipeline
 from src.core.ports import GovernanceRepositoryPort
@@ -473,12 +474,32 @@ async def _process_media_batch(
             continue
 
         if current_user is not None and queue_worker is not None:
+            caption = getattr(msg, "caption", None)
+            matched_mbid = None
+            parsed_meta = None
+            if caption and isinstance(caption, str) and caption.strip():
+                parsed_meta = parse_manual_search_query(caption.strip(), base_metadata=None)
+                if parsed_meta.release_mbid or parsed_meta.recording_mbid:
+                    matched_mbid = parsed_meta.release_mbid or parsed_meta.recording_mbid
+
             job, position = await queue_worker.enqueue_job(
                 user=current_user,
                 source_path=source_path,
                 original_filename=resolved_name,
                 file_size_bytes=file_size,
+                matched_release_mbid=matched_mbid,
             )
+            if matched_mbid:
+                job.matched_release_mbid = matched_mbid
+                if parsed_meta:
+                    job.selected_metadata = parsed_meta
+                save_fn = getattr(governance_repository, "save_job", None) or getattr(
+                    getattr(queue_worker, "_catalog", None), "save_job", None
+                )
+                if callable(save_fn):
+                    save_res = save_fn(job)
+                    if inspect.isawaitable(save_res):
+                        await save_res
             enqueued_items.append((job, position, msg))
 
     # Case A: Fallback if dependencies not injected
@@ -537,20 +558,69 @@ async def _process_media_batch(
             ),
         )
 
+        async def _cache_telegram_file_if_completed(completed_result: IngestionResult) -> None:
+            if (
+                completed_result.job.state == JobState.COMPLETED
+                and msg.audio is not None
+                and governance_repository is not None
+            ):
+                recent_tracks = await governance_repository.list_library_tracks(limit=20)
+                for trk in recent_tracks:
+                    if trk.job_id == completed_result.job.job_id or (
+                        completed_result.job.final_path is not None
+                        and trk.storage_path == completed_result.job.final_path
+                    ):
+                        chat_id = getattr(getattr(msg, "chat", None), "id", None)
+                        msg_id = getattr(msg, "message_id", None)
+                        await governance_repository.cache_track_telegram_file(
+                            trk.id,
+                            telegram_file_id=msg.audio.file_id,
+                            source_chat_id=chat_id if isinstance(chat_id, int) else None,
+                            source_message_id=msg_id if isinstance(msg_id, int) else None,
+                        )
+                        break
+
         async def _on_stage_progress(
             updated_job: IngestionJob,
             _result: IngestionResult | None = None,
         ) -> None:
             if updated_job.job_id != job.job_id:
                 return
+
             if updated_job.state in {
-                JobState.PAUSED,
-                JobState.AWAITING_CONFIRMATION,
                 JobState.COMPLETED,
-                JobState.FAILED,
-                JobState.CANCELLED,
+                JobState.DUPLICATE_REJECTED,
+                JobState.AWAITING_CONFIRMATION,
             }:
+                res = _result or IngestionResult(job=updated_job)
+                await _cache_telegram_file_if_completed(res)
+                await _dispatch_pipeline_result(
+                    msg,
+                    res,
+                    state,
+                    status_message=status_msg,
+                )
                 return
+
+            if updated_job.state in {JobState.FAILED, JobState.CANCELLED}:
+                err_msg = html.escape(str(updated_job.error_message or "Cancelled"))
+                is_failed = updated_job.state == JobState.FAILED
+                title_text = "⚠️ Ingestion Failed" if is_failed else "🚫 Job Cancelled"
+                await _edit_or_answer(
+                    message=msg,
+                    status_message=status_msg,
+                    text=format_screen(
+                        title=title_text,
+                        context_lines=[f"Reason: <code>{err_msg[:60]}</code>"],
+                        footer_lines=[f"<i>Job ID:</i> <code>{html.escape(updated_job.job_id)}</code>"],
+                    ),
+                    reply_markup=build_back_to_home_keyboard(),
+                )
+                return
+
+            if updated_job.state == JobState.PAUSED:
+                return
+
             try:
                 await safe_edit_text(
                     status_msg,
@@ -563,6 +633,10 @@ async def _process_media_batch(
                 )
             except Exception as exc:
                 logger.debug("Progress bar edit skipped for job %s: %s", updated_job.job_id, exc)
+
+        if getattr(queue_worker, "is_worker_loop_active", False) is True:
+            queue_worker.add_progress_callback(_on_stage_progress)
+            return
 
         try:
             result = await queue_worker.execute_job(
@@ -584,26 +658,7 @@ async def _process_media_batch(
             return
 
         if result is not None:
-            if (
-                result.job.state == JobState.COMPLETED
-                and msg.audio is not None
-                and governance_repository is not None
-            ):
-                recent_tracks = await governance_repository.list_library_tracks(limit=20)
-                for trk in recent_tracks:
-                    if trk.job_id == result.job.job_id or (
-                        result.job.final_path is not None and trk.storage_path == result.job.final_path
-                    ):
-                        chat_id = getattr(getattr(msg, "chat", None), "id", None)
-                        msg_id = getattr(msg, "message_id", None)
-                        await governance_repository.cache_track_telegram_file(
-                            trk.id,
-                            telegram_file_id=msg.audio.file_id,
-                            source_chat_id=chat_id if isinstance(chat_id, int) else None,
-                            source_message_id=msg_id if isinstance(msg_id, int) else None,
-                        )
-                        break
-
+            await _cache_telegram_file_if_completed(result)
             await _dispatch_pipeline_result(
                 msg,
                 result,

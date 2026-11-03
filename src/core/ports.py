@@ -209,6 +209,14 @@ class GovernanceRepositoryPort(Protocol):
         """Return all library tracks matching `artist` and `album` ordered by track number."""
         ...
 
+    async def list_library_tracks_by_artist(
+        self,
+        artist_name: str,
+        limit: int = 200,
+    ) -> list[LibraryTrackRecord]:
+        """Return library tracks matching `artist_name` ordered by year desc, album asc, track_number asc."""
+        ...
+
     async def search_library_albums(
         self,
         query: str,
@@ -357,6 +365,13 @@ class GovernanceRepositoryPort(Protocol):
         offset: int = 0,
     ) -> list[DiscoveredRelease]:
         """List discovered releases ordered by release_date descending."""
+        ...
+
+    async def count_discovered_releases(
+        self,
+        artist_name: str | None = None,
+    ) -> int:
+        """Count discovered releases in repository optionally filtered by artist."""
         ...
 
     async def get_discovered_release(self, release_id: str) -> DiscoveredRelease | None:
@@ -557,4 +572,11 @@ class ReleaseRadarProviderPort(Protocol):
         limit: int = 10,
     ) -> list[ReleaseTrackPreview]:
         """Search external provider for individual tracks with 30-second audio previews."""
+        ...
+
+    async def get_track_preview(
+        self,
+        provider_track_id: str,
+    ) -> tuple[str, str] | None:
+        """Fetch `(track_title, preview_mp3_url)` directly for an individual track."""
         ...

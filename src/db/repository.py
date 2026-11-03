@@ -691,7 +691,7 @@ class SqliteCatalogRepository:
             cursor = await conn.execute(
                 """
                 SELECT telegram_id, stream_format, stream_bitrate, auto_lyrics_search,
-                       theme, streaming_platform_order, search_scope, search_scope
+                       theme, streaming_platform_order, search_scope, notifications_enabled
                 FROM user_settings
                 WHERE telegram_id = ?
                 """,
@@ -709,14 +709,15 @@ class SqliteCatalogRepository:
                     search_scope=str(row[6])
                     if len(row) > 6 and row[6] is not None and str(row[6]).strip()
                     else "global",
+                    notifications_enabled=bool(int(row[7])) if len(row) > 7 and row[7] is not None else True,
                 )
             default_prefs = UserPreferences(telegram_id=telegram_id)
             await conn.execute(
                 """
                 INSERT OR IGNORE INTO user_settings (
                     telegram_id, stream_format, stream_bitrate, auto_lyrics_search,
-                    theme, streaming_platform_order, search_scope
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    theme, streaming_platform_order, search_scope, notifications_enabled
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     telegram_id,
@@ -726,6 +727,7 @@ class SqliteCatalogRepository:
                     default_prefs.theme,
                     default_prefs.streaming_platform_order,
                     default_prefs.search_scope,
+                    1 if default_prefs.notifications_enabled else 0,
                 ),
             )
             await conn.commit()
@@ -738,8 +740,8 @@ class SqliteCatalogRepository:
                 """
                 INSERT INTO user_settings (
                     telegram_id, stream_format, stream_bitrate, auto_lyrics_search,
-                    theme, streaming_platform_order, search_scope, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    theme, streaming_platform_order, search_scope, notifications_enabled, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(telegram_id) DO UPDATE SET
                     stream_format = excluded.stream_format,
                     stream_bitrate = excluded.stream_bitrate,
@@ -747,6 +749,7 @@ class SqliteCatalogRepository:
                     theme = excluded.theme,
                     streaming_platform_order = excluded.streaming_platform_order,
                     search_scope = excluded.search_scope,
+                    notifications_enabled = excluded.notifications_enabled,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
@@ -757,6 +760,7 @@ class SqliteCatalogRepository:
                     preferences.theme,
                     preferences.streaming_platform_order,
                     preferences.search_scope,
+                    1 if preferences.notifications_enabled else 0,
                 ),
             )
             await conn.commit()
@@ -1227,6 +1231,31 @@ class SqliteCatalogRepository:
                 ORDER BY COALESCE(track_number, 1) ASC, title ASC
                 """,
                 (artist.strip(), album.strip()),
+            )
+            rows = await cursor.fetchall()
+        return [_row_to_library_track(tuple(r)) for r in rows]
+
+    async def list_library_tracks_by_artist(
+        self,
+        artist_name: str,
+        limit: int = 200,
+    ) -> list[LibraryTrackRecord]:
+        """Return library tracks matching `artist_name` ordered by year desc, album asc, track_number asc."""
+        clean = artist_name.strip()
+        async with self._db.connect() as conn:
+            cursor = await conn.execute(
+                f"""
+                SELECT {_LIBRARY_TRACK_COLUMNS}
+                FROM library_tracks
+                WHERE lower(artist) = lower(?)
+                ORDER BY
+                    COALESCE(year, 0) DESC,
+                    album COLLATE NOCASE ASC,
+                    COALESCE(track_number, 1) ASC,
+                    title ASC
+                LIMIT ?
+                """,
+                (clean, limit),
             )
             rows = await cursor.fetchall()
         return [_row_to_library_track(tuple(r)) for r in rows]
@@ -1762,8 +1791,14 @@ class SqliteCatalogRepository:
         async with (
             self._db.connect() as conn,
             conn.execute(
-                "SELECT telegram_id FROM artist_follows "
-                "WHERE LOWER(artist_name) = LOWER(?) AND notify_telegram = 1",
+                """
+                SELECT af.telegram_id
+                FROM artist_follows af
+                LEFT JOIN user_settings us ON af.telegram_id = us.telegram_id
+                WHERE LOWER(af.artist_name) = LOWER(?)
+                  AND af.notify_telegram = 1
+                  AND COALESCE(us.notifications_enabled, 1) = 1
+                """,
                 (clean,),
             ) as cur,
         ):
@@ -1788,7 +1823,11 @@ class SqliteCatalogRepository:
                 ) as cur:
                     matching = await self.find_library_tracks_for_release(rel.artist_name, rel.title)
                     in_lib = (await cur.fetchone()) is not None or bool(matching) or rel.in_library
-                    lib_track_id = matching[0].id if matching else rel.library_track_id
+                    lib_track_id = (
+                        matching[0].id
+                        if (matching and rel.track_count == 1)
+                        else (rel.library_track_id if rel.track_count == 1 else None)
+                    )
 
                 await conn.execute(
                     """
@@ -1869,6 +1908,21 @@ class SqliteCatalogRepository:
         async with self._db.connect() as conn, conn.execute(query, tuple(params)) as cur:
             rows = await cur.fetchall()
             return [_row_to_discovered_release(r) for r in rows]
+
+    async def count_discovered_releases(
+        self,
+        artist_name: str | None = None,
+    ) -> int:
+        """Count discovered releases in repository optionally filtered by artist."""
+        query = "SELECT COUNT(*) FROM discovered_releases "
+        params: list[object] = []
+        if artist_name and artist_name.strip():
+            query += "WHERE LOWER(artist_name) = LOWER(?) "
+            params.append(artist_name.strip())
+
+        async with self._db.connect() as conn, conn.execute(query, tuple(params)) as cur:
+            row = await cur.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
 
     async def get_discovered_release(self, release_id: str) -> DiscoveredRelease | None:
         """Retrieve a discovered release by its ID."""

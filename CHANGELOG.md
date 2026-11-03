@@ -12,6 +12,85 @@
 
 ## Completed Milestones
 
+### M42: Single Queue Item Link Guidance, Real-Time Radar Scan Tracking, Concurrency Deduplication Fix, WebApp Volume Control, & Admin Debug Menu
+- **Single Queue Item Link Guidance & Streaming Release Match (`webapp/src/components/queue/JobCard.tsx`, `JobEditModal.tsx`, `DisambiguationCard.tsx`, `src/bot/routers/admin.py`, `src/bot/states.py`, `src/bot/keyboards/admin.py`, `src/core/queue.py`):**
+  - Added direct release link input drawer and `🔗 Guided Link` / `🔗 Set Link` button to queued job cards in the Web Mini App, allowing users to guide ingestion against a specific MusicBrainz or streaming URL prior to or during processing.
+  - Added platform provider filter pills (`All Sources`, `MusicBrainz`, `Deezer`, `Genius`, `Last.fm`) to `JobEditModal` manual search.
+  - Added guided MBID badges and guidance banner in `DisambiguationCard`.
+  - Added Telegram Bot queue support for setting/updating guided links via `QueueJobCallback(action="set_link")` and FSM state `AdminStates.awaiting_job_link`.
+- **UI Deduplication & Cleanup (`webapp/src/components/ingest/FileDropzone.tsx`, `webapp/src/components/studio/EditMetadataModal.tsx`):**
+  - Removed duplicate MusicBrainz/streaming link input boxes and guidance text in `FileDropzone`.
+  - Cleaned up duplicated provider source filter badges in `EditMetadataModal`.
+- **Radar Scan Live Progress & Provider Connection Reuse (`src/core/radar.py`, `src/core/deezer.py`, `src/bot/webapp_server.py`, `webapp/src/views/RadarView.tsx`, `webapp/src/lib/queueApi.ts`):**
+  - Resolved frozen radar progress bar and scan updates: `_scan_single_artist` now emits progress at the start of each artist scan, displaying the active artist in real time instead of lingering on previous entries.
+  - Added client-side cache-busting timestamp `_t=${Date.now()}` and backend HTTP response header `Cache-Control: no-store, no-cache, must-revalidate` on `/api/v1/app/radar/status`.
+  - Added automatic reconnection on SSE dropouts in `connectQueueEvents`.
+  - Reused persistent `httpx.AsyncClient` inside `DeezerReleaseProvider` avoiding connection exhaustion, socket churn, and SSL handshake latency across parallel artist queries.
+  - Fixed multi-exception handling syntax in SSE stream generator.
+- **Double Ingestion Bug Prevention (`src/bot/routers/files.py`, `src/core/queue.py`):**
+  - Resolved race condition where forwarded audio files were processed twice concurrently (resulting in `INGEST AUDIT: SUCCESS` followed by `INGEST AUDIT: DUPLICATE_REJECTED` for the identical job ID).
+  - When the background queue worker loop is active (`is_worker_loop_active is True`), file ingress registers an async completion listener instead of directly calling `execute_job` on the same job.
+- **Admin Debug Menu & Log Channel Access (`src/bot/routers/admin.py`, `src/bot/keyboards/admin.py`, `webapp/src/views/RadarView.tsx`):**
+  - Removed test notification button from user-facing Radar GUI and relocated test triggers to an admin debug menu (`/admin -> 🧪 Debug & Tests`).
+  - Added direct log channel link button `📢 Open Admin Log Channel` in the Admin Dashboard.
+- **Web App Volume Control (`webapp/src/components/player/MiniPlayer.tsx`, `FullscreenPlayer.tsx`, `AudioPlayerContext.tsx`):**
+  - Added interactive volume slider control supporting smooth audio volume adjustment and muting across mini and fullscreen player views.
+
+### M41: Audio Previews CDN Fix, Album-Level Track Ownership Isolation, Telegram Bot Feature Parity (Followed Artists, Search Previews), Notification Test Dispatch, User Drop Alert Settings, & Admin Log Channel Link
+- **Audio Previews CDN URL Sanitization (`webapp/src/context/AudioPlayerContext.tsx`):**
+  - Resolved `403 Forbidden` playback errors on 30-second audio previews by ensuring external CDN URLs (`http://` or `https://` pointing to Deezer CDN) are not altered with local backend query parameters (`tgWebAppData`, transcode `format`, `bitrate`).
+- **Album-Level Track Ownership Isolation (`src/db/repository.py`, `src/bot/webapp_server.py`, `webapp/src/views/RadarView.tsx`, `webapp/src/components/artist/ArtistModal.tsx`):**
+  - Fixed false "Play Full Song" attempts on multi-track albums where only partial tracks were owned in the library.
+  - Restricted release-level `library_track_id` reconciliation strictly to single-track releases (`r.track_count == 1`). Multi-track releases (`r.track_count > 1`) retain `library_track_id = None` at the release header and present an expandable tracklist where each track independently indicates owned vs 30s preview playback.
+- **Direct Track Preview Provider API (`src/core/ports.py`, `src/core/deezer.py`, `src/core/radar.py`, `src/bot/routers/search.py`):**
+  - Added `get_track_preview(provider_track_id)` to `ReleaseRadarProviderPort`, implemented in `DeezerReleaseProvider` (querying `https://api.deezer.com/track/{id}` directly), and exposed via `ReleaseRadarService`.
+  - Added support for 30s audio preview downloads and Telegram audio message delivery from search results via `handle_search_track_preview`.
+  - Handled `/search <query>` command and registered `/search` in Telegram bot commands menu (`BOT_COMMANDS` in `main.py`).
+- **Telegram Bot Followed Artists Management Parity (`src/bot/keyboards/radar.py`, `src/bot/routers/radar.py`, `main.py`):**
+  - Enforced bot/Mini App feature parity: implemented complete artist management directly in Telegram chat.
+  - Added `/follow <artist>` and `/unfollow <artist>` commands, registered in bot commands list.
+  - Added interactive in-chat Artist Dossier screen (`format_artist_dossier_card`, `build_artist_dossier_keyboard`) with owned tracks count, upcoming releases count, follow/unfollow toggle, and external streaming platform links.
+  - Added followed artists listing with interactive pagination, inline unfollow actions, and "Add Followed Artist" prompt FSM state (`RadarStates.waiting_for_artist_name`).
+- **Release Notification Delivery Testing (`src/bot/routers/radar.py`, `src/bot/webapp_server.py`, `webapp/src/views/RadarView.tsx`, `webapp/src/components/settings/SettingsModal.tsx`):**
+  - Added interactive testing mechanism to verify that release drop notifications are received in Telegram chat.
+  - Added `/radar_test` bot command and `RadarCallback(action="test_alert")` delivering a mock drop card with 30s audio preview to the requesting user.
+  - Added backend REST endpoint `POST /api/v1/app/radar/test-notification` for testing alerts directly from the Web Mini App.
+  - Added "Test Alert" button in `RadarView.tsx` header banner and "Send Test Drop Alert to Telegram" button in `SettingsModal.tsx`.
+- **User Release Drop Alert Settings (`src/core/models.py`, `src/db/models.py`, `src/db/repository.py`, `src/bot/keyboards/songs.py`, `src/bot/routers/commands.py`, `src/bot/webapp_server.py`, `webapp/`):**
+  - Added `notifications_enabled: bool = True` field to `UserPreferences` and `UserSettings`.
+  - Added database migration column `notifications_enabled INTEGER NOT NULL DEFAULT 1` to `user_settings` table.
+  - Filtered artist drop broadcast notifications to users with `COALESCE(us.notifications_enabled, 1) = 1`.
+  - Added `🔔 [Enabled] Release Drop Alerts` toggle in Telegram `/settings` (`SettingsCallback(action="notifs")`).
+  - Added `notifications_enabled` to Mini App `GET` and `POST` `/api/v1/app/user/settings` and user settings modal toggle switch.
+- **Admin Dashboard Log Channel Link (`src/config/settings.py`, `src/bot/keyboards/admin.py`, `src/bot/routers/admin.py`):**
+  - Added `admin_log_channel_url: str = Field(default="")` to `AppSettings`.
+  - Added `_resolve_admin_log_channel_url` in `src/bot/routers/admin.py` with safe `getattr` fallbacks.
+  - Added `📢 Open Admin Log Channel` button in `build_admin_dashboard_keyboard` linking directly to the log channel.
+
+### M40: Radar Scan Concurrency & Live SSE Progress Bar, Artist Dossier Modal & Telegram Radar Fix
+- **Synchronized Radar Scan & Live Concurrency Guard (`src/core/models.py`, `src/core/radar.py`, `src/bot/webapp_server.py`, `src/bot/routers/radar.py`):**
+  - Added pure domain model `RadarScanProgress` in `src/core/models.py` capturing `is_scanning`, `current_artist`, `processed_artists`, `total_artists`, `discovered_count`, `started_at`, and computed `percent`.
+  - Added `asyncio.Lock` concurrency guard in `ReleaseRadarService` preventing simultaneous duplicate scans across multiple clients or background routines.
+  - Implemented live per-artist progress reporting and subscriber callback registration (`add_progress_callback`) on `ReleaseRadarService`.
+  - Hooked radar progress callbacks to `QueueEventBus` in `src/bot/webapp_server.py`, broadcasting `radar_scan_progress` events in real-time over SSE (`/api/v1/app/queue/events`) to all connected Web Mini App clients.
+  - Added `GET /api/v1/app/radar/status` returning current scanning status and active progress snapshot.
+  - Updated `POST /api/v1/app/radar/scan` to reject concurrent requests with HTTP 409 Conflict (`{"already_scanning": True, "progress": ...}`).
+  - Added concurrency check in Telegram bot `handle_radar_refresh` showing an alert if a scan is already underway.
+- **Telegram Bot Radar Fix & Callback Compatibility (`src/bot/keyboards/admin.py`, `src/bot/routers/radar.py`):**
+  - Fixed broken Telegram Radar navigation caused by callback format mismatch in `build_home_menu_inline_keyboard` (`radar:page:1` converted to packed `radar~page~~1` matching `RadarCallback` schema).
+  - Added fallback string callback routing for `radar:page:1`, `radar:home`, `radar:list`, and `radar` in `src/bot/routers/radar.py` guaranteeing backward compatibility for existing in-chat message keyboards.
+- **Artist Dossier Modal & Catalog Navigation (`src/core/ports.py`, `src/db/repository.py`, `src/bot/webapp_server.py`, `webapp/`):**
+  - Added `list_library_tracks_by_artist(artist_name, limit)` and `count_discovered_releases(artist_name)` to `CatalogRepositoryPort`, `GovernanceRepositoryPort`, and `SqliteCatalogRepository`.
+  - Created backend REST endpoint `GET /api/v1/app/artists/{artist_name}` delivering complete artist intelligence: owned library tracks, upcoming/recent radar drops, follow status, and track/drop counts.
+  - Built accessible `ArtistModal.tsx` in `webapp/src/components/artist/` featuring tabbed switching between Library Tracks and Radar Drops, follow/unfollow toggle, 30s preview and full track playback, copyable multi-platform streaming links, and "Send to Chat".
+  - Extended `AudioPlayerContext` with `selectedArtist`, `openArtistPage(name)`, and `closeArtistPage()`, globally mounted in `webapp/src/App.tsx`.
+  - Wired clickable artist names to open the Artist Dossier across `TrackCard.tsx`, `MiniPlayer.tsx`, `FullscreenPlayer.tsx`, `AlbumGapModal.tsx`, and `RadarView.tsx`.
+- **Radar Pagination & Semantic Progress Bar UI (`webapp/src/views/RadarView.tsx`):**
+  - Implemented semantic HTML `<progress>` card adhering to modern web guidance (`role="progressbar"`, `aria-valuenow`, `aria-valuemin`, `aria-valuemax`, `aria-live="polite"`, `appearance: none`, `overflow: clip`).
+  - Displays real-time progress (`X/N artists done`), animated progress bar, currently scanned artist name, and discovered releases counter.
+  - Synchronizes scan button state across all clients with live "Scanning in progress..." lockout.
+  - Implemented client-side pagination with "Load More Drops" button and release count indicators (`Showing X of Y drops`).
+
 ### M39: Telegram Bot Chat Search Routing, Dynamic Tunnel Cache-Busting & Mini App Song Delivery
 - **Telegram Client Menu Button Cache-Busting (`src/bot/routers/commands.py`):**
   - Added proactive `bot.set_chat_menu_button` invocation during `/start` execution to immediately update the user's client-side Telegram `MenuButtonWebApp` URL whenever Cloudflare quick tunnel generates an ephemeral domain upon restart.

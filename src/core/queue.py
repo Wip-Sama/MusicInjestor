@@ -84,9 +84,15 @@ class IngestionQueueWorker:
         self._condition = asyncio.Condition()
         self._wake_event = asyncio.Event()
         self._processing_job_ids: set[str] = set()
+        self._worker_loop_active: bool = False
         self._progress_callbacks: list[ProgressCallback] = (
             [progress_callback] if progress_callback is not None else []
         )
+
+    @property
+    def is_worker_loop_active(self) -> bool:
+        """Return True if the autonomous background worker loop is currently running."""
+        return self._worker_loop_active
 
     @property
     def concurrency_limit(self) -> int:
@@ -136,6 +142,7 @@ class IngestionQueueWorker:
         original_filename: str | None = None,
         job_id: str | None = None,
         file_size_bytes: int | None = None,
+        matched_release_mbid: str | None = None,
     ) -> tuple[IngestionJob, int]:
         """Persist a new job in `QUEUED` state and return `(job, queue_position)`."""
         require_permission(user, Permission.SUBMIT_INGESTION)
@@ -156,6 +163,7 @@ class IngestionQueueWorker:
             file_size_bytes=size_bytes,
             scratch_dir=source_path.parent,
             sha256_hash=sha256_hex,
+            matched_release_mbid=matched_release_mbid,
         )
         await self._catalog.save_job(job)
         await self._governance.append_audit_log(
@@ -280,29 +288,33 @@ class IngestionQueueWorker:
         """Autonomous background loop popping oldest QUEUED jobs up to concurrency limit."""
         effective_stop = stop_event or asyncio.Event()
         self._wake_event.set()
+        self._worker_loop_active = True
         logger.info(
             "IngestionQueueWorker background loop started (concurrency_limit=%d)",
             self._concurrency_limit,
         )
-        while not effective_stop.is_set():
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(self._wake_event.wait(), timeout=2.0)
-            self._wake_event.clear()
-            if effective_stop.is_set():
-                break
-
-            while self._active_count < self._concurrency_limit and not effective_stop.is_set():
-                queued_jobs = await self._governance.list_queued_jobs()
-                next_job = None
-                for j in queued_jobs:
-                    if j.job_id not in self._processing_job_ids and j.state == JobState.QUEUED:
-                        next_job = j
-                        break
-                if next_job is None:
+        try:
+            while not effective_stop.is_set():
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._wake_event.wait(), timeout=2.0)
+                self._wake_event.clear()
+                if effective_stop.is_set():
                     break
 
-                self._processing_job_ids.add(next_job.job_id)
-                asyncio.create_task(self._safe_execute_job(next_job.job_id))
+                while self._active_count < self._concurrency_limit and not effective_stop.is_set():
+                    queued_jobs = await self._governance.list_queued_jobs()
+                    next_job = None
+                    for j in queued_jobs:
+                        if j.job_id not in self._processing_job_ids and j.state == JobState.QUEUED:
+                            next_job = j
+                            break
+                    if next_job is None:
+                        break
+
+                    self._processing_job_ids.add(next_job.job_id)
+                    asyncio.create_task(self._safe_execute_job(next_job.job_id))
+        finally:
+            self._worker_loop_active = False
 
     async def _safe_execute_job(self, job_id: str) -> None:
         """Helper to run a queued job inside the worker loop and ensure wake_event triggers afterwards."""
@@ -343,7 +355,17 @@ class IngestionQueueWorker:
 
         try:
             job = await self._catalog.get_job(job_id)
-            if job is None or job.state == JobState.CANCELLED:
+            if job is None or job.state in {
+                JobState.CANCELLED,
+                JobState.COMPLETED,
+                JobState.DUPLICATE_REJECTED,
+                JobState.FAILED,
+            }:
+                logger.info(
+                    "Job %s is already completed/cancelled (%s). Skipping.",
+                    job_id,
+                    getattr(job, "state", None),
+                )
                 return None
             if job.state == JobState.PAUSED and not force_confirmation:
                 return None

@@ -164,7 +164,7 @@ def build_home_menu_inline_keyboard(
     if web_app_url and web_app_url.strip():
         builder.button(text="🚀 Open Web App", web_app=WebAppInfo(url=web_app_url.strip()))
     builder.button(text="🎵 Songs", callback_data="songs:list")
-    builder.button(text="📡 Radar", callback_data="radar:page:1")
+    builder.button(text="📡 Radar", callback_data="radar~page~~1")
     builder.button(text="⏳ Queue", callback_data=QueueActionCallback(action="mine").pack())
     builder.button(text="🔐 Authentik SSO", callback_data=MenuCallback(action="sso").pack())
     builder.button(text="🟢 Status", callback_data=MenuCallback(action="status").pack())
@@ -474,9 +474,13 @@ def build_queued_job_keyboard(
         # --- Row 3: Utility ---
         builder.row(
             InlineKeyboardButton(
+                text="🔗 Guide with Link",
+                callback_data=QueueJobCallback(action="set_link", job_id=job_id).pack(),
+            ),
+            InlineKeyboardButton(
                 text=f"📋 Copy Job ID ({job_id[:8]})",
                 copy_text=CopyTextButton(text=job_id),
-            )
+            ),
         )
     else:
         builder.row(
@@ -535,9 +539,25 @@ def build_admin_dashboard_keyboard(
     pending_tags_count: int = 0,
     *,
     back_callback: str | None = None,
+    log_channel_url: str | None = None,
+    has_log_channel: bool = False,
 ) -> InlineKeyboardMarkup:
     """Create the Administrator Control Panel keyboard (`/admin`, Specification Section 7.1)."""
     builder = InlineKeyboardBuilder()
+    if log_channel_url and log_channel_url.strip():
+        builder.row(
+            InlineKeyboardButton(
+                text="📢 Open Admin Log Channel",
+                url=log_channel_url.strip(),
+            )
+        )
+    elif has_log_channel:
+        builder.row(
+            InlineKeyboardButton(
+                text="📢 Open Admin Log Channel",
+                callback_data=AdminActionCallback(action="log_channel").pack(),
+            )
+        )
     builder.row(
         InlineKeyboardButton(
             text="👥 User Management",
@@ -572,6 +592,12 @@ def build_admin_dashboard_keyboard(
             text="📜 Audit Logs",
             callback_data=AdminActionCallback(action="audit").pack(),
         ),
+        InlineKeyboardButton(
+            text="🧪 Debug & Tests",
+            callback_data=AdminActionCallback(action="debug").pack(),
+        ),
+    )
+    builder.row(
         InlineKeyboardButton(
             text=BTN_BACK_LABEL,
             callback_data=effective_back,

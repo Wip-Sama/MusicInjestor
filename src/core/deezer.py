@@ -29,12 +29,20 @@ class DeezerReleaseProvider(ReleaseRadarProviderPort):
         self._base_url = base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
         self._client = client
+        self._owns_client = client is None
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Return the injected HTTP client or construct a reusable instance."""
-        if self._client is not None:
-            return self._client
-        return httpx.AsyncClient(timeout=self._timeout_seconds)
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self._timeout_seconds)
+            self._owns_client = True
+        return self._client
+
+    async def close(self) -> None:
+        """Close the underlying HTTP client if owned."""
+        if self._owns_client and self._client is not None:
+            await self._client.aclose()
+            self._client = None
 
     async def search_artist(self, artist_name: str) -> str | None:
         """Search Deezer for the given artist name and return the canonical Deezer artist ID."""
@@ -342,3 +350,9 @@ class DeezerReleaseProvider(ReleaseRadarProviderPort):
         except Exception as exc:
             logger.warning("Failed to search Deezer tracks for '%s': %s", cleaned_query, exc)
             return []
+
+    async def get_track_preview(
+        self,
+        provider_track_id: str,
+    ) -> tuple[str, str] | None:
+        """Fetch title and 30s audio preview URL directly for a Deezer track ID."""

@@ -5,7 +5,7 @@ import logging
 import re
 
 from aiogram import F, Router
-from aiogram.filters import StateFilter
+from aiogram.filters import Command, StateFilter
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 
 from src.bot.keyboards.admin import (
@@ -105,6 +105,65 @@ def format_album_gap_card(gap: AlbumGapAnalysis) -> str:
         context_lines=context,
         footer_lines=["<i>🧭 Home › Search › Album Gap Analysis</i>"],
     )
+
+
+@search_router.message(Command("search"))
+async def handle_search_command(
+    message: Message,
+    current_user: UserAccount | None = None,
+    governance_repository: GovernanceRepositoryPort | None = None,
+    album_search_service: AlbumSearchService | None = None,
+    oidc_service: AuthentikOidcService | None = None,
+    settings: AppSettings | None = None,
+) -> None:
+    """Execute search from `/search <query>` or explain search usage."""
+    raw_text = (message.text or "").strip()
+    query = raw_text.removeprefix("/search").strip()
+    if not query:
+        card = format_screen(
+            title="🔍 Search Music &amp; Albums",
+            context_lines=[
+                "Search across both your local library and external providers (Deezer).",
+                "",
+                "<b>Usage:</b>",
+                "• <code>/search &lt;artist, album or song title&gt;</code>",
+                "• Or simply send any text in chat to search automatically!",
+                "",
+                "<i>You can inspect album gap coverage and listen to 30s previews directly in chat.</i>",
+            ],
+            footer_lines=["<i>🧭 Home › Search</i>"],
+        )
+        await safe_answer(message, card)
+        return
+
+    if current_user is not None and current_user.role == UserRole.GUEST:
+        oidc_url = resolve_oidc_url(current_user, oidc_service, settings)
+        await safe_answer(
+            message,
+            format_guest_access_denied_card(current_user.telegram_id),
+            reply_markup=build_guest_onboarding_keyboard(
+                oidc_url,
+                telegram_id=current_user.telegram_id,
+            ),
+        )
+        return
+
+    if governance_repository is None or current_user is None:
+        return
+
+    if album_search_service is None:
+        album_search_service = AlbumSearchService(
+            catalog_repository=governance_repository, radar_provider=None
+        )
+
+    prefs = await governance_repository.get_user_preferences(current_user.telegram_id)
+    scope = prefs.search_scope or "global"
+    result = await album_search_service.search(query=query, scope=scope)
+
+    web_url = settings.web_app_url.strip() if settings and settings.web_app_url else None
+    card = format_search_results_card(result)
+    markup = build_search_results_keyboard(result, web_app_url=web_url)
+    await safe_answer(message, card, reply_markup=markup)
 
 
 @search_router.message(
@@ -310,16 +369,35 @@ async def handle_search_track_preview(
     target_id = track_id.replace("preview:", "", 1)
     # Fetch preview url
     preview_url = None
-    if hasattr(radar_service, "_provider"):
+    track_title = "Audio Preview (30s)"
+
+    if hasattr(radar_service, "get_track_preview"):
+        try:
+            preview_res = await radar_service.get_track_preview(target_id)
+            if preview_res:
+                if hasattr(preview_res, "preview_url"):
+                    preview_url = getattr(preview_res, "preview_url", None)
+                    p_title = getattr(preview_res, "title", None)
+                    if p_title:
+                        track_title = f"{p_title} (Preview)"
+                elif isinstance(preview_res, tuple) and len(preview_res) == 2:
+                    track_title = f"{preview_res[0]} (Preview)"
+                    preview_url = preview_res[1]
+        except Exception as exc:
+            logger.debug("radar_service.get_track_preview failed: %s", exc)
+
+    if not preview_url and hasattr(radar_service, "_provider"):
         try:
             tracks = await radar_service._provider.search_tracks(callback_data.query, limit=10)
             matched = next((t for t in tracks if t.track_id == target_id), None)
             if matched:
                 preview_url = matched.preview_url
+                if getattr(matched, "title", None):
+                    track_title = f"{matched.title} (Preview)"
         except Exception as exc:
             logger.warning("Failed to lookup preview URL for %s: %s", target_id, exc)
 
-    if not preview_url:
+    if not preview_url or not isinstance(preview_url, str):
         await ack_callback(query, "Preview URL not found.", show_alert=True)
         return
 
@@ -335,7 +413,7 @@ async def handle_search_track_preview(
         await query.message.answer_audio(
             BufferedInputFile(audio_bytes, filename=filename),
             caption=f"🎧 <b>30-Second Audio Preview</b>\n<i>From search: {caption_query}</i>",
-            title="Audio Preview (30s)",
+            title=track_title,
             duration=30,
         )
     except Exception as exc:

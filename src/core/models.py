@@ -169,6 +169,7 @@ class UserPreferences:
     theme: str = "system"
     streaming_platform_order: str = "deezer,tidal,qobuz,spotify,apple_music"
     search_scope: str = "global"
+    notifications_enabled: bool = True
 
     @property
     def platform_priority_list(self) -> list[str]:
@@ -414,6 +415,19 @@ class FollowedArtist:
     provider_artist_id: str | None = None
     notify_telegram: bool = True
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass(slots=True)
+class RadarScanProgress:
+    """Current live progress and status of a Release Radar scan across monitored artists."""
+
+    is_scanning: bool = False
+    current_artist: str = ""
+    processed_artists: int = 0
+    total_artists: int = 0
+    discovered_count: int = 0
+    started_at: str | None = None
+    percent: int = 0
 
 
 @dataclass(frozen=True, slots=True)

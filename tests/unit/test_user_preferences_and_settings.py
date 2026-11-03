@@ -68,16 +68,19 @@ async def test_user_preferences_sqlite_roundtrip(tmp_path: Path) -> None:
     assert prefs.stream_format == "auto"
     assert prefs.stream_bitrate == 128
     assert prefs.auto_lyrics_search is True
+    assert prefs.notifications_enabled is True
 
     # 2. Insert new preferences
     prefs.stream_format = "opus"
     prefs.stream_bitrate = 128
     prefs.auto_lyrics_search = False
+    prefs.notifications_enabled = False
     await repo.update_user_preferences(prefs)
 
     reloaded = await repo.get_user_preferences(telegram_id=456)
     assert reloaded.telegram_id == 456
     assert reloaded.stream_format == "opus"
+    assert reloaded.notifications_enabled is False
     assert reloaded.stream_bitrate == 128
     assert reloaded.auto_lyrics_search is False
 
@@ -106,10 +109,13 @@ def test_render_settings_card_and_keyboards() -> None:
     assert "Opus" in card
     assert "128 kbps" in card
     assert "Disabled" in card
+    assert "Release Notifications" in card
 
     kb = build_user_settings_keyboard(prefs, back_callback="menu:home")
     assert kb is not None
     assert len(kb.inline_keyboard) > 0
+    button_texts = [btn.text for row in kb.inline_keyboard for btn in row]
+    assert any("Release Drop Alerts" in text for text in button_texts)
 
     overview_kb = build_bulk_review_overview_keyboard(pending_count=3)
     assert overview_kb is not None
@@ -171,6 +177,18 @@ async def test_bot_settings_command_and_callbacks() -> None:
         state=None,
     )
     assert prefs.auto_lyrics_search is False
+
+    # Callback: toggle release notifications
+    cb_data_notifs = SettingsCallback(action="notifs", value="toggle")
+    assert prefs.notifications_enabled is True
+    await handle_settings_callback(
+        cb,
+        cb_data_notifs,
+        current_user=user,
+        governance_repository=repo,
+        state=None,
+    )
+    assert prefs.notifications_enabled is False
 
     # Callback: oidc disconnect
     linked_user = UserAccount(

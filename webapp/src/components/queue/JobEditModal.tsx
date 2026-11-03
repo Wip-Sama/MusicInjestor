@@ -43,6 +43,7 @@ export const JobEditModal: React.FC<JobEditModalProps> = ({
 
   // Link / Search state
   const [linkQuery, setLinkQuery] = useState<string>('');
+  const [selectedProvider, setSelectedProvider] = useState<string>('all');
   const [isSearching, setIsSearching] = useState<boolean>(false);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [candidates, setCandidates] = useState<CandidateItem[]>([]);
@@ -106,7 +107,7 @@ export const JobEditModal: React.FC<JobEditModalProps> = ({
     setSuccessNote(null);
 
     try {
-      const updatedJob = await manualSearch(job.job_id, query);
+      const updatedJob = await manualSearch(job.job_id, query, selectedProvider);
       const newCandidates = updatedJob.candidates || [];
       setCandidates(newCandidates);
 
@@ -317,6 +318,46 @@ export const JobEditModal: React.FC<JobEditModalProps> = ({
                 <span>Fetch Link</span>
               </button>
             </form>
+
+            {/* Platform Provider Source Pills */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+              <span style={{ fontSize: '11px', color: 'var(--tg-theme-subtitle-text-color, #8e8e93)', fontWeight: 600 }}>
+                Platform Order:
+              </span>
+              {[
+                { id: 'all', label: 'All Sources' },
+                { id: 'musicbrainz', label: 'MusicBrainz' },
+                { id: 'deezer', label: 'Deezer' },
+                { id: 'genius', label: 'Genius' },
+                { id: 'lastfm', label: 'Last.fm' },
+              ].map((prov) => {
+                const isSelected = selectedProvider === prov.id;
+                return (
+                  <button
+                    key={prov.id}
+                    type="button"
+                    onClick={() => setSelectedProvider(prov.id)}
+                    style={{
+                      fontSize: '11px',
+                      fontWeight: 600,
+                      padding: '3px 8px',
+                      borderRadius: '6px',
+                      border: isSelected ? '1px solid var(--tg-theme-button-color, #0a84ff)' : '1px solid rgba(255, 255, 255, 0.1)',
+                      backgroundColor: isSelected ? 'rgba(10, 132, 255, 0.2)' : 'rgba(255, 255, 255, 0.05)',
+                      color: isSelected ? 'var(--tg-theme-button-color, #0a84ff)' : 'var(--tg-theme-subtitle-text-color, #8e8e93)',
+                      cursor: 'pointer',
+                      transition: 'all 0.15s ease',
+                    }}
+                  >
+                    {prov.label}
+                  </button>
+                );
+              })}
+            </div>
+
+            <div style={{ fontSize: '11px', color: 'var(--tg-theme-subtitle-text-color, #8e8e93)', paddingLeft: '2px' }}>
+              💡 If provided, the ingestion engine tags against this exact release instead of cascading search.
+            </div>
 
             {searchError && (
               <div style={{ color: '#ff453a', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '4px' }}>

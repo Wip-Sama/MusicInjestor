@@ -9,6 +9,7 @@ from aiogram.types import CallbackQuery, Message, User
 from src.bot.keyboards.radar import (
     RadarCallback,
     build_album_tracks_keyboard,
+    build_artist_dossier_keyboard,
     build_followed_artists_keyboard,
     build_other_platforms_keyboard,
     build_preview_audio_keyboard,
@@ -17,15 +18,19 @@ from src.bot.keyboards.radar import (
     build_release_notification_keyboard,
 )
 from src.bot.routers.radar import (
+    format_artist_dossier_card,
     format_radar_home_card,
     format_release_detail_card,
     format_release_notification_card,
+    handle_cmd_follow,
     handle_cmd_radar,
+    handle_cmd_unfollow,
     handle_radar_album_tracks,
     handle_radar_other_links,
     handle_radar_play_full_track,
     handle_radar_preview_audio,
     handle_radar_preview_individual_track,
+    handle_radar_test_alert,
     handle_radar_toggle_follow,
     handle_radar_view_release,
 )
@@ -390,3 +395,149 @@ def test_radar_notification_formatting_and_keyboard(tmp_path: Path) -> None:
     assert any("Play Full Track" in t for t in button_texts)
     assert any("Song in Bot" in t for t in button_texts)
     assert any("Play in Mini App" in t for t in button_texts)
+
+
+def test_artist_dossier_card_and_keyboard(tmp_path: Path) -> None:
+    """Test format_artist_dossier_card and build_artist_dossier_keyboard."""
+    trk = LibraryTrackRecord(
+        id="tr_1",
+        job_id="job_1",
+        uploaded_by=1001,
+        storage_path=tmp_path / "song.flac",
+        fingerprint="fp1",
+        duration_seconds=180.0,
+        artist="YOASOBI",
+        album="THE BOOK",
+        title="Into The Night",
+        year=2021,
+    )
+    rel = DiscoveredRelease(
+        id="rel_1",
+        artist_name="YOASOBI",
+        title="Idol",
+        release_type="single",
+        release_date="2023-04-12",
+    )
+    card = format_artist_dossier_card(
+        artist_name="YOASOBI",
+        is_followed=True,
+        library_tracks_count=1,
+        releases_count=1,
+        library_tracks=[trk],
+        releases=[rel],
+    )
+    assert "Artist Dossier — YOASOBI" in card
+    assert "Following (Alerts Active)" in card
+    assert "Into The Night" in card
+    assert "Idol" in card
+
+    kb = build_artist_dossier_keyboard(
+        artist_name="YOASOBI",
+        is_followed=True,
+        library_tracks=[trk],
+        releases=[rel],
+        web_app_url="https://app.example.com",
+    )
+    button_texts = [btn.text for row in kb.inline_keyboard for btn in row]
+    assert any("Unfollow YOASOBI" in t for t in button_texts)
+    assert any("Into The Night" in t for t in button_texts)
+    assert any("Idol" in t for t in button_texts)
+
+
+@pytest.mark.anyio
+async def test_cmd_follow_and_unfollow() -> None:
+    """Test /follow and /unfollow command handlers."""
+    radar_service = AsyncMock(spec=ReleaseRadarService)
+    radar_service.follow_artist.return_value = FollowedArtist(id=1, telegram_id=123, artist_name="YOASOBI")
+    radar_service.unfollow_artist.return_value = True
+
+    repo = AsyncMock(spec=GovernanceRepositoryPort)
+    repo.list_library_tracks_by_artist.return_value = []
+    repo.list_discovered_releases.return_value = []
+    repo.get_user_preferences.return_value = UserPreferences(telegram_id=123)
+
+    settings = AppSettings()
+    user = UserAccount(telegram_id=123, display_name="User", role=UserRole.UPLOADER)
+
+    # 1. /follow without argument -> usage prompt
+    msg_empty = AsyncMock(spec=Message)
+    msg_empty.text = "/follow"
+    await handle_cmd_follow(
+        msg_empty,
+        current_user=user,
+        governance_repository=repo,
+        radar_service=radar_service,
+        settings=settings,
+    )
+    assert msg_empty.answer.called
+
+    # 2. /follow with artist name -> follows and shows dossier
+    msg_valid = AsyncMock(spec=Message)
+    msg_valid.text = "/follow YOASOBI"
+    await handle_cmd_follow(
+        msg_valid,
+        current_user=user,
+        governance_repository=repo,
+        radar_service=radar_service,
+        settings=settings,
+    )
+    radar_service.follow_artist.assert_awaited_with(123, "YOASOBI")
+    assert msg_valid.answer.called
+
+    # 3. /unfollow without argument -> usage prompt
+    msg_un_empty = AsyncMock(spec=Message)
+    msg_un_empty.text = "/unfollow"
+    await handle_cmd_unfollow(
+        msg_un_empty,
+        current_user=user,
+        radar_service=radar_service,
+    )
+    assert msg_un_empty.answer.called
+
+    # 4. /unfollow with artist name
+    msg_un_valid = AsyncMock(spec=Message)
+    msg_un_valid.text = "/unfollow YOASOBI"
+    await handle_cmd_unfollow(
+        msg_un_valid,
+        current_user=user,
+        radar_service=radar_service,
+    )
+    radar_service.unfollow_artist.assert_awaited_with(123, "YOASOBI")
+    assert msg_un_valid.answer.called
+
+
+@pytest.mark.anyio
+async def test_handle_radar_test_alert() -> None:
+    """Test delivering a test release drop notification card."""
+    repo = AsyncMock(spec=GovernanceRepositoryPort)
+    repo.get_user_preferences.return_value = UserPreferences(telegram_id=123, notifications_enabled=True)
+    repo.list_discovered_releases.return_value = [
+        DiscoveredRelease(
+            id="rel_1",
+            artist_name="YOASOBI",
+            title="Idol",
+            release_type="single",
+            release_date="2023-04-12",
+        )
+    ]
+    repo.find_library_tracks_for_release.return_value = []
+
+    settings = AppSettings()
+    user = UserAccount(telegram_id=123, display_name="User", role=UserRole.UPLOADER)
+
+    mock_bot = AsyncMock()
+    msg = AsyncMock(spec=Message)
+    msg.from_user = User(id=123, is_bot=False, first_name="User")
+    msg.bot = mock_bot
+
+    await handle_radar_test_alert(
+        event=msg,
+        current_user=user,
+        governance_repository=repo,
+        settings=settings,
+    )
+    mock_bot.send_message.assert_awaited_once()
+    call_args = mock_bot.send_message.call_args[1]
+    assert call_args["chat_id"] == 123
+    assert "[TEST NOTIFICATION]" in call_args["text"]
+    assert "YOASOBI" in call_args["text"]

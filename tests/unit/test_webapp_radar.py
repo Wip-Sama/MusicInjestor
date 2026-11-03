@@ -1,5 +1,6 @@
 """Unit tests for the Release Radar Web Mini App API endpoints."""
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -9,7 +10,13 @@ import httpx
 import pytest
 
 from src.bot.webapp_server import BotWebServer
-from src.core.models import DiscoveredRelease, ReleaseTrackPreview, UserAccount, UserRole
+from src.core.models import (
+    DiscoveredRelease,
+    RadarScanProgress,
+    ReleaseTrackPreview,
+    UserAccount,
+    UserRole,
+)
 from src.core.radar import ReleaseRadarService
 from src.core.rbac import GovernanceService
 from src.db.database import SqliteDatabaseManager
@@ -120,9 +127,41 @@ async def test_webapp_radar_endpoints(tmp_path: Path) -> None:
 
             # 4. POST /api/v1/app/radar/scan
             scan_resp = await client.post(f"{base_url}/api/v1/app/radar/scan", headers=headers)
-            assert scan_resp.status_code == 200
+            assert scan_resp.status_code == 202
             assert scan_resp.json()["ok"] is True
+            assert scan_resp.json()["is_scanning"] is True
+            await asyncio.sleep(0.05)
             mock_radar.scan_monitored_artists.assert_awaited_once()
+
+            # 5. GET /api/v1/app/radar/status
+            status_resp = await client.get(f"{base_url}/api/v1/app/radar/status", headers=headers)
+            assert status_resp.status_code == 200
+            status_data = status_resp.json()
+            assert "is_scanning" in status_data
+            assert "progress" in status_data
+
+            # 6. Test concurrent scan rejection (409)
+            mock_radar.is_scanning = True
+            mock_radar.progress = RadarScanProgress(
+                is_scanning=True,
+                current_artist="Fujii Kaze",
+                processed_artists=1,
+                total_artists=5,
+                percent=20,
+            )
+            busy_scan_resp = await client.post(f"{base_url}/api/v1/app/radar/scan", headers=headers)
+            assert busy_scan_resp.status_code == 409
+            assert busy_scan_resp.json()["already_scanning"] is True
+
+            # 7. GET /api/v1/app/artists/{artist_name}
+            artist_resp = await client.get(f"{base_url}/api/v1/app/artists/Fujii%20Kaze", headers=headers)
+            assert artist_resp.status_code == 200
+            artist_data = artist_resp.json()
+            assert artist_data["artist_name"] == "Fujii Kaze"
+            assert "library_tracks" in artist_data
+            assert "discovered_releases" in artist_data
+            assert len(artist_data["discovered_releases"]) == 1
+            assert artist_data["stats"]["releases_discovered"] == 1
 
     finally:
         await server.stop()

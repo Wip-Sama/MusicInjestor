@@ -817,3 +817,79 @@ def test_governance_tag_corrections_and_system_wipe(tmp_path: Path) -> None:
         assert await repo.list_library_tracks(limit=5) == []
 
     asyncio.run(_scenario())
+
+
+def test_ingestion_queue_worker_duplicate_execution_guards(tmp_path: Path) -> None:
+    """Verify execute_job terminal state protection and worker loop active detection."""
+    db_manager = SqliteDatabaseManager(tmp_path / "queue_guard.db")
+    repo = SqliteCatalogRepository(db_manager)
+    notifier = TelegramAdminLogNotifier(admin_log_channel_id=-100123)
+
+    candidates = [
+        MetadataCandidate(
+            metadata=TrackMetadata(
+                title="Song A",
+                artist="Artist A",
+                album="Album A",
+                year=2020,
+            ),
+            confidence=0.95,
+        )
+    ]
+    pipeline = IngestionPipeline(
+        extractor=StubExtractor(),
+        fingerprinter=StubFingerprinter("FP_GUARD"),
+        metadata_provider=StubMetadataProvider(candidates),
+        lyrics_provider=StubLyricsProvider(),
+        organizer=LibraryOrganizer(tmp_path / "library"),
+        catalog_repository=repo,
+        auto_approve_confidence=0.90,
+    )
+    worker = IngestionQueueWorker(
+        pipeline=pipeline,
+        catalog_repository=repo,
+        governance_repository=repo,
+        notifier=notifier,
+        concurrency_limit=1,
+    )
+
+    async def _scenario() -> None:
+        await db_manager.initialize()
+        user = UserAccount(telegram_id=999, display_name="User", role=UserRole.UPLOADER)
+        await repo.upsert_user(user)
+
+        # 1. Test worker loop active status
+        assert worker.is_worker_loop_active is False
+        worker._worker_loop_active = True
+        assert worker.is_worker_loop_active is True
+        worker._worker_loop_active = False
+        assert worker.is_worker_loop_active is False
+
+        # 2. Test execute_job on already COMPLETED job returns early (None)
+        audio = tmp_path / "track.flac"
+        audio.write_bytes(b"flac-data")
+        job, _ = await worker.enqueue_job(user, audio, "track.flac")
+        job.state = JobState.COMPLETED
+        await repo.save_job(job)
+
+        res_completed = await worker.execute_job(job.job_id)
+        assert res_completed is None
+        assert len(notifier.sent_events) == 0
+
+        # 3. Test execute_job on already DUPLICATE_REJECTED job returns early (None)
+        job_dup, _ = await worker.enqueue_job(user, audio, "track2.flac")
+        job_dup.state = JobState.DUPLICATE_REJECTED
+        await repo.save_job(job_dup)
+
+        res_dup = await worker.execute_job(job_dup.job_id)
+        assert res_dup is None
+
+        # 4. Test execute_job on CANCELLED job returns early (None)
+        job_cancel, _ = await worker.enqueue_job(user, audio, "track3.flac")
+        job_cancel.state = JobState.CANCELLED
+        await repo.save_job(job_cancel)
+
+        res_cancel = await worker.execute_job(job_cancel.job_id)
+        assert res_cancel is None
+
+    asyncio.run(_scenario())

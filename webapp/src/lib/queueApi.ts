@@ -13,11 +13,15 @@ export async function fetchQueue(mineOnly: boolean = false): Promise<QueueRespon
 
 export async function uploadMediaFile(
   file: File,
-  onProgress?: (percent: number) => void
+  onProgress?: (percent: number) => void,
+  releaseUrl?: string
 ): Promise<{ success: boolean; job: QueueJob }> {
   const initData = await ensureInitData();
   const formData = new FormData();
   formData.append('file', file, file.name);
+  if (releaseUrl && releaseUrl.trim()) {
+    formData.append('release_url', releaseUrl.trim());
+  }
 
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -95,8 +99,12 @@ export async function selectCandidate(jobId: string, candidateIndex: number): Pr
   return executeQueueAction(jobId, { action: 'select_candidate', candidate_index: candidateIndex });
 }
 
-export async function manualSearch(jobId: string, query: string): Promise<QueueJob> {
-  return executeQueueAction(jobId, { action: 'manual_search', query });
+export async function manualSearch(jobId: string, query: string, provider?: string): Promise<QueueJob> {
+  return executeQueueAction(jobId, { action: 'manual_search', query, provider });
+}
+
+export async function setJobReleaseLink(jobId: string, releaseUrl: string): Promise<QueueJob> {
+  return executeQueueAction(jobId, { action: 'set_release_link', release_url: releaseUrl });
 }
 
 export interface ApplyJobEditPayload {
@@ -142,6 +150,8 @@ export function connectQueueEvents(
       'job_completed',
       'job_failed',
       'job_state_changed',
+      'bulk_research_progress',
+      'radar_scan_progress',
     ];
 
     eventTypes.forEach((type) => {
@@ -157,6 +167,15 @@ export function connectQueueEvents(
 
     source.onerror = (e) => {
       if (onError) onError(e);
+      if (!closed) {
+        source?.close();
+        source = null;
+        setTimeout(() => {
+          if (!closed) {
+            init();
+          }
+        }, 3000);
+      }
     };
   };
 

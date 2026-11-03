@@ -43,6 +43,7 @@ export const EditMetadataModal: React.FC<EditMetadataModalProps> = ({
   const [selectedMbid, setSelectedMbid] = useState<{ rec?: string; rel?: string }>({});
   const [enrichError, setEnrichError] = useState<string | null>(null);
   const [fetchedLyrics, setFetchedLyrics] = useState<string | null>(null);
+  const [selectedProvider, setSelectedProvider] = useState<string>('all');
 
   const handleAutoSearch = async (customQuery?: string) => {
     setIsSearching(true);
@@ -52,7 +53,7 @@ export const EditMetadataModal: React.FC<EditMetadataModalProps> = ({
       const res = await apiFetch(`/api/v1/app/tracks/${track.id}/auto-enrich`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: q }),
+        body: JSON.stringify({ query: q, provider: selectedProvider }),
       });
       if (!res.ok) {
         throw new Error(`Enrichment failed (${res.status})`);
@@ -130,7 +131,7 @@ export const EditMetadataModal: React.FC<EditMetadataModalProps> = ({
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px', fontWeight: 600 }}>
             <Sparkles size={16} color="var(--tg-theme-button-color, #0a84ff)" />
-            <span>Auto-Enrich with MusicBrainz &amp; Genius</span>
+            <span>Auto-Enrich &amp; Tagging Search</span>
           </div>
           <button
             onClick={() => handleAutoSearch()}
@@ -154,6 +155,41 @@ export const EditMetadataModal: React.FC<EditMetadataModalProps> = ({
           </button>
         </div>
 
+        {/* Platform Provider Source Pills */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
+          <span style={{ fontSize: '11px', color: 'var(--tg-theme-subtitle-text-color, #8e8e93)', fontWeight: 600 }}>
+            Platform Order:
+          </span>
+          {[
+            { id: 'all', label: 'All Sources' },
+            { id: 'musicbrainz', label: 'MusicBrainz' },
+            { id: 'deezer', label: 'Deezer' },
+            { id: 'genius', label: 'Genius' },
+            { id: 'lastfm', label: 'Last.fm' },
+          ].map((prov) => {
+            const isSelected = selectedProvider === prov.id;
+            return (
+              <button
+                key={prov.id}
+                type="button"
+                onClick={() => setSelectedProvider(prov.id)}
+                style={{
+                  fontSize: '11px',
+                  fontWeight: 600,
+                  padding: '3px 8px',
+                  borderRadius: '6px',
+                  border: isSelected ? '1px solid var(--tg-theme-button-color, #0a84ff)' : '1px solid rgba(255, 255, 255, 0.1)',
+                  backgroundColor: isSelected ? 'rgba(10, 132, 255, 0.2)' : 'rgba(255, 255, 255, 0.05)',
+                  color: isSelected ? 'var(--tg-theme-button-color, #0a84ff)' : 'var(--tg-theme-subtitle-text-color, #8e8e93)',
+                  cursor: 'pointer',
+                  transition: 'all 0.15s ease',
+                }}
+              >
+                {prov.label}
+              </button>
+            );
+          })}
+        </div>
         {/* Custom Query Search row */}
         <div style={{ display: 'flex', gap: '6px' }}>
           <input

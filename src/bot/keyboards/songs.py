@@ -653,6 +653,17 @@ def build_user_settings_keyboard(
             callback_data=SettingsCallback(action="lyrics", value="toggle").pack(),
         )
     )
+    notif_state = (
+        "🔔 [Enabled] Release Drop Alerts"
+        if prefs.notifications_enabled
+        else "🔕 [Disabled] Release Drop Alerts"
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text=notif_state,
+            callback_data=SettingsCallback(action="notifs", value="toggle").pack(),
+        )
+    )
     builder.row(
         InlineKeyboardButton(
             text="🎛️ Platform Links Priority",

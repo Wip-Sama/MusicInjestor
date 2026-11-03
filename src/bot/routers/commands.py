@@ -316,11 +316,13 @@ def _render_settings_card(prefs: UserPreferences, current_user: UserAccount | No
     fmt_text = fmt_labels.get(prefs.stream_format, prefs.stream_format)
     lyr_status = "Enabled" if prefs.auto_lyrics_search else "Disabled"
     scope_desc = "Global (Deezer + Library)" if prefs.search_scope == "global" else "Library Only"
+    notif_status = "Enabled (Active Alerts)" if prefs.notifications_enabled else "Disabled (Muted)"
     context = [
         f"• <b>Streaming Format:</b> <code>{html.escape(fmt_text)}</code>",
         f"• <b>Transcoding Bitrate:</b> <code>{prefs.stream_bitrate} kbps</code>",
         f"• <b>Auto-Search Online Lyrics:</b> <code>{lyr_status}</code>",
         f"• <b>Search Scope:</b> <code>{scope_desc}</code>",
+        f"• <b>Release Notifications:</b> <code>{notif_status}</code>",
     ]
     platform_names = [PLATFORM_LABELS.get(p, p.title()) for p in prefs.platform_priority_list]
     context.append(f"• <b>Platform Links Priority:</b> <code>{' → '.join(platform_names)}</code>")
@@ -831,6 +833,10 @@ async def handle_settings_callback(
     elif callback_data.action == "lyrics":
         await ack_callback(callback)
         prefs.auto_lyrics_search = not prefs.auto_lyrics_search
+        await governance_repository.update_user_preferences(prefs)
+    elif callback_data.action == "notifs":
+        await ack_callback(callback)
+        prefs.notifications_enabled = not prefs.notifications_enabled
         await governance_repository.update_user_preferences(prefs)
     elif callback_data.action == "scope":
         await ack_callback(callback)

@@ -14,9 +14,10 @@ class IngestionStates(StatesGroup):
 
 
 class AdminStates(StatesGroup):
-    """FSM states during interactive administrator user onboarding/management."""
+    """FSM states during interactive administrator user onboarding/management and queue controls."""
 
     awaiting_new_user_id = State()
+    awaiting_job_link = State()
 
 
 class SongManagementStates(StatesGroup):
@@ -35,3 +36,9 @@ class SettingsStates(StatesGroup):
     """FSM states during user settings customization."""
 
     waiting_for_platform_order = State()
+
+
+class RadarStates(StatesGroup):
+    """FSM states during release radar interactions."""
+
+    awaiting_artist_to_follow = State()

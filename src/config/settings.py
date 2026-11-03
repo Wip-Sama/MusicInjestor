@@ -185,6 +185,7 @@ class AppSettings(BaseModel):
     # Governance, RBAC, Queue & Admin Log Channel settings
     owner_telegram_ids: tuple[int, ...] = Field(default=())
     admin_log_channel_id: int | None = Field(default=None)
+    admin_log_channel_url: str = Field(default="")
     queue_concurrency_limit: int = Field(default=1, ge=1, le=4)
     secret_key: str = Field(default="change-me-in-production-secret-key", min_length=16)
     node_name: str = Field(default="Proxmox LXC 104")

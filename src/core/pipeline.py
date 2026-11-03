@@ -6,6 +6,7 @@ import inspect
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -470,7 +471,22 @@ class IngestionPipeline:
         job.state = JobState.ENRICHING_METADATA
         if not was_paused:
             await self._notify_stage(job, stage_callback)
-        candidates = await self._metadata.find_candidates(local_meta, fingerprint)
+
+        preselected_mbid = job.matched_release_mbid or (
+            job.selected_metadata.release_mbid if job.selected_metadata else None
+        )
+        if preselected_mbid:
+            logger.info(
+                "Job %s has preselected release/recording MBID '%s'. Prioritizing user link.",
+                resolved_job_id,
+                preselected_mbid,
+            )
+            query_meta = replace(local_meta, release_mbid=preselected_mbid)
+            candidates = await self._metadata.find_candidates(query_meta, fingerprint)
+            if not candidates and job.selected_metadata:
+                candidates = [MetadataCandidate(metadata=job.selected_metadata, confidence=1.0)]
+        else:
+            candidates = await self._metadata.find_candidates(local_meta, fingerprint)
         job.candidates = candidates
         if candidates:
             job.confidence_score = candidates[0].confidence

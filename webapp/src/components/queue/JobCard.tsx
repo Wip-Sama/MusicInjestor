@@ -10,7 +10,10 @@ import {
   Check,
   FolderCheck,
   Edit3,
+  Link as LinkIcon,
+  Loader2,
 } from 'lucide-react';
+import { setJobReleaseLink } from '../../lib/queueApi';
 import { QueueJob, CandidateItem } from '../../types/queue';
 import { UserProfile, canResolveOthersJobs } from '../../lib/auth';
 import { StageVisualizer } from './StageVisualizer';
@@ -24,6 +27,7 @@ interface JobCardProps {
   onSelectCandidate: (jobId: string, candidateIndex: number) => Promise<void>;
   onManualSearch: (jobId: string, query: string) => Promise<void>;
   onOpenEdit?: (job: QueueJob, candidate?: CandidateItem) => void;
+  onSetReleaseLink?: (jobId: string, link: string) => Promise<void>;
   profile?: UserProfile | null;
 }
 
@@ -43,10 +47,34 @@ export const JobCard: React.FC<JobCardProps> = ({
   onSelectCandidate,
   onManualSearch,
   onOpenEdit,
+  onSetReleaseLink,
   profile,
 }) => {
   const [copied, setCopied] = useState<boolean>(false);
   const [actionLoading, setActionLoading] = useState<boolean>(false);
+  const [showLinkInput, setShowLinkInput] = useState<boolean>(false);
+  const [linkInput, setLinkInput] = useState<string>(job.matched_release_mbid || '');
+  const [linkLoading, setLinkLoading] = useState<boolean>(false);
+  const [linkError, setLinkError] = useState<string | null>(null);
+
+  const handleApplyLink = async () => {
+    if (actionLoading || linkLoading) return;
+    setLinkLoading(true);
+    setLinkError(null);
+    try {
+      if (onSetReleaseLink) {
+        await onSetReleaseLink(job.job_id, linkInput.trim());
+      } else {
+        await setJobReleaseLink(job.job_id, linkInput.trim());
+      }
+      setShowLinkInput(false);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Failed to apply release link';
+      setLinkError(msg);
+    } finally {
+      setLinkLoading(false);
+    }
+  };
 
   const isOwnJob = !job.user_id || job.user_id === profile?.telegram_id;
   const canControl = isOwnJob || (profile ? canResolveOthersJobs(profile) : false);
@@ -201,6 +229,121 @@ export const JobCard: React.FC<JobCardProps> = ({
       {/* Stage Progress Visualizer for Active/Processing/Queued */}
       {(isPending || isQueued || isPaused) && <StageVisualizer state={job.state} />}
 
+      {/* Guided Release MBID Indicator */}
+      {job.matched_release_mbid && (
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            backgroundColor: 'rgba(10, 132, 255, 0.1)',
+            border: '1px solid rgba(10, 132, 255, 0.25)',
+            borderRadius: '6px',
+            padding: '4px 8px',
+            fontSize: '11px',
+            color: 'var(--tg-theme-button-color, #0a84ff)',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: '4px', overflow: 'hidden' }}>
+            <LinkIcon size={12} />
+            <span style={{ fontWeight: 600 }}>Guided Release:</span>
+            <span style={{ fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {job.matched_release_mbid}
+            </span>
+          </div>
+          {canControl && (isQueued || isPending || isPaused || isAwaiting) && (
+            <button
+              type="button"
+              onClick={() => {
+                setLinkInput(job.matched_release_mbid || '');
+                setShowLinkInput(!showLinkInput);
+              }}
+              style={{
+                background: 'none',
+                border: 'none',
+                color: 'inherit',
+                cursor: 'pointer',
+                fontSize: '10px',
+                textDecoration: 'underline',
+                padding: '0 2px',
+              }}
+            >
+              {showLinkInput ? 'Close' : 'Change'}
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Optional Release Link Guide Box */}
+      {showLinkInput && canControl && (
+        <div
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '6px',
+            backgroundColor: 'rgba(10, 132, 255, 0.06)',
+            border: '1px solid rgba(10, 132, 255, 0.2)',
+            borderRadius: '8px',
+            padding: '8px 10px',
+          }}
+        >
+          <div style={{ display: 'flex', gap: '6px' }}>
+            <input
+              type="text"
+              placeholder="MusicBrainz or Streaming Link (optional, guides ingestion)..."
+              value={linkInput}
+              onChange={(e) => setLinkInput(e.target.value)}
+              disabled={linkLoading || actionLoading}
+              style={{
+                flex: 1,
+                backgroundColor: 'var(--tg-theme-bg-color, #1c1c1e)',
+                border: '1px solid var(--tg-theme-secondary-bg-color, #3a3a3c)',
+                borderRadius: '6px',
+                color: 'var(--tg-theme-text-color, #fff)',
+                padding: '6px 10px',
+                fontSize: '12px',
+                outline: 'none',
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  handleApplyLink();
+                }
+              }}
+            />
+            <button
+              type="button"
+              onClick={handleApplyLink}
+              disabled={linkLoading || actionLoading || !linkInput.trim()}
+              style={{
+                backgroundColor: 'var(--tg-theme-button-color, #0a84ff)',
+                color: '#ffffff',
+                border: 'none',
+                borderRadius: '6px',
+                padding: '6px 12px',
+                fontSize: '12px',
+                fontWeight: 600,
+                cursor: linkLoading || actionLoading || !linkInput.trim() ? 'not-allowed' : 'pointer',
+                whiteSpace: 'nowrap',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '4px',
+              }}
+            >
+              {linkLoading ? <Loader2 size={12} className="spin" /> : 'Apply Link'}
+            </button>
+          </div>
+          {linkError && (
+            <div style={{ color: '#ff453a', fontSize: '11px', display: 'flex', alignItems: 'center', gap: '4px' }}>
+              <AlertCircle size={11} />
+              <span>{linkError}</span>
+            </div>
+          )}
+          <div style={{ fontSize: '11px', color: 'var(--tg-theme-subtitle-text-color, #8e8e93)', paddingLeft: '2px' }}>
+            💡 If provided, the ingestion engine tags against this exact release instead of cascading search.
+          </div>
+        </div>
+      )}
+
       {/* Confirmation Disambiguation Card */}
       {isAwaiting && (
         <DisambiguationCard
@@ -259,6 +402,29 @@ export const JobCard: React.FC<JobCardProps> = ({
       {/* Job Control Action Buttons */}
       {canControl && (isQueued || isPending || isPaused || isAwaiting) && (
         <div style={{ display: 'flex', gap: '6px', justifyContent: 'flex-end', paddingTop: '2px' }}>
+          {/* Set Release Link Button */}
+          <button
+            type="button"
+            onClick={() => setShowLinkInput(!showLinkInput)}
+            disabled={actionLoading}
+            style={{
+              backgroundColor: showLinkInput ? 'rgba(10, 132, 255, 0.2)' : 'var(--tg-theme-secondary-bg-color, #2c2c2e)',
+              color: showLinkInput ? 'var(--tg-theme-button-color, #0a84ff)' : 'var(--tg-theme-text-color, #ffffff)',
+              border: '1px solid var(--tg-theme-subtitle-text-color, #3a3a3c)',
+              borderRadius: '6px',
+              padding: '5px 10px',
+              fontSize: '11px',
+              fontWeight: 600,
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '4px',
+            }}
+          >
+            <LinkIcon size={12} />
+            <span>{job.matched_release_mbid ? 'Change Link' : 'Set Link'}</span>
+          </button>
+
           {/* Edit Tags Button */}
           {onOpenEdit && (
             <button

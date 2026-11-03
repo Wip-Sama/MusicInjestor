@@ -2,11 +2,18 @@
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
 import httpx
 
-from src.core.models import DiscoveredRelease, FollowedArtist, ReleaseNotification, ReleaseTrackPreview
+from src.core.models import (
+    DiscoveredRelease,
+    FollowedArtist,
+    RadarScanProgress,
+    ReleaseNotification,
+    ReleaseTrackPreview,
+)
 from src.core.ports import GovernanceRepositoryPort, ReleaseRadarProviderPort
 
 logger = logging.getLogger(__name__)
@@ -42,6 +49,36 @@ class ReleaseRadarService:
         self._provider = provider
         self._repository = repository
         self._http_client = http_client
+        self._scan_lock = asyncio.Lock()
+        self._progress = RadarScanProgress()
+        self._progress_callbacks: list[Callable[[RadarScanProgress], Awaitable[None] | None]] = []
+
+    @property
+    def is_scanning(self) -> bool:
+        """Check whether a release radar scan is currently in progress."""
+        return self._progress.is_scanning
+
+    @property
+    def progress(self) -> RadarScanProgress:
+        """Return the current radar scan progress snapshot."""
+        return self._progress
+
+    def add_progress_callback(
+        self,
+        callback: Callable[[RadarScanProgress], Awaitable[None] | None],
+    ) -> None:
+        """Register a callback invoked whenever scan progress updates."""
+        self._progress_callbacks.append(callback)
+
+    async def _notify_progress(self) -> None:
+        """Invoke all registered progress listeners."""
+        for cb in self._progress_callbacks:
+            try:
+                res = cb(self._progress)
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception as exc:
+                logger.debug("Radar progress callback error: %s", exc)
 
     async def _get_http_client(self) -> httpx.AsyncClient:
         """Return the injected HTTP client or construct an ephemeral one."""
@@ -97,67 +134,123 @@ class ReleaseRadarService:
         concurrency_limit: int = 3,
     ) -> tuple[list[DiscoveredRelease], list[ReleaseNotification]]:
         """Scan all monitored artists (library artists + followed artists) and generate notifications."""
-        monitored_artists = await self._repository.list_all_monitored_artists()
-        if not monitored_artists:
-            logger.info("No monitored artists found in library or follows to scan.")
+        if self._scan_lock.locked():
+            logger.info("Radar scan is already running. Skipping concurrent invocation.")
             return [], []
 
-        logger.info("Starting Release Radar scan across %d monitored artists...", len(monitored_artists))
+        async with self._scan_lock:
+            monitored_artists = await self._repository.list_all_monitored_artists()
+            if not monitored_artists:
+                logger.info("No monitored artists found in library or follows to scan.")
+                return [], []
 
-        discovered_releases: list[DiscoveredRelease] = []
-        new_notifications: list[ReleaseNotification] = []
-        sem = asyncio.Semaphore(max(1, concurrency_limit))
+            total = len(monitored_artists)
+            self._progress = RadarScanProgress(
+                is_scanning=True,
+                current_artist="",
+                processed_artists=0,
+                total_artists=total,
+                discovered_count=0,
+                started_at=datetime.now(UTC).isoformat(),
+                percent=0,
+            )
+            await self._notify_progress()
 
-        async def _scan_single_artist(name: str) -> list[DiscoveredRelease]:
-            async with sem:
-                try:
-                    provider_id = await self._provider.search_artist(name)
-                    if not provider_id:
-                        return []
-                    releases = await self._provider.get_artist_recent_releases(
-                        provider_artist_id=provider_id,
-                        artist_name=name,
-                        limit=10,
+            logger.info("Starting Release Radar scan across %d monitored artists...", total)
+
+            discovered_releases: list[DiscoveredRelease] = []
+            discovered_lock = asyncio.Lock()
+            new_notifications: list[ReleaseNotification] = []
+            sem = asyncio.Semaphore(max(1, concurrency_limit))
+            processed_counter = 0
+
+            async def _scan_single_artist(name: str) -> list[DiscoveredRelease]:
+                nonlocal processed_counter
+                async with sem:
+                    pct_start = int((processed_counter / total) * 100) if total > 0 else 0
+                    self._progress = RadarScanProgress(
+                        is_scanning=True,
+                        current_artist=name,
+                        processed_artists=processed_counter,
+                        total_artists=total,
+                        discovered_count=len(discovered_releases),
+                        started_at=self._progress.started_at,
+                        percent=pct_start,
                     )
-                    recent = [
-                        r for r in releases if is_release_recent(r.release_date, max_days=max_days_back)
-                    ]
-                    if recent:
-                        return await self._repository.upsert_discovered_releases(recent)
-                    return []
-                except Exception as exc:
-                    logger.warning("Error scanning releases for artist '%s': %s", name, exc)
-                    return []
-
-        tasks = [_scan_single_artist(art) for art in monitored_artists]
-        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for res in batch_results:
-            if isinstance(res, list):
-                discovered_releases.extend(res)
-
-        if discovered_releases and hasattr(self._repository, "list_followers_of_artist"):
-            for rel in discovered_releases:
-                followers = await self._repository.list_followers_of_artist(rel.artist_name)
-                if isinstance(followers, (list, tuple)):
-                    for uid in followers:
-                        new_notifications.append(
-                            ReleaseNotification(
-                                id=0,
-                                telegram_id=uid,
-                                release_id=rel.id,
-                            )
+                    await self._notify_progress()
+                    try:
+                        provider_id = await self._provider.search_artist(name)
+                        if not provider_id:
+                            return []
+                        releases = await self._provider.get_artist_recent_releases(
+                            provider_artist_id=provider_id,
+                            artist_name=name,
+                            limit=10,
                         )
-            if new_notifications and hasattr(self._repository, "create_release_notifications"):
-                await self._repository.create_release_notifications(new_notifications)
+                        recent = [
+                            r for r in releases if is_release_recent(r.release_date, max_days=max_days_back)
+                        ]
+                        if recent:
+                            saved = await self._repository.upsert_discovered_releases(recent)
+                            async with discovered_lock:
+                                discovered_releases.extend(saved)
+                            return saved
+                        return []
+                    except Exception as exc:
+                        logger.warning("Error scanning releases for artist '%s': %s", name, exc)
+                        return []
+                    finally:
+                        processed_counter += 1
+                        pct = int((processed_counter / total) * 100) if total > 0 else 100
+                        self._progress = RadarScanProgress(
+                            is_scanning=True,
+                            current_artist=name,
+                            processed_artists=processed_counter,
+                            total_artists=total,
+                            discovered_count=len(discovered_releases),
+                            started_at=self._progress.started_at,
+                            percent=pct,
+                        )
+                        await self._notify_progress()
 
-        logger.info(
-            "Release Radar scan complete: processed %d artists, discovered %d recent releases.",
-            len(monitored_artists),
-            len(discovered_releases),
-        )
+            try:
+                tasks = [_scan_single_artist(art) for art in monitored_artists]
+                await asyncio.gather(*tasks, return_exceptions=True)
 
-        return discovered_releases, new_notifications
+                self._progress.discovered_count = len(discovered_releases)
+
+                if discovered_releases and hasattr(self._repository, "list_followers_of_artist"):
+                    for rel in discovered_releases:
+                        followers = await self._repository.list_followers_of_artist(rel.artist_name)
+                        if isinstance(followers, (list, tuple)):
+                            for uid in followers:
+                                new_notifications.append(
+                                    ReleaseNotification(
+                                        id=0,
+                                        telegram_id=uid,
+                                        release_id=rel.id,
+                                    )
+                                )
+                if new_notifications and hasattr(self._repository, "create_release_notifications"):
+                    await self._repository.create_release_notifications(new_notifications)
+
+                logger.info(
+                    "Release Radar scan complete: processed %d artists, discovered %d recent releases.",
+                    total,
+                    len(discovered_releases),
+                )
+                return discovered_releases, new_notifications
+            finally:
+                self._progress = RadarScanProgress(
+                    is_scanning=False,
+                    current_artist="",
+                    processed_artists=processed_counter,
+                    total_artists=total,
+                    discovered_count=len(discovered_releases),
+                    started_at=self._progress.started_at,
+                    percent=100,
+                )
+                await self._notify_progress()
 
     async def get_release_track_previews(
         self,
@@ -165,6 +258,15 @@ class ReleaseRadarService:
     ) -> list[ReleaseTrackPreview]:
         """Fetch all track previews for a release from the provider."""
         return await self._provider.get_release_track_previews(provider_release_id)
+
+    async def get_track_preview(
+        self,
+        provider_track_id: str,
+    ) -> tuple[str, str] | None:
+        """Fetch (title, preview_url) directly for an individual track."""
+        if hasattr(self._provider, "get_track_preview"):
+            return await self._provider.get_track_preview(provider_track_id)
+        return None
 
     async def get_preview_audio_bytes(self, preview_url: str) -> bytes | None:
         """Download 30-second audio stream bytes for Telegram chat playback."""

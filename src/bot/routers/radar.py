@@ -6,19 +6,23 @@ from math import ceil
 
 from aiogram import F, Router
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from src.bot.keyboards.radar import (
     RadarCallback,
     build_album_tracks_keyboard,
+    build_artist_dossier_keyboard,
     build_followed_artists_keyboard,
     build_other_platforms_keyboard,
     build_preview_audio_keyboard,
     build_radar_home_keyboard,
     build_release_detail_keyboard,
+    build_release_notification_keyboard,
 )
-from src.bot.ui import ack_callback, format_screen, safe_edit_text
+from src.bot.states import RadarStates
+from src.bot.ui import ack_callback, format_screen, safe_answer, safe_edit_text
 from src.config.settings import AppSettings
 from src.core.deezer import DeezerReleaseProvider
 from src.core.models import DiscoveredRelease, LibraryTrackRecord, UserAccount
@@ -154,7 +158,7 @@ async def handle_cmd_radar(
     await message.answer(card, reply_markup=keyboard, parse_mode="HTML")
 
 
-@radar_router.callback_query(RadarCallback.filter(F.action == "page"))
+@radar_router.callback_query(RadarCallback.filter(F.action.in_({"page", "home"})))
 async def handle_radar_page(
     query: CallbackQuery,
     callback_data: RadarCallback,
@@ -189,6 +193,18 @@ async def handle_radar_page(
         web_app_url=settings.web_app_url,
     )
     await safe_edit_text(query.message, card, reply_markup=keyboard)
+
+
+@radar_router.callback_query(F.data.in_({"radar:page:1", "radar:home", "radar:list", "radar"}))
+async def handle_radar_home_string_cb(
+    query: CallbackQuery,
+    current_user: UserAccount | None,
+    governance_repository: GovernanceRepositoryPort,
+    settings: AppSettings,
+) -> None:
+    """Handle plain string navigation callbacks to the radar screen."""
+    dummy_data = RadarCallback(action="page", page=1)
+    await handle_radar_page(query, dummy_data, current_user, governance_repository, settings)
 
 
 @radar_router.callback_query(RadarCallback.filter(F.action == "view"))
@@ -442,6 +458,16 @@ async def handle_radar_follows_list(
         builder = InlineKeyboardBuilder()
         builder.row(
             InlineKeyboardButton(
+                text="➕ Follow New Artist",
+                callback_data=RadarCallback(action="add_follow").pack(),
+            ),
+            InlineKeyboardButton(
+                text="🧪 Test Alert",
+                callback_data=RadarCallback(action="test_alert").pack(),
+            ),
+        )
+        builder.row(
+            InlineKeyboardButton(
                 text="◀️ Back to Releases",
                 callback_data=RadarCallback(action="page", page=1).pack(),
             )
@@ -476,6 +502,39 @@ async def handle_radar_unfollow_from_list(
     await ack_callback(query, f"🔕 Unfollowed {artist_name}.")
 
     user_follows = await governance_repository.list_user_followed_artists(user_id)
+    if not user_follows:
+        card = format_screen(
+            title="🔔 Followed Artists",
+            context_lines=[
+                "You are not currently following any artists.",
+                "",
+                (
+                    "<i>Browse releases in /radar or songs in /songs and tap 'Follow Artist' "
+                    "to receive alerts!</i>"
+                ),
+            ],
+            footer_lines=["<i>0 Follows</i> • <i>Radar Settings</i>"],
+        )
+        builder = InlineKeyboardBuilder()
+        builder.row(
+            InlineKeyboardButton(
+                text="➕ Follow New Artist",
+                callback_data=RadarCallback(action="add_follow").pack(),
+            ),
+            InlineKeyboardButton(
+                text="🧪 Test Alert",
+                callback_data=RadarCallback(action="test_alert").pack(),
+            ),
+        )
+        builder.row(
+            InlineKeyboardButton(
+                text="◀️ Back to Releases",
+                callback_data=RadarCallback(action="page", page=1).pack(),
+            )
+        )
+        await safe_edit_text(query.message, card, reply_markup=builder.as_markup())
+        return
+
     card = format_screen(
         title=f"🔔 Followed Artists ({len(user_follows)})",
         context_lines=[
@@ -488,6 +547,364 @@ async def handle_radar_unfollow_from_list(
     await safe_edit_text(query.message, card, reply_markup=keyboard)
 
 
+def format_artist_dossier_card(
+    artist_name: str,
+    is_followed: bool,
+    library_tracks_count: int,
+    releases_count: int,
+    library_tracks: list[LibraryTrackRecord],
+    releases: list[DiscoveredRelease],
+) -> str:
+    """Format full intelligence dossier card for a specific artist."""
+    follow_status = "🔔 Following (Alerts Active)" if is_followed else "🔕 Not Followed"
+    context: list[str] = [
+        f"• <b>Artist Name:</b> <code>{html.escape(artist_name)}</code>",
+        f"• <b>Follow Status:</b> <code>{follow_status}</code>",
+        f"• <b>Songs in Library:</b> <code>{library_tracks_count}</code> tracks",
+        f"• <b>Radar Drops Discovered:</b> <code>{releases_count}</code> releases",
+        "",
+    ]
+    if library_tracks:
+        context.append("<b>🎵 Top Library Tracks:</b>")
+        for trk in library_tracks[:4]:
+            yr = f" ({trk.year})" if trk.year else ""
+            context.append(f"• <b>{html.escape(trk.title)}</b> — <i>{html.escape(trk.album)}</i>{yr}")
+        context.append("")
+    else:
+        context.append("<i>No songs currently stored in library for this artist.</i>")
+        context.append("")
+
+    if releases:
+        context.append("<b>📡 Recent &amp; Upcoming Radar Drops:</b>")
+        for rel in releases[:4]:
+            t_count = f"{rel.track_count} tracks" if rel.track_count > 1 else "Single"
+            context.append(
+                f"• <b>{html.escape(rel.title)}</b> [{rel.release_date or 'Recent'}] — <i>{t_count}</i>"
+            )
+    else:
+        context.append("<i>No external releases currently cached for this artist.</i>")
+
+    return format_screen(
+        title=f"🎤 Artist Dossier — {html.escape(artist_name)}",
+        context_lines=context,
+        footer_lines=[f"<i>🧭 Home › Radar › {html.escape(artist_name)}</i>"],
+    )
+
+
+@radar_router.callback_query(RadarCallback.filter(F.action.in_({"artist_releases", "artist_dossier"})))
+async def handle_radar_artist_dossier(
+    query: CallbackQuery,
+    callback_data: RadarCallback,
+    current_user: UserAccount | None,
+    governance_repository: GovernanceRepositoryPort,
+    settings: AppSettings,
+) -> None:
+    """Display comprehensive dossier for an artist (library tracks, radar drops, follow state)."""
+    await ack_callback(query)
+    user_id = current_user.telegram_id if current_user else (query.from_user.id if query.from_user else 0)
+    artist_name = callback_data.target_id.strip()
+    if not artist_name:
+        await ack_callback(query, "Artist name missing.", show_alert=True)
+        return
+
+    is_followed = await governance_repository.is_artist_followed(user_id, artist_name)
+    lib_tracks = await governance_repository.list_library_tracks_by_artist(artist_name, limit=20)
+    releases = await governance_repository.list_discovered_releases(artist_name=artist_name, limit=20)
+    prefs = await governance_repository.get_user_preferences(user_id)
+
+    card = format_artist_dossier_card(
+        artist_name=artist_name,
+        is_followed=is_followed,
+        library_tracks_count=len(lib_tracks),
+        releases_count=len(releases),
+        library_tracks=lib_tracks,
+        releases=releases,
+    )
+    keyboard = build_artist_dossier_keyboard(
+        artist_name=artist_name,
+        is_followed=is_followed,
+        library_tracks=lib_tracks,
+        releases=releases,
+        web_app_url=settings.web_app_url,
+        platform_priority=prefs.platform_priority_list,
+        back_callback="radar~follows_list~~1",
+    )
+    await safe_edit_text(query.message, card, reply_markup=keyboard)
+
+
+@radar_router.callback_query(RadarCallback.filter(F.action.in_({"follow_artist", "unfollow_artist"})))
+async def handle_radar_toggle_follow_artist(
+    query: CallbackQuery,
+    callback_data: RadarCallback,
+    current_user: UserAccount | None,
+    governance_repository: GovernanceRepositoryPort,
+    radar_service: ReleaseRadarService,
+    settings: AppSettings,
+) -> None:
+    """Toggle follow status from the artist dossier and re-render."""
+    user_id = current_user.telegram_id if current_user else (query.from_user.id if query.from_user else 0)
+    artist_name = callback_data.target_id.strip()
+    if not artist_name:
+        return
+
+    is_following = callback_data.action == "follow_artist"
+    if is_following:
+        await radar_service.follow_artist(user_id, artist_name)
+        await ack_callback(query, f"🔔 Now following {artist_name}!")
+    else:
+        await radar_service.unfollow_artist(user_id, artist_name)
+        await ack_callback(query, f"🔕 Unfollowed {artist_name}.")
+
+    is_followed = is_following
+    lib_tracks = await governance_repository.list_library_tracks_by_artist(artist_name, limit=20)
+    releases = await governance_repository.list_discovered_releases(artist_name=artist_name, limit=20)
+    prefs = await governance_repository.get_user_preferences(user_id)
+
+    card = format_artist_dossier_card(
+        artist_name=artist_name,
+        is_followed=is_followed,
+        library_tracks_count=len(lib_tracks),
+        releases_count=len(releases),
+        library_tracks=lib_tracks,
+        releases=releases,
+    )
+    keyboard = build_artist_dossier_keyboard(
+        artist_name=artist_name,
+        is_followed=is_followed,
+        library_tracks=lib_tracks,
+        releases=releases,
+        web_app_url=settings.web_app_url,
+        platform_priority=prefs.platform_priority_list,
+        back_callback="radar~follows_list~~1",
+    )
+    await safe_edit_text(query.message, card, reply_markup=keyboard)
+
+
+@radar_router.callback_query(RadarCallback.filter(F.action == "add_follow"))
+async def handle_radar_add_follow_prompt(
+    query: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    """Prompt user to type the name of an artist to monitor for new drops."""
+    await ack_callback(query)
+    await state.set_state(RadarStates.awaiting_artist_to_follow)
+    card = format_screen(
+        title="➕ Follow Artist for Release Alerts",
+        context_lines=[
+            "Please send the <b>Artist Name</b> you would like to follow.",
+            "",
+            "<i>Examples:</i> <code>YOASOBI</code>, <code>Taylor Swift</code>, <code>Fujii Kaze</code>",
+            "",
+            "💡 <i>You will receive automatic notification alerts whenever they release new music!</i>",
+        ],
+        footer_lines=["<i>Type an artist name below, or /cancel to abort.</i>"],
+    )
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="◀️ Cancel",
+            callback_data=RadarCallback(action="follows_list", page=1).pack(),
+        )
+    )
+    await safe_edit_text(query.message, card, reply_markup=builder.as_markup())
+
+
+@radar_router.message(RadarStates.awaiting_artist_to_follow, F.text)
+async def handle_radar_artist_name_input(
+    message: Message,
+    state: FSMContext,
+    current_user: UserAccount | None,
+    governance_repository: GovernanceRepositoryPort,
+    radar_service: ReleaseRadarService,
+    settings: AppSettings,
+) -> None:
+    """Process user text input for following a new artist."""
+    raw_name = (message.text or "").strip()
+    await state.clear()
+
+    if not raw_name or raw_name.startswith("/"):
+        return
+
+    user_id = current_user.telegram_id if current_user else (message.from_user.id if message.from_user else 0)
+    followed = await radar_service.follow_artist(user_id, raw_name)
+    artist_name = followed.artist_name
+
+    lib_tracks = await governance_repository.list_library_tracks_by_artist(artist_name, limit=20)
+    releases = await governance_repository.list_discovered_releases(artist_name=artist_name, limit=20)
+    prefs = await governance_repository.get_user_preferences(user_id)
+
+    card = format_artist_dossier_card(
+        artist_name=artist_name,
+        is_followed=True,
+        library_tracks_count=len(lib_tracks),
+        releases_count=len(releases),
+        library_tracks=lib_tracks,
+        releases=releases,
+    )
+    keyboard = build_artist_dossier_keyboard(
+        artist_name=artist_name,
+        is_followed=True,
+        library_tracks=lib_tracks,
+        releases=releases,
+        web_app_url=settings.web_app_url,
+        platform_priority=prefs.platform_priority_list,
+        back_callback="radar~follows_list~~1",
+    )
+    await safe_answer(message, card, reply_markup=keyboard)
+
+
+@radar_router.message(Command("follow"))
+async def handle_cmd_follow(
+    message: Message,
+    current_user: UserAccount | None,
+    governance_repository: GovernanceRepositoryPort,
+    radar_service: ReleaseRadarService,
+    settings: AppSettings,
+) -> None:
+    """Follow an artist via `/follow <artist_name>`."""
+    raw = (message.text or "").strip()
+    artist_name = raw.removeprefix("/follow").strip()
+    if not artist_name:
+        await safe_answer(
+            message,
+            format_screen(
+                title="🔔 Follow Artist",
+                context_lines=[
+                    "Please specify the artist name to follow.",
+                    "<b>Usage:</b> <code>/follow &lt;Artist Name&gt;</code>",
+                ],
+                footer_lines=["<i>🧭 Home › Radar › Follow</i>"],
+            ),
+        )
+        return
+
+    user_id = current_user.telegram_id if current_user else (message.from_user.id if message.from_user else 0)
+    await radar_service.follow_artist(user_id, artist_name)
+    lib_tracks = await governance_repository.list_library_tracks_by_artist(artist_name, limit=20)
+    releases = await governance_repository.list_discovered_releases(artist_name=artist_name, limit=20)
+    prefs = await governance_repository.get_user_preferences(user_id)
+
+    card = format_artist_dossier_card(
+        artist_name=artist_name,
+        is_followed=True,
+        library_tracks_count=len(lib_tracks),
+        releases_count=len(releases),
+        library_tracks=lib_tracks,
+        releases=releases,
+    )
+    keyboard = build_artist_dossier_keyboard(
+        artist_name=artist_name,
+        is_followed=True,
+        library_tracks=lib_tracks,
+        releases=releases,
+        web_app_url=settings.web_app_url,
+        platform_priority=prefs.platform_priority_list,
+    )
+    await safe_answer(message, card, reply_markup=keyboard)
+
+
+@radar_router.message(Command("unfollow"))
+async def handle_cmd_unfollow(
+    message: Message,
+    current_user: UserAccount | None,
+    radar_service: ReleaseRadarService,
+) -> None:
+    """Unfollow an artist via `/unfollow <artist_name>`."""
+    raw = (message.text or "").strip()
+    artist_name = raw.removeprefix("/unfollow").strip()
+    if not artist_name:
+        await safe_answer(
+            message,
+            format_screen(
+                title="🔕 Unfollow Artist",
+                context_lines=[
+                    "Please specify the artist name to unfollow.",
+                    "<b>Usage:</b> <code>/unfollow &lt;Artist Name&gt;</code>",
+                ],
+                footer_lines=["<i>🧭 Home › Radar › Unfollow</i>"],
+            ),
+        )
+        return
+
+    user_id = current_user.telegram_id if current_user else (message.from_user.id if message.from_user else 0)
+    await radar_service.unfollow_artist(user_id, artist_name)
+    await safe_answer(
+        message,
+        format_screen(
+            title="🔕 Artist Unfollowed",
+            context_lines=[
+                f"You have stopped monitoring <code>{html.escape(artist_name)}</code> for new music drops."
+            ],
+            footer_lines=["<i>🧭 Home › Radar</i>"],
+        ),
+    )
+
+
+@radar_router.callback_query(RadarCallback.filter(F.action == "test_alert"))
+@radar_router.message(Command("radar_test"))
+async def handle_radar_test_alert(
+    event: CallbackQuery | Message,
+    current_user: UserAccount | None,
+    governance_repository: GovernanceRepositoryPort,
+    settings: AppSettings,
+) -> None:
+    """Deliver a test release notification card into the chat to verify alert delivery."""
+    user_id = current_user.telegram_id if current_user else (event.from_user.id if event.from_user else 0)
+    prefs = await governance_repository.get_user_preferences(user_id)
+
+    if isinstance(event, CallbackQuery):
+        await ack_callback(event, "🧪 Dispatching test release drop notification...")
+
+    # Find an actual release or generate a representative sample
+    sample_release = None
+    all_releases = await governance_repository.list_discovered_releases(limit=5)
+    if all_releases:
+        sample_release = all_releases[0]
+    else:
+        sample_release = DiscoveredRelease(
+            id="test:yoasobi-idol",
+            artist_name="YOASOBI",
+            title="Idol (Sample Drop)",
+            release_type="single",
+            release_date="2026-10-28",
+            cover_url=None,
+            preview_url=None,
+            external_url="https://www.deezer.com",
+            provider="deezer",
+            track_count=1,
+            in_library=False,
+        )
+
+    matching_tracks = await governance_repository.find_library_tracks_for_release(
+        sample_release.artist_name, sample_release.title
+    )
+    lib_track = matching_tracks[0] if matching_tracks else None
+
+    notif_card = format_release_notification_card(sample_release, lib_track)
+    notif_card = f"🧪 <b>[TEST NOTIFICATION]</b>\n{notif_card}"
+    if not prefs.notifications_enabled:
+        notif_card += (
+            "\n\n⚠️ <i>Note: Release Notifications are currently <b>OFF</b> in your /settings. "
+            "Turn them ON to receive real-time alerts when drops happen!</i>"
+        )
+
+    keyboard = build_release_notification_keyboard(
+        release=sample_release,
+        lib_track=lib_track,
+        web_app_url=settings.web_app_url,
+        platform_priority=prefs.platform_priority_list,
+    )
+
+    bot = event.bot
+    if bot is not None:
+        await bot.send_message(
+            chat_id=user_id,
+            text=notif_card,
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
+
+
 @radar_router.callback_query(RadarCallback.filter(F.action == "refresh"))
 async def handle_radar_refresh(
     query: CallbackQuery,
@@ -497,6 +914,19 @@ async def handle_radar_refresh(
     settings: AppSettings,
 ) -> None:
     """Run an on-demand scan across all monitored artists and refresh the radar screen."""
+    if radar_service.is_scanning:
+        prog = radar_service.progress
+        msg = (
+            f"⏳ Radar scan already running ({prog.processed_artists}/{prog.total_artists} artists). "
+            "Please wait!"
+        )
+        await ack_callback(
+            query,
+            msg,
+            show_alert=True,
+        )
+        return
+
     await ack_callback(query, "🔄 Scanning artists for new drops...")
     discovered, _ = await radar_service.scan_monitored_artists()
     await ack_callback(query, f"✅ Scan complete! Found {len(discovered)} recent releases.")

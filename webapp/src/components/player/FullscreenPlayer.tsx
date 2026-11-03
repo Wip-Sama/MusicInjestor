@@ -15,6 +15,9 @@ import {
   Check,
   Send,
   Bot,
+  Volume2,
+  Volume1,
+  VolumeX,
 } from 'lucide-react';
 import { useAudioPlayer } from '../../context/AudioPlayerContext';
 import { formatTime } from '../../lib/lrc';
@@ -28,6 +31,10 @@ export const FullscreenPlayer: React.FC = () => {
     isPlaying,
     currentTime,
     duration,
+    volume,
+    setVolume,
+    isMuted,
+    toggleMute,
     repeatMode,
     isShuffle,
     isPlayerOpen,
@@ -48,6 +55,7 @@ export const FullscreenPlayer: React.FC = () => {
     toggleFollowArtist,
     sendTrackToChat,
     openInTelegramBot,
+    openArtistPage,
   } = useAudioPlayer();
   const [isSendingToChat, setIsSendingToChat] = useState<boolean>(false);
   const [chatStatusText, setChatStatusText] = useState<string | null>(null);
@@ -203,15 +211,20 @@ export const FullscreenPlayer: React.FC = () => {
               }}
             >
               <span
+                onClick={() => openArtistPage(currentTrack.artist)}
                 style={{
                   fontSize: '16px',
                   fontWeight: 500,
-                  color: 'var(--tg-theme-subtitle-text-color, #8e8e93)',
+                  color: 'var(--tg-theme-button-color, #0a84ff)',
+                  textDecoration: 'underline',
+                  textUnderlineOffset: '2px',
                   whiteSpace: 'nowrap',
                   overflow: 'hidden',
                   textOverflow: 'ellipsis',
                   maxWidth: '180px',
+                  cursor: 'pointer',
                 }}
+                title={`View ${currentTrack.artist} artist page`}
               >
                 {currentTrack.artist}
               </span>
@@ -407,6 +420,73 @@ export const FullscreenPlayer: React.FC = () => {
         >
           {repeatMode === 'one' ? <Repeat1 size={20} /> : <Repeat size={20} />}
         </button>
+      </div>
+
+      {/* Volume Control Slider */}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '12px',
+          width: '100%',
+          maxWidth: '300px',
+          margin: '2px auto 8px auto',
+          padding: '0 12px',
+        }}
+      >
+        <button
+          type="button"
+          onClick={toggleMute}
+          title={isMuted ? 'Unmute' : 'Mute'}
+          style={{
+            background: 'transparent',
+            border: 'none',
+            color: isMuted || volume === 0 ? 'var(--tg-theme-destructive-text-color, #ff453a)' : 'var(--tg-theme-subtitle-text-color, #8e8e93)',
+            cursor: 'pointer',
+            padding: '4px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+        >
+          {isMuted || volume === 0 ? (
+            <VolumeX size={18} />
+          ) : volume < 0.5 ? (
+            <Volume1 size={18} />
+          ) : (
+            <Volume2 size={18} />
+          )}
+        </button>
+
+        <input
+          type="range"
+          min="0"
+          max="1"
+          step="0.01"
+          value={isMuted ? 0 : volume}
+          onChange={(e) => setVolume(parseFloat(e.target.value))}
+          style={{
+            flex: 1,
+            height: '4px',
+            borderRadius: '2px',
+            accentColor: 'var(--tg-theme-button-color, #0a84ff)',
+            cursor: 'pointer',
+          }}
+          aria-label="Volume slider"
+        />
+
+        <span
+          style={{
+            fontSize: '11px',
+            fontWeight: 600,
+            color: 'var(--tg-theme-subtitle-text-color, #8e8e93)',
+            fontVariantNumeric: 'tabular-nums',
+            minWidth: '32px',
+            textAlign: 'right',
+          }}
+        >
+          {isMuted ? '0%' : `${Math.round(volume * 100)}%`}
+        </span>
       </div>
 
       {/* Bottom Features Toggle Bar */}

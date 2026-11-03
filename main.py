@@ -42,7 +42,9 @@ logger = logging.getLogger(__name__)
 BOT_COMMANDS: tuple[BotCommand, ...] = (
     BotCommand(command="start", description="Open main menu, status & SSO pairing"),
     BotCommand(command="songs", description="Browse, search, download, edit & export songs"),
+    BotCommand(command="search", description="Search songs & albums across library and Deezer"),
     BotCommand(command="radar", description="New releases radar & followed artists"),
+    BotCommand(command="follow", description="Follow an artist for release alerts (/follow <artist>)"),
     BotCommand(command="rescan", description="Scan library folder & sync database"),
     BotCommand(command="job", description="Inspect, pause, unlock or review a job by ID"),
     BotCommand(command="cancel", description="Exit any active input or confirmation prompt"),

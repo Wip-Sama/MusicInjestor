@@ -26,6 +26,7 @@ export const AlbumGapModal: React.FC<AlbumGapModalProps> = ({
     openInTelegramBot,
     sendAlbumToChat,
     sendTrackToChat,
+    openArtistPage,
   } = useAudioPlayer();
   const [gapData, setGapData] = useState<AlbumGapAnalysis | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
@@ -244,7 +245,18 @@ export const AlbumGapModal: React.FC<AlbumGapModalProps> = ({
                   <div style={{ fontSize: '15px', fontWeight: 700, color: '#fff', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                     {gapData.title}
                   </div>
-                  <div style={{ fontSize: '13px', color: '#8e8e93', marginTop: '2px' }}>
+                  <div
+                    onClick={() => openArtistPage(gapData.artist)}
+                    style={{
+                      fontSize: '13px',
+                      color: 'var(--tg-theme-button-color, #0a84ff)',
+                      marginTop: '2px',
+                      cursor: 'pointer',
+                      textDecoration: 'underline',
+                      textUnderlineOffset: '2px',
+                    }}
+                    title={`View ${gapData.artist} artist page`}
+                  >
                     {gapData.artist}
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '6px' }}>

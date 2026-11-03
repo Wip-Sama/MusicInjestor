@@ -21,7 +21,8 @@ import {
 import { Card, Subheadline, Caption, Spinner } from '@telegram-apps/telegram-ui';
 import { useAudioPlayer } from '../context/AudioPlayerContext';
 import { apiFetch } from '../lib/auth';
-import { RadarRelease, RadarFollowItem, TrackItem, ReleaseTrackPreview } from '../types/music';
+import { connectQueueEvents } from '../lib/queueApi';
+import { RadarRelease, RadarFollowItem, TrackItem, ReleaseTrackPreview, RadarScanProgress } from '../types/music';
 
 interface RadarViewProps {
   profile?: unknown;
@@ -55,12 +56,16 @@ const triggerNotificationHaptic = (type: 'error' | 'success' | 'warning' = 'succ
 };
 
 export const RadarView: React.FC<RadarViewProps> = ({ initialReleaseId }) => {
-  const { currentTrack, isPlaying, playTrack, togglePlay, toggleFollowArtist } = useAudioPlayer();
+  const { currentTrack, isPlaying, playTrack, togglePlay, toggleFollowArtist, openArtistPage } = useAudioPlayer();
   const [releases, setReleases] = useState<RadarRelease[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [refreshing, setRefreshing] = useState<boolean>(false);
   const [filterFollowed, setFilterFollowed] = useState<boolean>(false);
-  const [page] = useState<number>(1);
+  const [page, setPage] = useState<number>(1);
+  const [totalReleases, setTotalReleases] = useState<number>(0);
+  const [loadingMore, setLoadingMore] = useState<boolean>(false);
+  const [scanProgress, setScanProgress] = useState<RadarScanProgress | null>(null);
+  const [isScanning, setIsScanning] = useState<boolean>(false);
   const [newArtistName, setNewArtistName] = useState<string>('');
   const [followingArtist, setFollowingArtist] = useState<boolean>(false);
   const [followedCount, setFollowedCount] = useState<number>(0);
@@ -75,33 +80,96 @@ export const RadarView: React.FC<RadarViewProps> = ({ initialReleaseId }) => {
   const longPressTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const isLongPressTriggeredRef = React.useRef<boolean>(false);
 
-  const loadReleases = useCallback(() => {
-    setLoading(true);
-    const params = new URLSearchParams({
-      page: page.toString(),
-      per_page: '30',
-      followed_only: filterFollowed ? 'true' : 'false',
-    });
+  const loadReleases = useCallback(
+    (targetPage: number = 1, append: boolean = false) => {
+      if (append) {
+        setLoadingMore(true);
+      } else {
+        setLoading(true);
+      }
+      const params = new URLSearchParams({
+        page: targetPage.toString(),
+        per_page: '30',
+        followed_only: filterFollowed ? 'true' : 'false',
+      });
 
-    apiFetch(`/api/v1/app/radar/releases?${params.toString()}`)
-      .then((res) => res.json())
+      apiFetch(`/api/v1/app/radar/releases?${params.toString()}`)
+        .then((res) => res.json())
+        .then((data) => {
+          const items = data.items || [];
+          setTotalReleases(data.total || 0);
+          setPage(targetPage);
+          setFollowedCount(data.followed_count || 0);
+          if (append) {
+            setReleases((prev) => {
+              const existingIds = new Set(prev.map((r) => r.id));
+              const newItems = items.filter((r: RadarRelease) => !existingIds.has(r.id));
+              return [...prev, ...newItems];
+            });
+          } else {
+            setReleases(items);
+          }
+          setLoading(false);
+          setLoadingMore(false);
+          if (initialReleaseId && !append) {
+            const matched = items.find((r: RadarRelease) => r.id === initialReleaseId);
+            if (matched && (matched.track_count > 1 || matched.release_type === 'album')) {
+              setExpandedReleaseId(matched.id);
+            }
+          }
+        })
+        .catch((err) => {
+          console.error('Failed to load radar releases:', err);
+          setLoading(false);
+          setLoadingMore(false);
+        });
+    },
+    [filterFollowed, initialReleaseId]
+  );
+
+  const checkScanStatus = useCallback(() => {
+    apiFetch(`/api/v1/app/radar/status?_t=${Date.now()}`)
+      .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
-        const items = data.items || [];
-        setReleases(items);
-        setFollowedCount(data.followed_count || 0);
-        setLoading(false);
-        if (initialReleaseId) {
-          const matched = items.find((r: RadarRelease) => r.id === initialReleaseId);
-          if (matched && (matched.track_count > 1 || matched.release_type === 'album')) {
-            setExpandedReleaseId(matched.id);
+        if (data) {
+          const scanning = Boolean(data.is_scanning);
+          setIsScanning(scanning);
+          if (data.progress) setScanProgress(data.progress);
+          if (!scanning && isScanning) {
+            loadReleases(1, false);
           }
         }
       })
-      .catch((err) => {
-        console.error('Failed to load radar releases:', err);
-        setLoading(false);
-      });
-  }, [filterFollowed, page]);
+      .catch(() => {});
+  }, [isScanning, loadReleases]);
+
+  // Resilient live polling: rapid while scanning, background heartbeats while idle
+  useEffect(() => {
+    checkScanStatus();
+    const interval = isScanning ? 1200 : 5000;
+    const timer = setInterval(() => {
+      checkScanStatus();
+    }, interval);
+    return () => clearInterval(timer);
+  }, [isScanning, checkScanStatus]);
+
+  useEffect(() => {
+    const cleanup = connectQueueEvents((event) => {
+      if (event.type === 'radar_scan_progress') {
+        const prog: RadarScanProgress | undefined = event.progress || event.data;
+        if (prog) {
+          setScanProgress(prog);
+          setIsScanning(Boolean(prog.is_scanning));
+          if (!prog.is_scanning) {
+            loadReleases(1, false);
+          }
+        }
+      }
+    });
+    return () => {
+      cleanup();
+    };
+  }, [loadReleases]);
 
   const loadFollows = useCallback(() => {
     setLoadingFollows(true);
@@ -120,7 +188,7 @@ export const RadarView: React.FC<RadarViewProps> = ({ initialReleaseId }) => {
 
   useEffect(() => {
     if (activeTab === 'releases') {
-      loadReleases();
+      loadReleases(1, false);
     } else {
       loadFollows();
     }
@@ -171,11 +239,21 @@ export const RadarView: React.FC<RadarViewProps> = ({ initialReleaseId }) => {
   };
 
   const handleTriggerScan = async () => {
+    if (isScanning || refreshing) return;
     setRefreshing(true);
+    setIsScanning(true);
     try {
       triggerHaptic('heavy');
-      await apiFetch('/api/v1/app/radar/scan', { method: 'POST' });
-      loadReleases();
+      const res = await apiFetch('/api/v1/app/radar/scan', { method: 'POST' });
+      if (res.ok) {
+        const data = await res.json().catch(() => null);
+        if (data?.progress) setScanProgress(data.progress);
+        triggerNotificationHaptic('success');
+      } else if (res.status === 409) {
+        const errData = await res.json().catch(() => null);
+        if (errData?.progress) setScanProgress(errData.progress);
+        triggerNotificationHaptic('warning');
+      }
     } catch (err) {
       console.error('Failed to trigger scan:', err);
     } finally {
@@ -324,26 +402,28 @@ export const RadarView: React.FC<RadarViewProps> = ({ initialReleaseId }) => {
               </Caption>
             </div>
           </div>
-          <button
-            onClick={handleTriggerScan}
-            disabled={refreshing}
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '6px',
-              padding: '6px 10px',
-              borderRadius: '8px',
-              border: 'none',
-              backgroundColor: 'var(--tg-theme-button-color, #0a84ff)',
-              color: 'var(--tg-theme-button-text-color, #fff)',
-              cursor: refreshing ? 'default' : 'pointer',
-              fontSize: '12px',
-              fontWeight: 600,
-            }}
-          >
-            <RefreshCw size={13} className={refreshing ? 'animate-spin' : ''} />
-            <span>{refreshing ? 'Scanning...' : 'Scan'}</span>
-          </button>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <button
+              onClick={handleTriggerScan}
+              disabled={refreshing || isScanning}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '6px',
+                padding: '6px 10px',
+                borderRadius: '8px',
+                border: 'none',
+                backgroundColor: isScanning ? 'rgba(255, 255, 255, 0.12)' : 'var(--tg-theme-button-color, #0a84ff)',
+                color: isScanning ? 'var(--tg-theme-subtitle-text-color, #8e8e93)' : 'var(--tg-theme-button-text-color, #fff)',
+                cursor: refreshing || isScanning ? 'default' : 'pointer',
+                fontSize: '12px',
+                fontWeight: 600,
+              }}
+            >
+              <RefreshCw size={13} className={refreshing || isScanning ? 'animate-spin' : ''} />
+              <span>{isScanning ? 'Scanning...' : 'Scan'}</span>
+            </button>
+          </div>
         </div>
 
         {/* Follow new artist input form */}
@@ -393,6 +473,65 @@ export const RadarView: React.FC<RadarViewProps> = ({ initialReleaseId }) => {
           </button>
         </form>
       </Card>
+
+      {/* Live Synchronized Radar Scan Progress Card */}
+      {isScanning && (
+        <Card
+          role="status"
+          aria-live="polite"
+          style={{
+            padding: '14px 16px',
+            backgroundColor: 'var(--tg-theme-secondary-bg-color, #2c2c2e)',
+            borderRadius: '12px',
+            border: '1px solid rgba(10, 132, 255, 0.3)',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '10px',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <RefreshCw size={16} className="animate-spin" color="var(--tg-theme-button-color, #0a84ff)" />
+              <span style={{ fontSize: '13px', fontWeight: 700, color: '#fff' }}>
+                Scanning Monitored Artists...
+              </span>
+            </div>
+            <span style={{ fontSize: '12px', fontWeight: 700, color: 'var(--tg-theme-button-color, #0a84ff)' }}>
+              {scanProgress?.processed_artists ?? 0} / {scanProgress?.total_artists ?? 0} artists ({scanProgress?.percent ?? 0}%)
+            </span>
+          </div>
+
+          <div style={{ width: '100%' }}>
+            <progress
+              value={scanProgress?.percent ?? 0}
+              max={100}
+              role="progressbar"
+              aria-valuenow={scanProgress?.percent ?? 0}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-label="Release Radar scan progress"
+              style={{
+                width: '100%',
+                height: '8px',
+                borderRadius: '4px',
+                appearance: 'none',
+                overflow: 'clip',
+                backgroundColor: 'rgba(255, 255, 255, 0.1)',
+                accentColor: 'var(--tg-theme-button-color, #0a84ff)',
+              }}
+            />
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: '11px', color: '#8e8e93' }}>
+            <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '70%' }}>
+              {scanProgress?.current_artist ? `Artist: ${scanProgress.current_artist}` : 'Resolving artist catalog...'}
+            </span>
+            <span style={{ color: '#30d158', fontWeight: 600 }}>
+              +{scanProgress?.discovered_count ?? 0} new drops found
+            </span>
+          </div>
+        </Card>
+      )}
 
       {/* Sub-view selector tabs: Releases vs Followed Artists */}
       <div style={{ display: 'flex', gap: '8px' }}>
@@ -512,7 +651,7 @@ export const RadarView: React.FC<RadarViewProps> = ({ initialReleaseId }) => {
                       )}
 
                       {/* Play Overlay Button: Complete Track if available in library, else 30s preview */}
-                      {(rel.in_library && rel.library_track_id) ? (
+                      {(rel.in_library && rel.library_track_id && rel.track_count === 1) ? (
                         <button
                           onClick={() => handlePlayFullTrack(rel)}
                           title="Stream complete track from library"
@@ -601,13 +740,21 @@ export const RadarView: React.FC<RadarViewProps> = ({ initialReleaseId }) => {
                       </div>
 
                       <div
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          openArtistPage(rel.artist_name);
+                        }}
                         style={{
                           fontSize: '13px',
-                          color: 'var(--tg-theme-subtitle-text-color, #8e8e93)',
+                          color: 'var(--tg-theme-button-color, #0a84ff)',
+                          cursor: 'pointer',
+                          textDecoration: 'underline',
+                          textUnderlineOffset: '2px',
                           whiteSpace: 'nowrap',
                           overflow: 'hidden',
                           textOverflow: 'ellipsis',
                         }}
+                        title={`View ${rel.artist_name} artist dossier`}
                       >
                         {rel.artist_name}
                       </div>
@@ -671,7 +818,7 @@ export const RadarView: React.FC<RadarViewProps> = ({ initialReleaseId }) => {
                       )}
 
                       {/* Complete Track streaming option for releases in library */}
-                      {rel.in_library && rel.library_track_id && (
+                      {rel.in_library && rel.library_track_id && rel.track_count === 1 && (
                         <button
                           onClick={() => handlePlayFullTrack(rel)}
                           title="Stream complete track from library"
@@ -990,6 +1137,33 @@ export const RadarView: React.FC<RadarViewProps> = ({ initialReleaseId }) => {
                 </Card>
               );
             })}
+
+            {/* Pagination / Load More button */}
+            {releases.length < totalReleases && (
+              <button
+                onClick={() => loadReleases(page + 1, true)}
+                disabled={loadingMore}
+                style={{
+                  width: '100%',
+                  padding: '12px',
+                  borderRadius: '10px',
+                  border: 'none',
+                  backgroundColor: 'rgba(255, 255, 255, 0.08)',
+                  color: 'var(--tg-theme-text-color, #fff)',
+                  fontWeight: 600,
+                  fontSize: '13px',
+                  cursor: loadingMore ? 'default' : 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '8px',
+                  marginTop: '4px',
+                }}
+              >
+                {loadingMore ? <Spinner size="s" /> : <ChevronDown size={16} />}
+                <span>Load More Drops ({releases.length} of {totalReleases})</span>
+              </button>
+            )}
           </div>
         )
       ) : (

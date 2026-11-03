@@ -80,8 +80,18 @@ def build_radar_home_keyboard(
             callback_data=RadarCallback(action="follows_list", page=1).pack(),
         ),
         InlineKeyboardButton(
-            text="🔄 Scan Releases Now",
+            text="🔄 Scan Releases",
             callback_data=RadarCallback(action="refresh").pack(),
+        ),
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="➕ Follow Artist",
+            callback_data=RadarCallback(action="add_follow").pack(),
+        ),
+        InlineKeyboardButton(
+            text="🧪 Test Alert",
+            callback_data=RadarCallback(action="test_alert").pack(),
         ),
     )
 
@@ -352,8 +362,6 @@ def build_release_notification_keyboard(
 
     return builder.as_markup()
 
-    return builder.as_markup()
-
 
 def build_followed_artists_keyboard(
     follows: list[FollowedArtist],
@@ -400,8 +408,106 @@ def build_followed_artists_keyboard(
 
     builder.row(
         InlineKeyboardButton(
+            text="➕ Follow New Artist",
+            callback_data=RadarCallback(action="add_follow").pack(),
+        ),
+        InlineKeyboardButton(
+            text="🧪 Test Alert",
+            callback_data=RadarCallback(action="test_alert").pack(),
+        ),
+    )
+
+    builder.row(
+        InlineKeyboardButton(
             text="◀️ Back to Releases",
             callback_data=RadarCallback(action="page", page=1).pack(),
+        )
+    )
+    return builder.as_markup()
+
+
+def build_artist_dossier_keyboard(
+    artist_name: str,
+    is_followed: bool,
+    library_tracks: list[LibraryTrackRecord],
+    releases: list[DiscoveredRelease],
+    *,
+    web_app_url: str | None = None,
+    platform_priority: list[str] | None = None,
+    back_callback: str = "radar:page:1",
+) -> InlineKeyboardMarkup:
+    """Build interactive screen keyboard for viewing complete intelligence on a specific artist."""
+    builder = InlineKeyboardBuilder()
+
+    # Follow / Unfollow row
+    follow_text = f"🔕 Unfollow {artist_name}" if is_followed else f"🔔 Follow {artist_name}"
+    follow_action = "unfollow_artist" if is_followed else "follow_artist"
+    builder.row(
+        InlineKeyboardButton(
+            text=follow_text,
+            callback_data=RadarCallback(action=follow_action, target_id=artist_name).pack(),
+        )
+    )
+
+    # Library tracks row (up to 3 tracks directly playable / inspectable)
+    if library_tracks:
+        for trk in library_tracks[:3]:
+            lbl = f"🎵 {trk.title}"
+            if len(lbl) > 42:
+                lbl = f"{lbl[:39]}..."
+            builder.row(
+                InlineKeyboardButton(
+                    text=lbl,
+                    callback_data=SongsTrackCallback(action="view", track_id=trk.id).pack(),
+                )
+            )
+
+    # Discovered radar releases (up to 3 releases)
+    if releases:
+        for rel in releases[:3]:
+            lbl = f"💿 {rel.title} ({rel.release_date[:4]})" if rel.release_date else f"💿 {rel.title}"
+            if len(lbl) > 42:
+                lbl = f"{lbl[:39]}..."
+            builder.row(
+                InlineKeyboardButton(
+                    text=lbl,
+                    callback_data=RadarCallback(action="view", target_id=rel.id).pack(),
+                )
+            )
+
+    # Streaming links row
+    first_title = releases[0].title if releases else (library_tracks[0].title if library_tracks else "")
+    links = build_streaming_platform_links(artist_name, first_title)
+    primary_plat, primary_url = resolve_primary_platform_link(links, platform_priority or ["deezer"])
+    plat_icon = PLATFORM_ICONS.get(primary_plat, "🌐")
+    plat_label = PLATFORM_LABELS.get(primary_plat, primary_plat.title())
+    builder.row(
+        InlineKeyboardButton(
+            text=f"{plat_icon} Open {plat_label}",
+            url=primary_url,
+        ),
+        InlineKeyboardButton(
+            text="📋 Copy Link",
+            copy_text=CopyTextButton(text=primary_url),
+        ),
+    )
+
+    # Mini App link
+    if web_app_url and web_app_url.strip():
+        builder.row(
+            InlineKeyboardButton(
+                text="📡 Open Artist in Mini App",
+                web_app=WebAppInfo(
+                    url=f"{web_app_url.strip().rstrip('/')}?startapp=artist_{artist_name.replace(' ', '_')}"
+                ),
+            )
+        )
+
+    # Escape row
+    builder.row(
+        InlineKeyboardButton(
+            text="◀️ Back",
+            callback_data=back_callback,
         )
     )
     return builder.as_markup()

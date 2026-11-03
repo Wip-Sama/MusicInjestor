@@ -28,6 +28,9 @@ interface AudioPlayerContextType {
   isArtistFollowed: (artistName: string) => boolean;
   toggleFollowArtist: (artistName: string) => Promise<boolean>;
   refreshFollows: () => Promise<void>;
+  selectedArtist: string | null;
+  openArtistPage: (artistName: string) => void;
+  closeArtistPage: () => void;
   playTrack: (track: TrackItem, queueContext?: TrackItem[]) => void;
   togglePlay: () => void;
   seekTo: (seconds: number) => void;
@@ -44,12 +47,18 @@ interface AudioPlayerContextType {
   openInTelegramBot: (startParam: string) => void;
   sendTrackToChat: (trackId: string) => Promise<{ ok: boolean; message: string }>;
   sendAlbumToChat: (albumId: string, artist?: string, album?: string) => Promise<{ ok: boolean; message: string }>;
+  notificationsEnabled: boolean;
+  volume: number;
+  setVolume: (v: number) => void;
+  isMuted: boolean;
+  toggleMute: () => void;
   updateUserSettings: (settings: {
     stream_format?: string;
     stream_bitrate?: number;
     auto_lyrics_search?: boolean;
     streaming_platform_order?: string;
     search_scope?: 'global' | 'library';
+    notifications_enabled?: boolean;
   }) => Promise<void>;
 }
 
@@ -77,9 +86,61 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
   const [autoLyricsSearch, setAutoLyricsSearch] = useState<boolean>(true);
   const [streamingPlatformOrder, setStreamingPlatformOrder] = useState<string>('deezer,tidal,qobuz,spotify,apple_music');
   const [searchScope, setSearchScope] = useState<'global' | 'library'>('global');
+  const [notificationsEnabled, setNotificationsEnabled] = useState<boolean>(true);
+  const [volume, setVolumeState] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('tg_music_player_volume');
+      if (saved !== null) {
+        const parsed = parseFloat(saved);
+        if (!isNaN(parsed) && parsed >= 0 && parsed <= 1) return parsed;
+      }
+    } catch {
+      // ignore
+    }
+    return 1.0;
+  });
+  const [isMuted, setIsMuted] = useState<boolean>(false);
+
+  const setVolume = useCallback((newVol: number) => {
+    const clamped = Math.max(0, Math.min(1, newVol));
+    setVolumeState(clamped);
+    if (audioRef.current) {
+      audioRef.current.volume = clamped;
+      if (clamped > 0 && audioRef.current.muted) {
+        audioRef.current.muted = false;
+        setIsMuted(false);
+      }
+    }
+    try {
+      localStorage.setItem('tg_music_player_volume', clamped.toString());
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const toggleMute = useCallback(() => {
+    setIsMuted((prev) => {
+      const next = !prev;
+      if (audioRef.current) {
+        audioRef.current.muted = next;
+      }
+      return next;
+    });
+  }, []);
 
   const [followedArtists, setFollowedArtists] = useState<Set<string>>(new Set());
+  const [selectedArtist, setSelectedArtist] = useState<string | null>(null);
   const [botUsername, setBotUsername] = useState<string | null>(null);
+
+  const openArtistPage = useCallback((artistName: string) => {
+    if (artistName && artistName.trim()) {
+      setSelectedArtist(artistName.trim());
+    }
+  }, []);
+
+  const closeArtistPage = useCallback(() => {
+    setSelectedArtist(null);
+  }, []);
 
   useEffect(() => {
     fetchCurrentProfile()
@@ -192,6 +253,9 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
         if (data.search_scope === 'global' || data.search_scope === 'library') {
           setSearchScope(data.search_scope);
         }
+        if (typeof data.notifications_enabled === 'boolean') {
+          setNotificationsEnabled(data.notifications_enabled);
+        }
       })
       .catch((err) => {
         console.warn('Could not load user streaming preferences:', err);
@@ -199,6 +263,10 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
   }, []);
 
   const buildAudioUrl = (track: TrackItem, format: string, bitrate: number) => {
+    // If the audio URL is already an external absolute stream (e.g. Deezer CDN preview), do not append local auth parameters
+    if (track.audio_url.startsWith('http://') || track.audio_url.startsWith('https://')) {
+      return track.audio_url;
+    }
     const rawInit = getRawInitData();
     const sep = track.audio_url.includes('?') ? '&' : '?';
     const params = new URLSearchParams();
@@ -224,6 +292,8 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
   useEffect(() => {
     const audio = new Audio();
     audio.preload = 'metadata';
+    audio.volume = volume;
+    audio.muted = isMuted;
     audioRef.current = audio;
 
     const handleTimeUpdate = () => {
@@ -370,6 +440,7 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
     auto_lyrics_search?: boolean;
     streaming_platform_order?: string;
     search_scope?: 'global' | 'library';
+    notifications_enabled?: boolean;
   }) => {
     triggerHaptic();
     const newFormat = settings.stream_format ?? streamFormat;
@@ -377,12 +448,14 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const newLyrics = settings.auto_lyrics_search ?? autoLyricsSearch;
     const newOrder = settings.streaming_platform_order ?? streamingPlatformOrder;
     const newScope = settings.search_scope ?? searchScope;
+    const newNotifs = settings.notifications_enabled ?? notificationsEnabled;
 
     setStreamFormat(newFormat);
     setStreamBitrate(newBitrate);
     setAutoLyricsSearch(newLyrics);
     setStreamingPlatformOrder(newOrder);
     setSearchScope(newScope);
+    setNotificationsEnabled(newNotifs);
 
     try {
       await apiFetch('/api/v1/app/user/settings', {
@@ -394,6 +467,7 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
           auto_lyrics_search: newLyrics,
           streaming_platform_order: newOrder,
           search_scope: newScope,
+          notifications_enabled: newNotifs,
         }),
       });
     } catch (err) {
@@ -620,6 +694,9 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
         isArtistFollowed,
         toggleFollowArtist,
         refreshFollows,
+        selectedArtist,
+        openArtistPage,
+        closeArtistPage,
         playTrack,
         togglePlay,
         seekTo,
@@ -634,6 +711,11 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
         switchStreamQuality,
         searchScope,
         setSearchScope,
+        notificationsEnabled,
+        volume,
+        setVolume,
+        isMuted,
+        toggleMute,
         updateUserSettings,
         botUsername,
         openInTelegramBot,

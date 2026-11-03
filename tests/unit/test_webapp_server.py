@@ -1104,6 +1104,27 @@ async def test_queue_list_and_actions(tmp_path: Path) -> None:
             assert c_resp.status_code == 200
             assert c_resp.json()["job"]["state"] == "CANCELLED"
 
+            # 5b. Set release link on job_q2
+            srl_resp = await client.post(
+                f"{base_url}/api/v1/app/queue/job_q2/action",
+                headers=headers,
+                json={
+                    "action": "set_release_link",
+                    "release_url": "https://musicbrainz.org/release/12345678-1234-1234-1234-123456789abc",
+                },
+            )
+            assert srl_resp.status_code == 200
+            assert srl_resp.json()["job"]["matched_release_mbid"] == "12345678-1234-1234-1234-123456789abc"
+
+            # 5c. Clear release link on job_q2
+            clr_resp = await client.post(
+                f"{base_url}/api/v1/app/queue/job_q2/action",
+                headers=headers,
+                json={"action": "set_release_link", "release_url": "clear"},
+            )
+            assert clr_resp.status_code == 200
+            assert clr_resp.json()["job"]["matched_release_mbid"] is None
+
             # 5. Manual search on job_q2
             ms_resp = await client.post(
                 f"{base_url}/api/v1/app/queue/job_q2/action",

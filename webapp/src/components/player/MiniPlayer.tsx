@@ -11,6 +11,7 @@ export const MiniPlayer: React.FC = () => {
     togglePlay,
     nextTrack,
     setIsPlayerOpen,
+    openArtistPage,
   } = useAudioPlayer();
 
   if (!currentTrack) return null;
@@ -102,14 +103,22 @@ export const MiniPlayer: React.FC = () => {
               {currentTrack.title}
             </div>
             <div
+              onClick={(e) => {
+                e.stopPropagation();
+                openArtistPage(currentTrack.artist);
+              }}
               style={{
                 fontSize: '12px',
-                color: 'var(--tg-theme-subtitle-text-color, #8e8e93)',
+                color: 'var(--tg-theme-button-color, #0a84ff)',
+                textDecoration: 'underline',
+                textUnderlineOffset: '2px',
                 whiteSpace: 'nowrap',
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
                 marginTop: '2px',
+                cursor: 'pointer',
               }}
+              title={`View ${currentTrack.artist} artist page`}
             >
               {currentTrack.artist}
             </div>

@@ -16,6 +16,7 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({ onJobUploaded, disab
   const [uploading, setUploading] = useState<boolean>(false);
   const [progress, setProgress] = useState<number>(0);
   const [fileName, setFileName] = useState<string | null>(null);
+  const [releaseUrl, setReleaseUrl] = useState<string>('');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
@@ -61,9 +62,11 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({ onJobUploaded, disab
     setProgress(0);
 
     try {
-      const result = await uploadMediaFile(file, (pct) => {
-        setProgress(pct);
-      });
+      const result = await uploadMediaFile(
+        file,
+        (pct) => setProgress(pct),
+        releaseUrl.trim() || undefined
+      );
       setSuccessMsg(`Enqueued "${file.name}" successfully!`);
       onJobUploaded(result.job);
       if (fileInputRef.current) {
@@ -93,6 +96,29 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({ onJobUploaded, disab
         disabled={disabled || uploading}
       />
 
+      {/* Optional Release Link Override */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+        <input
+          type="text"
+          placeholder="MusicBrainz or Streaming Link (optional, guides ingestion)..."
+          value={releaseUrl}
+          onChange={(e) => setReleaseUrl(e.target.value)}
+          disabled={disabled || uploading}
+          style={{
+            width: '100%',
+            backgroundColor: 'var(--tg-theme-bg-color, #1c1c1e)',
+            border: '1px solid var(--tg-theme-secondary-bg-color, #3a3a3c)',
+            borderRadius: '8px',
+            padding: '8px 12px',
+            fontSize: '12px',
+            color: 'var(--tg-theme-text-color, #fff)',
+            outline: 'none',
+          }}
+        />
+        <div style={{ fontSize: '11px', color: 'var(--tg-theme-subtitle-text-color, #8e8e93)', paddingLeft: '2px' }}>
+          💡 If provided, the ingestion engine tags against this exact release instead of cascading search.
+        </div>
+      </div>
       {/* Drop Area Box */}
       <div
         onDragOver={handleDragOver}

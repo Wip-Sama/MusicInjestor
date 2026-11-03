@@ -15,12 +15,15 @@ from src.bot.routers.search import (
     handle_album_gap_preview,
     handle_album_gap_view,
     handle_chat_text_message,
+    handle_search_command,
     handle_search_scope_toggle,
+    handle_search_track_preview,
 )
 from src.config.settings import AppSettings
 from src.core.models import (
     AlbumGapAnalysis,
     AlbumTrackGap,
+    ReleaseTrackPreview,
     SearchResultItem,
     UnifiedSearchResult,
     UserAccount,
@@ -295,3 +298,71 @@ async def test_handle_search_scope_toggle() -> None:
     mock_repo.update_user_preferences.assert_called_once()
     mock_service.search.assert_called_once_with(query="Discovery", scope="library")
     query.message.edit_text.assert_called_once()
+
+
+@pytest.mark.anyio
+async def test_handle_search_command() -> None:
+    msg_empty = AsyncMock()
+    msg_empty.text = "/search"
+    await handle_search_command(
+        message=msg_empty,
+        current_user=None,
+        governance_repository=None,
+        album_search_service=None,
+        settings=AppSettings(),
+    )
+    msg_empty.answer.assert_called_once()
+    assert "Search Music &amp; Albums" in msg_empty.answer.call_args[0][0]
+
+    msg_query = AsyncMock()
+    msg_query.text = "/search Daft Punk"
+    user = UserAccount(telegram_id=123, display_name="Test User", role=UserRole.LISTENER)
+    mock_repo = AsyncMock()
+    mock_repo.get_user_preferences.return_value = UserPreferences(telegram_id=123, search_scope="global")
+
+    mock_service = AsyncMock()
+    mock_service.search.return_value = UnifiedSearchResult(
+        query="Daft Punk",
+        scope="global",
+        albums=[],
+        tracks=[],
+    )
+
+    await handle_search_command(
+        message=msg_query,
+        current_user=user,
+        governance_repository=mock_repo,
+        album_search_service=mock_service,
+        settings=AppSettings(),
+    )
+    mock_service.search.assert_called_once_with(query="Daft Punk", scope="global")
+    msg_query.answer.assert_called_once()
+
+
+@pytest.mark.anyio
+async def test_handle_search_track_preview() -> None:
+    query = AsyncMock()
+    query.message = AsyncMock()
+    cb = SearchActionCallback(action="preview", value="12345", query="Idol")
+
+    mock_radar = AsyncMock()
+    mock_radar.get_track_preview.return_value = ReleaseTrackPreview(
+        track_id="12345",
+        title="Idol",
+        preview_url="https://preview.mp3",
+        duration_seconds=30,
+        track_position=1,
+    )
+    mock_radar.get_preview_audio_bytes.return_value = b"ID3" + b"\x00" * 1000
+
+    await handle_search_track_preview(
+        query=query,
+        callback_data=cb,
+        radar_service=mock_radar,
+    )
+
+    mock_radar.get_track_preview.assert_called_once_with("12345")
+    mock_radar.get_preview_audio_bytes.assert_called_once_with("https://preview.mp3")
+    query.message.answer_audio.assert_called_once()
+    call_kwargs = query.message.answer_audio.call_args[1]
+    assert call_kwargs["title"] == "Idol (Preview)"
