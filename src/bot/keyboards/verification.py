@@ -31,6 +31,29 @@ class VerifyFieldCallback(CallbackData, prefix="verify"):
     field: str
 
 
+def build_upgrade_confirmation_keyboard(
+    job_id: str,
+    *,
+    back_callback: str = "menu:home",
+) -> InlineKeyboardMarkup:
+    """Create inline buttons for confirming an audio quality upgrade or keeping the existing file."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="🔄 Replace with Higher Quality",
+            callback_data=VerifyActionCallback(action="upgrade", job_id=job_id).pack(),
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="🚫 Keep Existing File (Ignore)",
+            callback_data=VerifyActionCallback(action="ignore_upgrade", job_id=job_id).pack(),
+        )
+    )
+    append_escape_row(builder, back_callback=back_callback, include_home=True)
+    return builder.as_markup()
+
+
 def build_verification_keyboard(
     job_id: str,
     candidates: list[MetadataCandidate],

@@ -12,6 +12,25 @@
 
 ## Completed Milestones
 
+### M43: Streaming Platform Links in Song Search Previews & Quality-Aware Song Upgrades
+- **External Streaming Platform Links in Song Search Previews (`src/bot/keyboards/search.py`, `src/bot/routers/search.py`, `webapp/src/components/catalog/AlbumGapModal.tsx`, `webapp/src/types/music.ts`):**
+  - Added external streaming links (Deezer, Spotify, Tidal, Apple Music, Qobuz) to 30-second audio preview deliveries in Telegram song search.
+  - Attached dynamic inline keyboards (`build_search_preview_keyboard`) featuring user-prioritized primary streaming link (`Open Deezer`/`Spotify`/etc.), instant URL clipboard copying via Telegram `CopyTextButton`, and an expandable "🔗 Other Platforms" menu (`build_search_other_platforms_keyboard`).
+  - Added tap-to-open and long-press-to-copy platform buttons for missing tracks and full album headers within the Web Mini App `AlbumGapModal`, respecting user platform preference ordering and providing native Telegram haptic feedback.
+- **Audio Quality Inspection & Scoring Domain Engine (`src/core/quality.py`, `tests/unit/test_quality.py`):**
+  - Created pure hexagonal domain module for inspecting and comparing audio quality (`AudioQuality`, `inspect_audio_quality`, `is_audio_quality_upgrade`).
+  - Implemented lossless vs lossy evaluation rules: lossless formats (FLAC, WAV, ALAC, AIFF) strictly supersede lossy formats; bit depth upgrades (24-bit vs 16-bit) and sample rate increases (96kHz vs 44.1kHz) are recognized as lossless upgrades; lossy formats upgrade when the candidate bitrate is higher by at least 32 kbps or upgrades sub-160 kbps files to >= 192 kbps.
+  - Formatted user-facing quality badges (e.g. `FLAC (Lossless, 24-bit/96kHz, 1500 kbps)`, `MP3 (320 kbps)`).
+- **Duplicate Quality Upgrade Ingestion Flow (`src/core/models.py`, `src/core/deduplicator.py`, `src/core/ports.py`, `src/core/pipeline.py`, `src/db/repository.py`):**
+  - Extended duplicate track checking to inspect incoming audio files against existing library files on disk. If a duplicate is identified, the system compares audio quality attributes instead of unconditionally rejecting it.
+  - If the incoming file is of lower or equal quality, the duplicate is ignored (`DUPLICATE_REJECTED`) with an informative message comparing current vs new quality.
+  - If the incoming file is of higher quality (`is_upgrade=True`), the pipeline pauses in `AWAITING_CONFIRMATION` (preserving the scratch audio) or automatically performs the upgrade if the user enabled `auto_upgrade_quality`.
+  - Implemented `execute_upgrade(job_id)` in `IngestionPipeline` and `replace_library_track(...)` in SQLite `CatalogRepositoryPort`: atomically moves and finalizes higher-quality audio at the library target path, unlinks the obsolete lower-quality file, updates fingerprints and metadata in database tables, invalidates cached Telegram file IDs, and completes the job.
+- **Telegram Bot & WebApp Upgrade Confirmation & Preferences (`src/bot/keyboards/verification.py`, `src/bot/routers/verification.py`, `src/bot/routers/files.py`, `src/bot/routers/commands.py`, `src/bot/webapp_server.py`, `webapp/src/components/queue/JobCard.tsx`, `webapp/src/components/settings/SettingsModal.tsx`, `webapp/src/context/AudioPlayerContext.tsx`):**
+  - Added "✨ Quality Upgrade Available!" interactive screen and keyboard (`build_upgrade_confirmation_keyboard`) in Telegram bot verification with `[ ✅ Replace with Higher Quality ]` and `[ ❌ Keep Existing (Ignore) ]` options.
+  - Added quality upgrade badges and interactive action buttons to job cards on the Web Mini App live queue board (`JobCard.tsx`).
+  - Added `auto_upgrade_quality` preference toggle across Telegram `/settings` and Web Mini App `SettingsModal` ("Auto-Upgrade Higher Quality"), persisted in SQLite `user_settings`.
+
 ### M42: Single Queue Item Link Guidance, Real-Time Radar Scan Tracking, Concurrency Deduplication Fix, WebApp Volume Control, & Admin Debug Menu
 - **Single Queue Item Link Guidance & Streaming Release Match (`webapp/src/components/queue/JobCard.tsx`, `JobEditModal.tsx`, `DisambiguationCard.tsx`, `src/bot/routers/admin.py`, `src/bot/states.py`, `src/bot/keyboards/admin.py`, `src/core/queue.py`):**
   - Added direct release link input drawer and `🔗 Guided Link` / `🔗 Set Link` button to queued job cards in the Web Mini App, allowing users to guide ingestion against a specific MusicBrainz or streaming URL prior to or during processing.

@@ -107,6 +107,14 @@ export async function setJobReleaseLink(jobId: string, releaseUrl: string): Prom
   return executeQueueAction(jobId, { action: 'set_release_link', release_url: releaseUrl });
 }
 
+export async function upgradeJob(jobId: string): Promise<QueueJob> {
+  return executeQueueAction(jobId, { action: 'upgrade' });
+}
+
+export async function ignoreUpgrade(jobId: string): Promise<QueueJob> {
+  return executeQueueAction(jobId, { action: 'ignore_upgrade' });
+}
+
 export interface ApplyJobEditPayload {
   title?: string;
   artist?: string;

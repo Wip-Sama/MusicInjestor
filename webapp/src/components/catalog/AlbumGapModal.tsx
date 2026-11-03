@@ -1,5 +1,6 @@
-import React, { useEffect, useState } from 'react';
-import { X, Play, Pause, ExternalLink, Disc, Send, Bot } from 'lucide-react';
+import React, { useEffect, useRef, useState } from 'react';
+import { X, Play, Pause, ExternalLink, Disc, Send, Bot, Check, Globe } from 'lucide-react';
+import { hapticFeedback } from '@telegram-apps/sdk-react';
 import { useAudioPlayer } from '../../context/AudioPlayerContext';
 import { apiFetch } from '../../lib/auth';
 import { AlbumGapAnalysis, TrackItem } from '../../types/music';
@@ -34,6 +35,46 @@ export const AlbumGapModal: React.FC<AlbumGapModalProps> = ({
   const [isSendingAlbum, setIsSendingAlbum] = useState<boolean>(false);
   const [albumSendStatus, setAlbumSendStatus] = useState<string | null>(null);
   const [sendingTrackId, setSendingTrackId] = useState<string | null>(null);
+  const [copiedLinkId, setCopiedLinkId] = useState<string | null>(null);
+  const [platformMenuTrackPos, setPlatformMenuTrackPos] = useState<number | null>(null);
+  const [showAlbumPlatformMenu, setShowAlbumPlatformMenu] = useState<boolean>(false);
+  const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isLongPressTriggeredRef = useRef<boolean>(false);
+
+  const startLongPress = (id: string, url: string) => {
+    isLongPressTriggeredRef.current = false;
+    if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current);
+    longPressTimerRef.current = setTimeout(() => {
+      isLongPressTriggeredRef.current = true;
+      navigator.clipboard.writeText(url).catch(() => {});
+      try {
+        if (hapticFeedback.notificationOccurred.isAvailable()) {
+          hapticFeedback.notificationOccurred('success');
+        }
+      } catch {
+        // ignore outside Telegram
+      }
+      setCopiedLinkId(id);
+      setTimeout(() => setCopiedLinkId(null), 2000);
+    }, 450);
+  };
+
+  const cancelLongPress = () => {
+    if (longPressTimerRef.current) {
+      clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  };
+
+  const handleLinkButtonClick = (e: React.MouseEvent, _id: string, url: string) => {
+    if (isLongPressTriggeredRef.current) {
+      e.preventDefault();
+      e.stopPropagation();
+      isLongPressTriggeredRef.current = false;
+      return;
+    }
+    window.open(url, '_blank', 'noreferrer');
+  };
 
   const handleOpenAlbumInBot = () => {
     if (!albumId) return;
@@ -458,33 +499,256 @@ export const AlbumGapModal: React.FC<AlbumGapModalProps> = ({
                         ) : (
                           <span style={{ fontSize: '11px', color: '#8e8e93' }}>No preview</span>
                         )}
+
+                        {/* Streaming Platform Link for Track (tap to open, long-press to copy) */}
+                        {(() => {
+                          const trackPrimUrl = trk.primary_url || trk.external_url;
+                          if (!trackPrimUrl) return null;
+                          const trackPlatKey = (trk.primary_platform || 'deezer').toLowerCase();
+                          const platLabels: Record<string, string> = {
+                            deezer: 'Deezer',
+                            tidal: 'Tidal',
+                            qobuz: 'Qobuz',
+                            spotify: 'Spotify',
+                            apple_music: 'Apple',
+                          };
+                          const trackPlatLabel = platLabels[trackPlatKey] || trackPlatKey.toUpperCase();
+                          const isTrackCopied = copiedLinkId === `track_${trk.position}`;
+
+                          return (
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '2px' }}>
+                              <button
+                                onMouseDown={() => startLongPress(`track_${trk.position}`, trackPrimUrl)}
+                                onMouseUp={cancelLongPress}
+                                onMouseLeave={cancelLongPress}
+                                onTouchStart={() => startLongPress(`track_${trk.position}`, trackPrimUrl)}
+                                onTouchEnd={cancelLongPress}
+                                onClick={(e) => handleLinkButtonClick(e, `track_${trk.position}`, trackPrimUrl)}
+                                style={{
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: '3px',
+                                  padding: '5px 7px',
+                                  borderRadius: '6px',
+                                  border: 'none',
+                                  backgroundColor: isTrackCopied ? 'rgba(48, 209, 88, 0.2)' : 'rgba(255, 255, 255, 0.08)',
+                                  color: isTrackCopied ? '#30d158' : 'var(--tg-theme-subtitle-text-color, #8e8e93)',
+                                  cursor: 'pointer',
+                                  fontSize: '11px',
+                                  fontWeight: 500,
+                                }}
+                                title="Tap to open • Long press to copy link"
+                              >
+                                {isTrackCopied ? <Check size={11} color="#30d158" /> : <ExternalLink size={11} />}
+                                <span>{isTrackCopied ? 'Copied' : trackPlatLabel}</span>
+                              </button>
+
+                              {trk.external_links && Object.keys(trk.external_links).length > 1 && (
+                                <button
+                                  onClick={() => setPlatformMenuTrackPos(platformMenuTrackPos === trk.position ? null : trk.position)}
+                                  style={{
+                                    padding: '5px',
+                                    borderRadius: '6px',
+                                    border: 'none',
+                                    backgroundColor: platformMenuTrackPos === trk.position ? 'rgba(10, 132, 255, 0.2)' : 'rgba(255, 255, 255, 0.08)',
+                                    color: platformMenuTrackPos === trk.position ? 'var(--tg-theme-button-color, #0a84ff)' : '#8e8e93',
+                                    cursor: 'pointer',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                  }}
+                                  title="More streaming links"
+                                >
+                                  <Globe size={11} />
+                                </button>
+                              )}
+                            </div>
+                          );
+                        })()}
                       </div>
                     </div>
                   );
                 })}
               </div>
 
-              {/* External Provider Link */}
-              {gapData.external_url && (
-                <div style={{ display: 'flex', justifyContent: 'flex-end', paddingTop: '6px' }}>
-                  <a
-                    href={gapData.external_url}
-                    target="_blank"
-                    rel="noreferrer"
+              {/* Track Other Platforms Menu */}
+              {platformMenuTrackPos !== null && (() => {
+                const trk = gapData.tracks.find((t) => t.position === platformMenuTrackPos);
+                if (!trk || !trk.external_links) return null;
+                const platLabels: Record<string, string> = {
+                  deezer: 'Deezer',
+                  tidal: 'Tidal',
+                  qobuz: 'Qobuz',
+                  spotify: 'Spotify',
+                  apple_music: 'Apple Music',
+                };
+                return (
+                  <div
                     style={{
+                      padding: '8px 10px',
+                      borderRadius: '8px',
+                      backgroundColor: 'rgba(255, 255, 255, 0.04)',
+                      border: '1px solid rgba(255, 255, 255, 0.08)',
                       display: 'flex',
-                      alignItems: 'center',
+                      flexDirection: 'column',
                       gap: '4px',
-                      color: 'var(--tg-theme-button-color, #0a84ff)',
-                      fontSize: '12px',
-                      textDecoration: 'none',
                     }}
                   >
-                    <span>View on Deezer</span>
-                    <ExternalLink size={12} />
-                  </a>
-                </div>
-              )}
+                    <div style={{ fontSize: '11px', color: '#8e8e93', fontWeight: 600 }}>
+                      #{trk.position} {trk.title} Links:
+                    </div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+                      {Object.entries(trk.external_links).map(([plat, url]) => {
+                        const isCopied = copiedLinkId === `track_${trk.position}_${plat}`;
+                        return (
+                          <button
+                            key={plat}
+                            onMouseDown={() => startLongPress(`track_${trk.position}_${plat}`, url)}
+                            onMouseUp={cancelLongPress}
+                            onMouseLeave={cancelLongPress}
+                            onTouchStart={() => startLongPress(`track_${trk.position}_${plat}`, url)}
+                            onTouchEnd={cancelLongPress}
+                            onClick={(e) => handleLinkButtonClick(e, `track_${trk.position}_${plat}`, url)}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '4px',
+                              padding: '4px 8px',
+                              borderRadius: '6px',
+                              border: 'none',
+                              backgroundColor: isCopied ? 'rgba(48, 209, 88, 0.2)' : 'rgba(255, 255, 255, 0.08)',
+                              color: isCopied ? '#30d158' : '#fff',
+                              cursor: 'pointer',
+                              fontSize: '11px',
+                            }}
+                            title="Tap to open • Long press to copy"
+                          >
+                            {isCopied ? <Check size={11} color="#30d158" /> : <ExternalLink size={11} />}
+                            <span>{isCopied ? 'Copied!' : (platLabels[plat] || plat)}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* External Provider Streaming Links */}
+              {(() => {
+                const albUrl = gapData.primary_url || gapData.external_url;
+                if (!albUrl) return null;
+                const albPlatKey = (gapData.primary_platform || 'deezer').toLowerCase();
+                const platLabels: Record<string, string> = {
+                  deezer: 'Deezer',
+                  tidal: 'Tidal',
+                  qobuz: 'Qobuz',
+                  spotify: 'Spotify',
+                  apple_music: 'Apple Music',
+                };
+                const albPlatLabel = platLabels[albPlatKey] || albPlatKey.toUpperCase();
+                const isAlbCopied = copiedLinkId === 'album_link';
+
+                return (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', paddingTop: '6px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: '6px' }}>
+                      <button
+                        onMouseDown={() => startLongPress('album_link', albUrl)}
+                        onMouseUp={cancelLongPress}
+                        onMouseLeave={cancelLongPress}
+                        onTouchStart={() => startLongPress('album_link', albUrl)}
+                        onTouchEnd={cancelLongPress}
+                        onClick={(e) => handleLinkButtonClick(e, 'album_link', albUrl)}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '4px',
+                          padding: '6px 10px',
+                          borderRadius: '6px',
+                          border: 'none',
+                          backgroundColor: isAlbCopied ? 'rgba(48, 209, 88, 0.2)' : 'rgba(255, 255, 255, 0.08)',
+                          color: isAlbCopied ? '#30d158' : 'var(--tg-theme-button-color, #0a84ff)',
+                          cursor: 'pointer',
+                          fontSize: '12px',
+                          fontWeight: 600,
+                        }}
+                        title="Tap to open • Long press to copy link"
+                      >
+                        {isAlbCopied ? <Check size={12} color="#30d158" /> : <ExternalLink size={12} />}
+                        <span>{isAlbCopied ? 'Copied Link!' : `Listen on ${albPlatLabel}`}</span>
+                      </button>
+
+                      {gapData.external_links && Object.keys(gapData.external_links).length > 1 && (
+                        <button
+                          onClick={() => setShowAlbumPlatformMenu(!showAlbumPlatformMenu)}
+                          style={{
+                            padding: '6px 8px',
+                            borderRadius: '6px',
+                            border: 'none',
+                            backgroundColor: showAlbumPlatformMenu ? 'rgba(10, 132, 255, 0.2)' : 'rgba(255, 255, 255, 0.08)',
+                            color: showAlbumPlatformMenu ? 'var(--tg-theme-button-color, #0a84ff)' : '#8e8e93',
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '4px',
+                            fontSize: '12px',
+                          }}
+                          title="Other platforms"
+                        >
+                          <Globe size={12} />
+                          <span>Other Platforms</span>
+                        </button>
+                      )}
+                    </div>
+
+                    {showAlbumPlatformMenu && gapData.external_links && (
+                      <div
+                        style={{
+                          padding: '8px 10px',
+                          borderRadius: '8px',
+                          backgroundColor: 'rgba(255, 255, 255, 0.04)',
+                          border: '1px solid rgba(255, 255, 255, 0.08)',
+                          display: 'flex',
+                          flexWrap: 'wrap',
+                          gap: '6px',
+                          justifyContent: 'flex-end',
+                        }}
+                      >
+                        {Object.entries(gapData.external_links).map(([plat, url]) => {
+                          const label = platLabels[plat] || plat.toUpperCase();
+                          const isPlatCopied = copiedLinkId === `album_${plat}`;
+                          return (
+                            <button
+                              key={plat}
+                              onMouseDown={() => startLongPress(`album_${plat}`, url)}
+                              onMouseUp={cancelLongPress}
+                              onMouseLeave={cancelLongPress}
+                              onTouchStart={() => startLongPress(`album_${plat}`, url)}
+                              onTouchEnd={cancelLongPress}
+                              onClick={(e) => handleLinkButtonClick(e, `album_${plat}`, url)}
+                              style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '4px',
+                                padding: '4px 8px',
+                                borderRadius: '6px',
+                                border: 'none',
+                                backgroundColor: isPlatCopied ? 'rgba(48, 209, 88, 0.2)' : 'rgba(255, 255, 255, 0.08)',
+                                color: isPlatCopied ? '#30d158' : '#fff',
+                                cursor: 'pointer',
+                                fontSize: '11px',
+                              }}
+                              title="Tap to open • Long press to copy"
+                            >
+                              {isPlatCopied ? <Check size={11} color="#30d158" /> : <ExternalLink size={11} />}
+                              <span>{isPlatCopied ? 'Copied!' : label}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
             </>
           ) : null}
         </div>

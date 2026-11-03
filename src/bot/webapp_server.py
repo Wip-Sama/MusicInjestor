@@ -10,6 +10,7 @@ import re
 import shutil
 import time
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlencode
@@ -207,6 +208,10 @@ def serialize_job(job: IngestionJob, queue_position: int = 0) -> dict[str, Any]:
         "lyrics_matched_count": job.lyrics_matched_count,
         "selected_metadata": selected,
         "candidates": candidates,
+        "is_upgrade": getattr(job, "is_upgrade", False),
+        "existing_quality": job.existing_quality.summary if job.existing_quality is not None else None,
+        "new_quality": job.new_quality.summary if job.new_quality is not None else None,
+        "upgrade_for_path": str(job.upgrade_for_path) if job.upgrade_for_path is not None else None,
     }
 
 
@@ -726,6 +731,7 @@ def build_webapp_api(
                 "streaming_platform_order": prefs.streaming_platform_order,
                 "search_scope": prefs.search_scope,
                 "notifications_enabled": prefs.notifications_enabled,
+                "auto_upgrade_quality": getattr(prefs, "auto_upgrade_quality", False),
             }
         )
 
@@ -797,6 +803,12 @@ def build_webapp_api(
             else current.notifications_enabled
         )
 
+        new_auto_upgrade = (
+            bool(body["auto_upgrade_quality"])
+            if "auto_upgrade_quality" in body
+            else getattr(current, "auto_upgrade_quality", False)
+        )
+
         updated = UserPreferences(
             telegram_id=user.telegram_id,
             stream_format=new_format,
@@ -806,6 +818,7 @@ def build_webapp_api(
             streaming_platform_order=new_platform_order,
             search_scope=new_search_scope,
             notifications_enabled=new_notifs,
+            auto_upgrade_quality=new_auto_upgrade,
         )
 
         saved = await governance_service._repo.update_user_preferences(updated)
@@ -820,6 +833,7 @@ def build_webapp_api(
                 "streaming_platform_order": saved.streaming_platform_order,
                 "search_scope": saved.search_scope,
                 "notifications_enabled": saved.notifications_enabled,
+                "auto_upgrade_quality": getattr(saved, "auto_upgrade_quality", False),
             }
         )
 
@@ -2938,6 +2952,100 @@ def build_webapp_api(
                 status=200,
             )
 
+        elif action == "upgrade":
+            if pipeline is None:
+                raise web.HTTPServiceUnavailable(
+                    text=json.dumps({"error": "Ingestion pipeline unavailable."}),
+                    content_type="application/json",
+                )
+
+            is_owner = job.user_id is not None and job.user_id == user.telegram_id
+
+            if is_owner:
+                require_permission(user, Permission.RESOLVE_OWN_DISAMBIGUATION)
+
+            else:
+                require_permission(user, Permission.RESOLVE_OTHERS_JOBS)
+
+            async def _publish_upgrade_stage(staged_job: IngestionJob) -> None:
+
+                await bus.publish(
+                    {
+                        "type": "stage_changed",
+                        "job_id": staged_job.job_id,
+                        "user_id": staged_job.user_id,
+                        "state": staged_job.state.value,
+                        "stage": staged_job.state.value,
+                        "processed_tracks": staged_job.processed_tracks,
+                        "total_tracks": staged_job.total_tracks,
+                        "job": serialize_job(staged_job),
+                    }
+                )
+
+            try:
+                result = await pipeline.execute_upgrade(
+                    job_id=job.job_id,
+                    stage_callback=_publish_upgrade_stage,
+                )
+
+            except Exception as exc:
+                logger.error("Upgrade failed for job %s: %s", job.job_id, exc, exc_info=True)
+
+                raise web.HTTPInternalServerError(
+                    text=json.dumps({"error": f"Upgrade failed: {exc}"}),
+                    content_type="application/json",
+                ) from exc
+
+            await queue_worker.record_confirmed_completion(result)
+
+            await bus.publish(
+                {
+                    "type": "job_completed",
+                    "job_id": result.job.job_id,
+                    "user_id": result.job.user_id,
+                    "state": result.job.state.value,
+                    "job": serialize_job(result.job),
+                }
+            )
+
+            return web.Response(
+                text=json.dumps({"success": True, "job": serialize_job(result.job)}),
+                content_type="application/json",
+                status=200,
+            )
+
+        elif action == "ignore_upgrade":
+            is_owner = job.user_id is not None and job.user_id == user.telegram_id
+
+            if is_owner:
+                require_permission(user, Permission.RESOLVE_OWN_DISAMBIGUATION)
+
+            else:
+                require_permission(user, Permission.RESOLVE_OTHERS_JOBS)
+
+            job.state = JobState.DUPLICATE_REJECTED
+            job.completed_at = datetime.now(UTC)
+            await catalog_repository.save_job(job)
+
+            if hasattr(pipeline, "_extractor"):
+                await pipeline._extractor.cleanup_job_scratch(job.job_id)
+
+            await bus.publish(
+                {
+                    "type": "job_state_changed",
+                    "job_id": job.job_id,
+                    "user_id": job.user_id,
+                    "state": job.state.value,
+                    "job": serialize_job(job),
+                }
+            )
+
+            return web.Response(
+                text=json.dumps({"success": True, "job": serialize_job(job)}),
+                content_type="application/json",
+                status=200,
+            )
+
         elif action == "set_release_link":
             is_owner = job.user_id is not None and job.user_id == user.telegram_id
 
@@ -4403,37 +4511,60 @@ def build_webapp_api(
 
         result = await album_search_service.search(query=query, scope=scope, limit=25)
 
+        platform_priority = ["deezer"]
+        if governance_service and hasattr(governance_service, "_repo"):
+            with contextlib.suppress(Exception):
+                p_prefs = await governance_service._repo.get_user_preferences(user.telegram_id)
+                platform_priority = p_prefs.platform_priority_list
+
+        albums_data = []
+        for alb in result.albums:
+            alb_links = build_streaming_platform_links(alb.artist, alb.title, deezer_url=alb.external_url)
+            prim_plat, prim_url = resolve_primary_platform_link(alb_links, platform_priority)
+            albums_data.append(
+                {
+                    "id": alb.id,
+                    "title": alb.title,
+                    "artist": alb.artist,
+                    "cover_url": alb.cover_url,
+                    "in_library": alb.in_library,
+                    "total_tracks": alb.total_tracks,
+                    "owned_tracks_count": alb.owned_tracks_count,
+                    "missing_tracks_count": alb.missing_tracks_count,
+                    "external_url": alb.external_url,
+                    "external_links": alb_links,
+                    "primary_platform": prim_plat,
+                    "primary_url": prim_url,
+                }
+            )
+
+        tracks_data = []
+        for trk in result.tracks:
+            trk_links = build_streaming_platform_links(trk.artist, trk.title, deezer_url=trk.external_url)
+            prim_plat, prim_url = resolve_primary_platform_link(trk_links, platform_priority)
+            tracks_data.append(
+                {
+                    "id": trk.id,
+                    "title": trk.title,
+                    "artist": trk.artist,
+                    "album": trk.album,
+                    "in_library": trk.in_library,
+                    "library_track_id": trk.library_track_id,
+                    "preview_url": trk.preview_url,
+                    "duration_seconds": trk.duration_seconds,
+                    "external_url": trk.external_url,
+                    "external_links": trk_links,
+                    "primary_platform": prim_plat,
+                    "primary_url": prim_url,
+                }
+            )
+
         return web.json_response(
             {
                 "query": result.query,
                 "scope": result.scope,
-                "albums": [
-                    {
-                        "id": alb.id,
-                        "title": alb.title,
-                        "artist": alb.artist,
-                        "cover_url": alb.cover_url,
-                        "in_library": alb.in_library,
-                        "total_tracks": alb.total_tracks,
-                        "owned_tracks_count": alb.owned_tracks_count,
-                        "missing_tracks_count": alb.missing_tracks_count,
-                        "external_url": alb.external_url,
-                    }
-                    for alb in result.albums
-                ],
-                "tracks": [
-                    {
-                        "id": trk.id,
-                        "title": trk.title,
-                        "artist": trk.artist,
-                        "album": trk.album,
-                        "in_library": trk.in_library,
-                        "library_track_id": trk.library_track_id,
-                        "preview_url": trk.preview_url,
-                        "duration_seconds": trk.duration_seconds,
-                    }
-                    for trk in result.tracks
-                ],
+                "albums": albums_data,
+                "tracks": tracks_data,
             }
         )
 
@@ -4482,6 +4613,36 @@ def build_webapp_api(
             provider_release_id=provider_id,
         )
 
+        platform_priority = ["deezer"]
+        if governance_service and hasattr(governance_service, "_repo"):
+            with contextlib.suppress(Exception):
+                p_prefs = await governance_service._repo.get_user_preferences(user.telegram_id)
+                platform_priority = p_prefs.platform_priority_list
+
+        album_links = build_streaming_platform_links(gap.artist, gap.title, deezer_url=gap.external_url)
+        gap_prim_plat, gap_prim_url = resolve_primary_platform_link(album_links, platform_priority)
+
+        gap_tracks_data = []
+        for t in gap.tracks:
+            t_ext_url = getattr(t, "external_url", None)
+            trk_links = build_streaming_platform_links(gap.artist, t.title, deezer_url=t_ext_url)
+            trk_prim_plat, trk_prim_url = resolve_primary_platform_link(trk_links, platform_priority)
+            gap_tracks_data.append(
+                {
+                    "position": t.position,
+                    "title": t.title,
+                    "duration_seconds": t.duration_seconds,
+                    "is_owned": t.is_owned,
+                    "library_track_id": t.library_track_id,
+                    "preview_url": t.preview_url,
+                    "disk_number": t.disk_number,
+                    "external_url": t_ext_url,
+                    "external_links": trk_links,
+                    "primary_platform": trk_prim_plat,
+                    "primary_url": trk_prim_url,
+                }
+            )
+
         return web.json_response(
             {
                 "album_id": gap.album_id,
@@ -4496,18 +4657,10 @@ def build_webapp_api(
                 "is_complete": gap.is_complete,
                 "provider": gap.provider,
                 "external_url": gap.external_url,
-                "tracks": [
-                    {
-                        "position": t.position,
-                        "title": t.title,
-                        "duration_seconds": t.duration_seconds,
-                        "is_owned": t.is_owned,
-                        "library_track_id": t.library_track_id,
-                        "preview_url": t.preview_url,
-                        "disk_number": t.disk_number,
-                    }
-                    for t in gap.tracks
-                ],
+                "external_links": album_links,
+                "primary_platform": gap_prim_plat,
+                "primary_url": gap_prim_url,
+                "tracks": gap_tracks_data,
             }
         )
 

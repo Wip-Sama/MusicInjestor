@@ -664,6 +664,17 @@ def build_user_settings_keyboard(
             callback_data=SettingsCallback(action="notifs", value="toggle").pack(),
         )
     )
+    upgrade_state = (
+        "✨ [Enabled] Auto-Upgrade Quality"
+        if getattr(prefs, "auto_upgrade_quality", False)
+        else "⬜ [Disabled] Auto-Upgrade Quality"
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text=upgrade_state,
+            callback_data=SettingsCallback(action="upgrade_auto", value="toggle").pack(),
+        )
+    )
     builder.row(
         InlineKeyboardButton(
             text="🎛️ Platform Links Priority",

@@ -354,5 +354,39 @@ class DeezerReleaseProvider(ReleaseRadarProviderPort):
     async def get_track_preview(
         self,
         provider_track_id: str,
-    ) -> tuple[str, str] | None:
-        """Fetch title and 30s audio preview URL directly for a Deezer track ID."""
+    ) -> ReleaseTrackPreview | None:
+        """Fetch ReleaseTrackPreview with title, 30s audio preview URL, artist name, and Deezer URL."""
+        clean_id = provider_track_id.strip()
+        if not clean_id:
+            return None
+
+        url = f"{self._base_url}/track/{clean_id}"
+        try:
+            client = await self._get_client()
+            resp = await client.get(url)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict) and not data.get("error"):
+                    title = str(data.get("title") or "").strip()
+                    preview = str(data.get("preview") or "").strip()
+                    link = str(data.get("link") or "").strip()
+                    artist_name = ""
+                    artist_obj = data.get("artist")
+                    if isinstance(artist_obj, dict):
+                        artist_name = str(artist_obj.get("name") or "").strip()
+                    dur = int(data.get("duration") or 30)
+                    pos = int(data.get("track_position") or 1)
+                    if preview:
+                        return ReleaseTrackPreview(
+                            track_id=clean_id,
+                            title=title,
+                            preview_url=preview,
+                            duration_seconds=dur,
+                            track_position=pos,
+                            artist_name=artist_name,
+                            external_url=link,
+                        )
+        except Exception as exc:
+            logger.warning("Failed to fetch Deezer track preview for %s: %s", clean_id, exc)
+
+        return None

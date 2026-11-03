@@ -4,6 +4,7 @@ import contextlib
 import html
 import logging
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -45,6 +46,7 @@ from src.core.metadata import _MB_URL_RE, normalize_primary_artist
 from src.core.models import (
     IngestionJob,
     IngestionResult,
+    JobState,
     LyricsData,
     Permission,
     TrackMetadata,
@@ -360,6 +362,93 @@ async def handle_verification_callback(
 
         summary = format_ingestion_summary(result)
         await safe_edit_text(msg, summary, reply_markup=build_back_to_home_keyboard(back_callback=back_cb))
+        return
+
+    if action == "upgrade":
+        await ack_callback(callback, "🔄 Upgrading track to higher-quality audio...")
+        await send_chat_action_safe(callback)
+        await safe_edit_text(
+            msg,
+            format_screen(
+                title="🔄 Upgrading Track Audio",
+                context_lines=[
+                    "Replacing existing library file with higher quality audio...",
+                    "Fetching lyrics and updating catalog metadata...",
+                ],
+                footer_lines=[f"<i>Job ID:</i> <code>{html.escape(job_id)}</code>"],
+            ),
+        )
+
+        async def _update_upgrade_stage(staged_job: IngestionJob) -> None:
+            with contextlib.suppress(Exception):
+                await safe_edit_text(msg, render_job_stage_progress(staged_job))
+
+        try:
+            result = await pipeline.execute_upgrade(
+                job_id=job_id,
+                stage_callback=_update_upgrade_stage,
+            )
+        except Exception as exc:
+            logger.error("Failed to upgrade track for job %s: %s", job_id, exc, exc_info=True)
+            await safe_edit_text(
+                msg,
+                format_screen(
+                    title="⚠️ Upgrade Failed",
+                    context_lines=[
+                        "An error occurred while upgrading audio file:\n"
+                        f"<code>{html.escape(str(exc))}</code>",
+                    ],
+                    footer_lines=[f"<i>Job ID:</i> <code>{html.escape(job_id)}</code>"],
+                ),
+                reply_markup=build_back_to_home_keyboard(),
+            )
+            return
+
+        if queue_worker is not None:
+            await queue_worker.record_confirmed_completion(result)
+
+        await reset_fsm_state(state)
+        new_q_str = (
+            result.duplicate.new_quality.summary
+            if result.duplicate and result.duplicate.new_quality
+            else "Higher Quality"
+        )
+        await safe_edit_text(
+            msg,
+            format_screen(
+                title="✨ Track Successfully Upgraded!",
+                context_lines=[
+                    "Existing library track has been replaced with higher-quality audio.",
+                    f"• <b>New Quality:</b> <code>{html.escape(new_q_str)}</code>",
+                    f"• <b>File:</b> <code>{html.escape(str(result.job.final_path))}</code>",
+                ],
+                footer_lines=[f"<i>Job ID:</i> <code>{html.escape(job_id)}</code>"],
+            ),
+            reply_markup=build_back_to_home_keyboard(),
+        )
+        return
+
+    if action == "ignore_upgrade":
+        await ack_callback(callback, "Upgrade ignored. Existing track kept.")
+        if target_job is not None:
+            target_job.state = JobState.DUPLICATE_REJECTED
+            target_job.completed_at = datetime.now(UTC)
+            await pipeline._catalog.save_job(target_job)
+            await pipeline._extractor.cleanup_job_scratch(job_id)
+
+        await reset_fsm_state(state)
+        await safe_edit_text(
+            msg,
+            format_screen(
+                title="ℹ️ Upgrade Cancelled",
+                context_lines=[
+                    "The higher-quality audio file was discarded.",
+                    "Your existing library track remains untouched.",
+                ],
+                footer_lines=[f"<i>Job ID:</i> <code>{html.escape(job_id)}</code>"],
+            ),
+            reply_markup=build_back_to_home_keyboard(),
+        )
         return
 
     if action == "cancel":

@@ -17,6 +17,7 @@ from src.core.extractor import SUPPORTED_AUDIO_EXTENSIONS
 from src.core.metadata import parse_filename_metadata, parse_manual_search_query
 from src.core.models import (
     AudioFingerprint,
+    DuplicateCheckResult,
     IngestionJob,
     IngestionResult,
     JobState,
@@ -442,20 +443,20 @@ class IngestionPipeline:
         )
         job.fingerprint = fingerprint
 
-        dup_check = await self._deduplicator.check_track(fingerprint, metadata=local_meta)
-        if dup_check.is_duplicate:
-            job.state = JobState.DUPLICATE_REJECTED
-            job.completed_at = datetime.now(UTC)
-            job.final_path = dup_check.existing_path
-            await self._catalog.save_job(job)
-            await self._extractor.cleanup_job_scratch(resolved_job_id)
-            return IngestionResult(
-                job=job,
-                requires_user_confirmation=False,
-                duplicate=dup_check,
-                tracks_ingested=0,
-                lyrics_embedded_count=0,
-            )
+        dup_check = await self._deduplicator.check_track(
+            fingerprint,
+            metadata=local_meta,
+            audio_path=primary_audio,
+        )
+        dup_res = await self._handle_duplicate_check(
+            job=job,
+            dup_check=dup_check,
+            meta=local_meta,
+            resolved_job_id=resolved_job_id,
+            stage_callback=stage_callback,
+        )
+        if dup_res is not None:
+            return dup_res
 
         persisted_midflight = await self._catalog.get_job(resolved_job_id)
         was_paused = persisted_midflight is not None and persisted_midflight.state == JobState.PAUSED
@@ -496,20 +497,17 @@ class IngestionPipeline:
                 fingerprint,
                 recording_mbid=candidates[0].metadata.recording_mbid,
                 metadata=candidates[0].metadata,
+                audio_path=primary_audio,
             )
-            if enriched_dup.is_duplicate:
-                job.state = JobState.DUPLICATE_REJECTED
-                job.completed_at = datetime.now(UTC)
-                job.final_path = enriched_dup.existing_path
-                await self._catalog.save_job(job)
-                await self._extractor.cleanup_job_scratch(resolved_job_id)
-                return IngestionResult(
-                    job=job,
-                    requires_user_confirmation=False,
-                    duplicate=enriched_dup,
-                    tracks_ingested=0,
-                    lyrics_embedded_count=0,
-                )
+            dup_res = await self._handle_duplicate_check(
+                job=job,
+                dup_check=enriched_dup,
+                meta=candidates[0].metadata,
+                resolved_job_id=resolved_job_id,
+                stage_callback=stage_callback,
+            )
+            if dup_res is not None:
+                return dup_res
         else:
             job.selected_metadata = local_meta
 
@@ -774,20 +772,17 @@ class IngestionPipeline:
                 job.fingerprint,
                 recording_mbid=primary_meta.recording_mbid,
                 metadata=primary_meta,
+                audio_path=audio_path,
             )
-            if final_dup.is_duplicate:
-                job.state = JobState.DUPLICATE_REJECTED
-                job.completed_at = datetime.now(UTC)
-                job.final_path = final_dup.existing_path
-                await self._catalog.save_job(job)
-                await self._extractor.cleanup_job_scratch(job.job_id)
-                return IngestionResult(
-                    job=job,
-                    requires_user_confirmation=False,
-                    duplicate=final_dup,
-                    tracks_ingested=0,
-                    lyrics_embedded_count=0,
-                )
+            dup_res = await self._handle_duplicate_check(
+                job=job,
+                dup_check=final_dup,
+                meta=primary_meta,
+                resolved_job_id=job.job_id,
+                stage_callback=stage_callback,
+            )
+            if dup_res is not None:
+                return dup_res
 
             job.state = JobState.FETCHING_LYRICS
             await self._notify_stage(job, stage_callback)
@@ -918,3 +913,164 @@ class IngestionPipeline:
             with contextlib.suppress(Exception):
                 await self._notify_stage(job, stage_callback)
             raise
+
+    async def _check_auto_upgrade(self, user_id: int | None) -> bool:
+        """Check if user has enabled auto_upgrade_quality preference."""
+        if not user_id:
+            return False
+        getter = getattr(self._catalog, "get_user_preferences", None)
+        if not callable(getter):
+            return False
+        try:
+            prefs = await getter(user_id)
+            return bool(getattr(prefs, "auto_upgrade_quality", False))
+        except Exception:
+            return False
+
+    async def _handle_duplicate_check(
+        self,
+        job: IngestionJob,
+        dup_check: DuplicateCheckResult,
+        meta: TrackMetadata,
+        resolved_job_id: str,
+        stage_callback: StageCallback | None = None,
+    ) -> IngestionResult | None:
+        """Evaluate a duplicate check outcome: handle quality upgrades or reject identical duplicates."""
+        if not dup_check.is_duplicate:
+            return None
+
+        if dup_check.is_upgrade:
+            job.is_upgrade = True
+            job.upgrade_for_path = dup_check.existing_path
+            job.existing_quality = dup_check.existing_quality
+            job.new_quality = dup_check.new_quality
+            job.selected_metadata = meta
+            job.final_path = dup_check.existing_path
+
+            if await self._check_auto_upgrade(job.user_id):
+                logger.info(
+                    "Job %s has higher quality version and auto-upgrade enabled. Upgrading track...",
+                    job.job_id,
+                )
+                return await self.execute_upgrade(job.job_id, stage_callback=stage_callback)
+
+            job.state = JobState.AWAITING_CONFIRMATION
+            await self._catalog.save_job(job)
+            return IngestionResult(
+                job=job,
+                requires_user_confirmation=True,
+                duplicate=dup_check,
+                tracks_ingested=0,
+                lyrics_embedded_count=0,
+            )
+
+        job.state = JobState.DUPLICATE_REJECTED
+        job.completed_at = datetime.now(UTC)
+        job.final_path = dup_check.existing_path
+        await self._catalog.save_job(job)
+        await self._extractor.cleanup_job_scratch(resolved_job_id)
+        return IngestionResult(
+            job=job,
+            requires_user_confirmation=False,
+            duplicate=dup_check,
+            tracks_ingested=0,
+            lyrics_embedded_count=0,
+        )
+
+    async def execute_upgrade(
+        self,
+        job_id: str,
+        stage_callback: StageCallback | None = None,
+    ) -> IngestionResult:
+        """Replace an existing lower-quality track with the newly ingested higher-quality file."""
+        job = await self._catalog.get_job(job_id)
+        if job is None:
+            raise KeyError(f"Job {job_id} not found.")
+
+        primary_audio: Path | None = None
+        if job.scratch_dir and job.scratch_dir.is_dir():
+            for p in sorted(job.scratch_dir.iterdir()):
+                if p.is_file() and p.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS:
+                    primary_audio = p
+                    break
+        if primary_audio is None and job.source_path.is_file():
+            primary_audio = job.source_path
+
+        if primary_audio is None or not primary_audio.is_file():
+            job.state = JobState.FAILED
+            job.error_message = f"Audio source file for upgrade {job_id} is missing."
+            await self._catalog.save_job(job)
+            return IngestionResult(job=job, tracks_ingested=0)
+
+        meta = job.selected_metadata
+        if meta is None:
+            meta = await self._metadata.read_local_metadata(primary_audio)
+
+        job.state = JobState.FETCHING_LYRICS
+        await self._notify_stage(job, stage_callback)
+        lyrics = await self._lyrics.fetch_lyrics(meta)
+
+        job.state = JobState.ORGANIZING
+        await self._notify_stage(job, stage_callback)
+        final_path = await self._organizer.finalize_track(
+            source_audio_path=primary_audio,
+            metadata=meta,
+            lyrics=lyrics,
+        )
+        job.final_path = final_path
+
+        old_path = job.upgrade_for_path
+        if old_path is not None and old_path.is_file():
+            try:
+                if old_path.resolve() != final_path.resolve():
+                    old_path.unlink(missing_ok=True)
+                    logger.info("Unlinked replaced lower-quality audio file at %s", old_path)
+            except OSError as exc:
+                logger.warning("Could not unlink old file %s: %s", old_path, exc)
+
+        new_fp = await self._compute_fingerprint_with_fallback(
+            final_path,
+            known_duration=meta.duration_seconds,
+        )
+        job.fingerprint = new_fp
+
+        has_synced = bool(lyrics and lyrics.has_synced)
+        if old_path is not None and hasattr(self._catalog, "replace_library_track"):
+            await self._catalog.replace_library_track(
+                old_path=old_path,
+                new_path=final_path,
+                metadata=meta,
+                fingerprint=new_fp,
+                uploaded_by=job.user_id or 0,
+                has_synced_lyrics=has_synced,
+            )
+        else:
+            await self._catalog.register_ingested_track(
+                job_id=job.job_id,
+                metadata=meta,
+                fingerprint=new_fp,
+                library_path=final_path,
+                has_synced_lyrics=has_synced,
+            )
+
+        await self._extractor.cleanup_job_scratch(job.job_id)
+        job.state = JobState.COMPLETED
+        job.completed_at = datetime.now(UTC)
+        job.processed_tracks = 1
+        job.total_tracks = 1
+        await self._catalog.save_job(job)
+        await self._notify_stage(job, stage_callback)
+
+        dup_result = DuplicateCheckResult(
+            is_duplicate=True,
+            existing_path=old_path,
+            is_upgrade=True,
+            existing_quality=job.existing_quality,
+            new_quality=job.new_quality,
+        )
+        return IngestionResult(
+            job=job,
+            duplicate=dup_result,
+            tracks_ingested=1,
+            lyrics_embedded_count=1 if (lyrics and lyrics.has_any) else 0,
+        )

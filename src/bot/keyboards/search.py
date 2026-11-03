@@ -1,11 +1,17 @@
 """Inline keyboards and CallbackData schemas for unified search and album gap analysis."""
 
 from aiogram.filters.callback_data import CallbackData
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from aiogram.types import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from src.bot.keyboards.admin import append_escape_row
 from src.core.models import AlbumGapAnalysis, UnifiedSearchResult
+from src.core.platform_links import (
+    PLATFORM_ICONS,
+    PLATFORM_LABELS,
+    build_streaming_platform_links,
+    resolve_primary_platform_link,
+)
 
 
 class SearchActionCallback(CallbackData, prefix="srch", sep="~"):
@@ -146,4 +152,83 @@ def build_album_gap_keyboard(
         )
 
     append_escape_row(builder, back_callback=back_callback, include_home=True)
+    return builder.as_markup()
+
+
+def build_search_preview_keyboard(
+    artist: str,
+    title: str,
+    deezer_url: str | None = None,
+    platform_priority: list[str] | None = None,
+    web_app_url: str | None = None,
+    target_id: str = "",
+    query: str = "",
+) -> InlineKeyboardMarkup:
+    """Build inline buttons attached to a 30-second audio preview file sent from song search."""
+    builder = InlineKeyboardBuilder()
+
+    links = build_streaming_platform_links(artist=artist, title=title, deezer_url=deezer_url)
+    primary_plat, primary_url = resolve_primary_platform_link(links, platform_priority or ["deezer"])
+    plat_icon = PLATFORM_ICONS.get(primary_plat, "🌐")
+    plat_label = PLATFORM_LABELS.get(primary_plat, primary_plat.title())
+
+    # Row 1: Primary Platform link + Copy Link
+    builder.row(
+        InlineKeyboardButton(
+            text=f"{plat_icon} Open {plat_label}",
+            url=primary_url,
+        ),
+        InlineKeyboardButton(
+            text="📋 Copy Link",
+            copy_text=CopyTextButton(text=primary_url),
+        ),
+    )
+
+    # Row 2: Other Platforms + optional Mini App
+    extra_row: list[InlineKeyboardButton] = [
+        InlineKeyboardButton(
+            text="🔗 Other Platforms",
+            callback_data=SearchActionCallback(
+                action="other_links",
+                value=target_id[:20],
+                query=f"{artist} - {title}"[:30],
+            ).pack(),
+        )
+    ]
+    if web_app_url and web_app_url.strip():
+        extra_row.append(
+            InlineKeyboardButton(
+                text="🎵 Mini App",
+                web_app=WebAppInfo(url=f"{web_app_url.strip().rstrip('/')}?startapp=search"),
+            )
+        )
+    builder.row(*extra_row)
+
+    return builder.as_markup()
+
+
+def build_search_other_platforms_keyboard(
+    artist: str,
+    title: str,
+    links: dict[str, str],
+    back_query: str = "",
+) -> InlineKeyboardMarkup:
+    """Build keyboard presenting links and copy buttons across Deezer, Tidal, Qobuz, Spotify, Apple Music."""
+    builder = InlineKeyboardBuilder()
+
+    for plat, url in links.items():
+        icon = PLATFORM_ICONS.get(plat, "🌐")
+        label = PLATFORM_LABELS.get(plat, plat.title())
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{icon} {label}",
+                url=url,
+            ),
+            InlineKeyboardButton(
+                text="📋 Copy",
+                copy_text=CopyTextButton(text=url),
+            ),
+        )
+
+    append_escape_row(builder, back_callback=f"srch~back~{back_query[:20]}", include_home=True)
     return builder.as_markup()

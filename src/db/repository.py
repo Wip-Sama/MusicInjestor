@@ -432,6 +432,161 @@ class SqliteCatalogRepository:
             )
             await conn.commit()
 
+    async def replace_library_track(
+        self,
+        old_path: Path,
+        new_path: Path,
+        metadata: TrackMetadata,
+        fingerprint: AudioFingerprint,
+        uploaded_by: int = 0,
+        has_synced_lyrics: bool = False,
+    ) -> None:
+        """Replace an existing track in the catalog with an upgraded higher-quality audio file."""
+        now_iso = datetime.now(UTC).isoformat()
+        track_id = metadata.recording_mbid or fingerprint.acoustid_mbid or str(uuid.uuid4())
+        old_path_str = str(old_path)
+        new_path_str = str(new_path)
+
+        async with self._db.connect() as conn:
+            cursor = await conn.execute(
+                "SELECT id, uploaded_by FROM library_tracks WHERE storage_path = ? LIMIT 1",
+                (old_path_str,),
+            )
+            existing_row = await cursor.fetchone()
+            resolved_uploader = uploaded_by
+            if existing_row is not None:
+                track_id = str(existing_row[0])
+                if resolved_uploader == 0 and existing_row[1] is not None:
+                    resolved_uploader = int(existing_row[1])
+
+                await conn.execute(
+                    """
+                    UPDATE library_tracks
+                    SET storage_path = ?,
+                        fingerprint = ?,
+                        duration_seconds = ?,
+                        artist = ?,
+                        album = ?,
+                        title = ?,
+                        year = ?,
+                        track_number = ?,
+                        has_synced_lyrics = ?,
+                        updated_at = CURRENT_TIMESTAMP,
+                        modification_count = modification_count + 1,
+                        telegram_file_id = NULL
+                    WHERE storage_path = ?
+                    """,
+                    (
+                        new_path_str,
+                        fingerprint.fingerprint,
+                        float(fingerprint.duration_seconds),
+                        metadata.artist,
+                        metadata.album,
+                        metadata.title,
+                        metadata.year,
+                        metadata.track_number,
+                        1 if has_synced_lyrics else 0,
+                        old_path_str,
+                    ),
+                )
+            else:
+                await conn.execute(
+                    """
+                    INSERT INTO library_tracks (
+                        id, job_id, uploaded_by, storage_path, fingerprint,
+                        duration_seconds, artist, album, title, year,
+                        track_number, has_synced_lyrics, ingested_at
+                    ) VALUES (?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(storage_path) DO UPDATE SET
+                        fingerprint = excluded.fingerprint,
+                        duration_seconds = excluded.duration_seconds,
+                        artist = excluded.artist,
+                        album = excluded.album,
+                        title = excluded.title,
+                        year = excluded.year,
+                        track_number = excluded.track_number,
+                        has_synced_lyrics = excluded.has_synced_lyrics,
+                        updated_at = CURRENT_TIMESTAMP,
+                        modification_count = modification_count + 1,
+                        telegram_file_id = NULL
+                    """,
+                    (
+                        track_id,
+                        resolved_uploader,
+                        new_path_str,
+                        fingerprint.fingerprint,
+                        float(fingerprint.duration_seconds),
+                        metadata.artist,
+                        metadata.album,
+                        metadata.title,
+                        metadata.year,
+                        metadata.track_number,
+                        1 if has_synced_lyrics else 0,
+                    ),
+                )
+
+            cat_cursor = await conn.execute(
+                "SELECT id FROM catalog_tracks WHERE library_path = ? LIMIT 1",
+                (old_path_str,),
+            )
+            cat_row = await cat_cursor.fetchone()
+            if cat_row is not None:
+                await conn.execute(
+                    """
+                    UPDATE catalog_tracks
+                    SET library_path = ?,
+                        fingerprint = ?,
+                        duration_seconds = ?,
+                        title = ?,
+                        artist = ?,
+                        album = ?,
+                        album_artist = ?,
+                        year = ?,
+                        track_number = ?,
+                        disc_number = ?
+                    WHERE library_path = ?
+                    """,
+                    (
+                        new_path_str,
+                        fingerprint.fingerprint,
+                        int(fingerprint.duration_seconds),
+                        metadata.title,
+                        metadata.artist,
+                        metadata.album,
+                        metadata.album_artist,
+                        metadata.year,
+                        metadata.track_number,
+                        metadata.disc_number,
+                        old_path_str,
+                    ),
+                )
+            else:
+                await conn.execute(
+                    """
+                    INSERT OR REPLACE INTO catalog_tracks (
+                        job_id, title, artist, album, album_artist, year,
+                        track_number, disc_number, duration_seconds, fingerprint,
+                        recording_mbid, release_mbid, library_path, created_at
+                    ) VALUES ('', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        metadata.title,
+                        metadata.artist,
+                        metadata.album,
+                        metadata.album_artist,
+                        metadata.year,
+                        metadata.track_number,
+                        metadata.disc_number,
+                        int(fingerprint.duration_seconds),
+                        fingerprint.fingerprint,
+                        metadata.recording_mbid or fingerprint.acoustid_mbid,
+                        metadata.release_mbid,
+                        new_path_str,
+                        now_iso,
+                    ),
+                )
+            await conn.commit()
+
     async def save_job(self, job: IngestionJob) -> None:
         """Upsert an `IngestionJob` state snapshot in `ingestion_jobs`."""
         candidates_payload = [
@@ -691,7 +846,8 @@ class SqliteCatalogRepository:
             cursor = await conn.execute(
                 """
                 SELECT telegram_id, stream_format, stream_bitrate, auto_lyrics_search,
-                       theme, streaming_platform_order, search_scope, notifications_enabled
+                       theme, streaming_platform_order, search_scope, notifications_enabled,
+                       auto_upgrade_quality
                 FROM user_settings
                 WHERE telegram_id = ?
                 """,
@@ -710,14 +866,16 @@ class SqliteCatalogRepository:
                     if len(row) > 6 and row[6] is not None and str(row[6]).strip()
                     else "global",
                     notifications_enabled=bool(int(row[7])) if len(row) > 7 and row[7] is not None else True,
+                    auto_upgrade_quality=bool(int(row[8])) if len(row) > 8 and row[8] is not None else False,
                 )
             default_prefs = UserPreferences(telegram_id=telegram_id)
             await conn.execute(
                 """
                 INSERT OR IGNORE INTO user_settings (
                     telegram_id, stream_format, stream_bitrate, auto_lyrics_search,
-                    theme, streaming_platform_order, search_scope, notifications_enabled
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    theme, streaming_platform_order, search_scope, notifications_enabled,
+                    auto_upgrade_quality
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     telegram_id,
@@ -728,6 +886,7 @@ class SqliteCatalogRepository:
                     default_prefs.streaming_platform_order,
                     default_prefs.search_scope,
                     1 if default_prefs.notifications_enabled else 0,
+                    1 if default_prefs.auto_upgrade_quality else 0,
                 ),
             )
             await conn.commit()
@@ -740,8 +899,9 @@ class SqliteCatalogRepository:
                 """
                 INSERT INTO user_settings (
                     telegram_id, stream_format, stream_bitrate, auto_lyrics_search,
-                    theme, streaming_platform_order, search_scope, notifications_enabled, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    theme, streaming_platform_order, search_scope, notifications_enabled,
+                    auto_upgrade_quality, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(telegram_id) DO UPDATE SET
                     stream_format = excluded.stream_format,
                     stream_bitrate = excluded.stream_bitrate,
@@ -750,6 +910,7 @@ class SqliteCatalogRepository:
                     streaming_platform_order = excluded.streaming_platform_order,
                     search_scope = excluded.search_scope,
                     notifications_enabled = excluded.notifications_enabled,
+                    auto_upgrade_quality = excluded.auto_upgrade_quality,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
@@ -761,6 +922,7 @@ class SqliteCatalogRepository:
                     preferences.streaming_platform_order,
                     preferences.search_scope,
                     1 if preferences.notifications_enabled else 0,
+                    1 if preferences.auto_upgrade_quality else 0,
                 ),
             )
             await conn.commit()

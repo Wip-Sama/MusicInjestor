@@ -62,6 +62,10 @@ export interface QueueJob {
   lyrics_matched_count: number;
   selected_metadata: SelectedMetadata | null;
   candidates: CandidateItem[];
+  is_upgrade?: boolean;
+  existing_quality?: string | null;
+  new_quality?: string | null;
+  upgrade_for_path?: string | null;
 }
 
 export interface ActiveBulkResearch {

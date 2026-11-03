@@ -262,8 +262,8 @@ class ReleaseRadarService:
     async def get_track_preview(
         self,
         provider_track_id: str,
-    ) -> tuple[str, str] | None:
-        """Fetch (title, preview_url) directly for an individual track."""
+    ) -> ReleaseTrackPreview | tuple[str, str] | None:
+        """Fetch track preview details or (title, preview_url) directly for an individual track."""
         if hasattr(self._provider, "get_track_preview"):
             return await self._provider.get_track_preview(provider_track_id)
         return None

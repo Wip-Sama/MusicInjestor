@@ -1,5 +1,5 @@
 import React from 'react';
-import { X, Sliders, Music, CheckCircle2, Shield, ChevronUp, ChevronDown, GripVertical, Bell } from 'lucide-react';
+import { X, Sliders, Music, CheckCircle2, Shield, ChevronUp, ChevronDown, GripVertical, Bell, Sparkles } from 'lucide-react';
 import { useAudioPlayer } from '../../context/AudioPlayerContext';
 
 import { UserProfile } from '../../lib/auth';
@@ -15,6 +15,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, p
     streamFormat,
     streamBitrate,
     autoLyricsSearch,
+    autoUpgradeQuality,
     streamingPlatformOrder,
     searchScope,
     notificationsEnabled,
@@ -299,6 +300,44 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, p
               <input
                 type="checkbox"
                 checked={autoLyricsSearch}
+                readOnly
+                style={{
+                  width: '18px',
+                  height: '18px',
+                  accentColor: 'var(--tg-theme-button-color, #0a84ff)',
+                  cursor: 'pointer',
+                }}
+              />
+            </div>
+
+            <div
+              onClick={() => updateUserSettings({ auto_upgrade_quality: !autoUpgradeQuality })}
+              style={{
+                marginTop: '8px',
+                padding: '12px 14px',
+                borderRadius: '12px',
+                backgroundColor: 'var(--tg-theme-secondary-bg-color, #2c2c2e)',
+                border: '1px solid rgba(255, 255, 255, 0.08)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                cursor: 'pointer',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <Sparkles size={18} color="#f59e0b" />
+                <div>
+                  <div style={{ fontSize: '14px', fontWeight: 600, color: 'var(--tg-theme-text-color, #fff)' }}>
+                    Auto-Upgrade Higher Quality
+                  </div>
+                  <div style={{ fontSize: '11px', color: 'var(--tg-theme-subtitle-text-color, #8e8e93)' }}>
+                    Automatically replace existing library tracks when an uploaded duplicate has higher audio quality.
+                  </div>
+                </div>
+              </div>
+              <input
+                type="checkbox"
+                checked={autoUpgradeQuality}
                 readOnly
                 style={{
                   width: '18px',

@@ -52,6 +52,18 @@ class CatalogRepositoryPort(Protocol):
         """Persist a newly ingested track and its fingerprint into the library catalog."""
         ...
 
+    async def replace_library_track(
+        self,
+        old_path: Path,
+        new_path: Path,
+        metadata: TrackMetadata,
+        fingerprint: AudioFingerprint,
+        uploaded_by: int = 0,
+        has_synced_lyrics: bool = False,
+    ) -> None:
+        """Replace an existing track in the catalog with an upgraded higher-quality audio file."""
+        ...
+
     async def save_job(self, job: IngestionJob) -> None:
         """Insert or update an ingestion job state in persistent storage."""
         ...
@@ -577,6 +589,6 @@ class ReleaseRadarProviderPort(Protocol):
     async def get_track_preview(
         self,
         provider_track_id: str,
-    ) -> tuple[str, str] | None:
-        """Fetch `(track_title, preview_mp3_url)` directly for an individual track."""
+    ) -> ReleaseTrackPreview | tuple[str, str] | None:
+        """Fetch ReleaseTrackPreview or `(track_title, preview_mp3_url)` directly for an individual track."""
         ...

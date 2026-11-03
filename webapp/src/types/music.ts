@@ -99,6 +99,10 @@ export interface AlbumTrackGap {
   library_track_id: string | null;
   preview_url: string | null;
   disk_number?: number;
+  external_url?: string | null;
+  external_links?: Record<string, string>;
+  primary_platform?: string;
+  primary_url?: string;
 }
 
 export interface AlbumGapAnalysis {
@@ -114,6 +118,9 @@ export interface AlbumGapAnalysis {
   is_complete: boolean;
   provider: string;
   external_url: string | null;
+  external_links?: Record<string, string>;
+  primary_platform?: string;
+  primary_url?: string;
   tracks: AlbumTrackGap[];
 }
 
@@ -127,6 +134,9 @@ export interface SearchResultAlbum {
   owned_tracks_count: number;
   missing_tracks_count: number;
   external_url: string | null;
+  external_links?: Record<string, string>;
+  primary_platform?: string;
+  primary_url?: string;
 }
 
 export interface SearchResultTrack {
@@ -138,6 +148,10 @@ export interface SearchResultTrack {
   library_track_id: string | null;
   preview_url: string | null;
   duration_seconds: number;
+  external_url?: string | null;
+  external_links?: Record<string, string>;
+  primary_platform?: string;
+  primary_url?: string;
 }
 
 export interface AppSearchResponse {
@@ -156,5 +170,6 @@ export interface UserSettings {
   streaming_platform_order: string;
   search_scope: 'global' | 'library';
   notifications_enabled: boolean;
+  auto_upgrade_quality: boolean;
 }
 

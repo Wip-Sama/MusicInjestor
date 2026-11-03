@@ -21,6 +21,7 @@ interface AudioPlayerContextType {
   streamFormat: string;
   streamBitrate: number;
   autoLyricsSearch: boolean;
+  autoUpgradeQuality: boolean;
   streamingPlatformOrder: string;
   searchScope: 'global' | 'library';
   setSearchScope: (scope: 'global' | 'library') => void;
@@ -59,6 +60,7 @@ interface AudioPlayerContextType {
     streaming_platform_order?: string;
     search_scope?: 'global' | 'library';
     notifications_enabled?: boolean;
+    auto_upgrade_quality?: boolean;
   }) => Promise<void>;
 }
 
@@ -84,6 +86,7 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
   const [streamFormat, setStreamFormat] = useState<string>('auto');
   const [streamBitrate, setStreamBitrate] = useState<number>(192);
   const [autoLyricsSearch, setAutoLyricsSearch] = useState<boolean>(true);
+  const [autoUpgradeQuality, setAutoUpgradeQuality] = useState<boolean>(false);
   const [streamingPlatformOrder, setStreamingPlatformOrder] = useState<string>('deezer,tidal,qobuz,spotify,apple_music');
   const [searchScope, setSearchScope] = useState<'global' | 'library'>('global');
   const [notificationsEnabled, setNotificationsEnabled] = useState<boolean>(true);
@@ -255,6 +258,9 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
         }
         if (typeof data.notifications_enabled === 'boolean') {
           setNotificationsEnabled(data.notifications_enabled);
+        }
+        if (typeof data.auto_upgrade_quality === 'boolean') {
+          setAutoUpgradeQuality(data.auto_upgrade_quality);
         }
       })
       .catch((err) => {
@@ -441,6 +447,7 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
     streaming_platform_order?: string;
     search_scope?: 'global' | 'library';
     notifications_enabled?: boolean;
+    auto_upgrade_quality?: boolean;
   }) => {
     triggerHaptic();
     const newFormat = settings.stream_format ?? streamFormat;
@@ -449,6 +456,7 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const newOrder = settings.streaming_platform_order ?? streamingPlatformOrder;
     const newScope = settings.search_scope ?? searchScope;
     const newNotifs = settings.notifications_enabled ?? notificationsEnabled;
+    const newUpgrade = settings.auto_upgrade_quality ?? autoUpgradeQuality;
 
     setStreamFormat(newFormat);
     setStreamBitrate(newBitrate);
@@ -456,6 +464,7 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
     setStreamingPlatformOrder(newOrder);
     setSearchScope(newScope);
     setNotificationsEnabled(newNotifs);
+    setAutoUpgradeQuality(newUpgrade);
 
     try {
       await apiFetch('/api/v1/app/user/settings', {
@@ -468,6 +477,7 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
           streaming_platform_order: newOrder,
           search_scope: newScope,
           notifications_enabled: newNotifs,
+          auto_upgrade_quality: newUpgrade,
         }),
       });
     } catch (err) {
@@ -689,6 +699,7 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
         streamFormat,
         streamBitrate,
         autoLyricsSearch,
+        autoUpgradeQuality,
         streamingPlatformOrder,
         followedArtists,
         isArtistFollowed,

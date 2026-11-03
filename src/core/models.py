@@ -5,6 +5,8 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
+from src.core.quality import AudioQuality
+
 
 class UserRole(StrEnum):
     """Six-tier Role-Based Access Control (RBAC) hierarchy."""
@@ -170,6 +172,7 @@ class UserPreferences:
     streaming_platform_order: str = "deezer,tidal,qobuz,spotify,apple_music"
     search_scope: str = "global"
     notifications_enabled: bool = True
+    auto_upgrade_quality: bool = False
 
     @property
     def platform_priority_list(self) -> list[str]:
@@ -363,6 +366,9 @@ class DuplicateCheckResult:
     is_duplicate: bool
     existing_path: Path | None = None
     match_reason: str | None = None
+    is_upgrade: bool = False
+    existing_quality: AudioQuality | None = None
+    new_quality: AudioQuality | None = None
 
 
 @dataclass(slots=True)
@@ -391,6 +397,10 @@ class IngestionJob:
     total_tracks: int = 1
     processed_tracks: int = 0
     lyrics_matched_count: int = 0
+    is_upgrade: bool = False
+    upgrade_for_path: Path | None = None
+    existing_quality: AudioQuality | None = None
+    new_quality: AudioQuality | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -472,6 +482,8 @@ class ReleaseTrackPreview:
     duration_seconds: int = 30
     track_position: int = 1
     library_track_id: str | None = None
+    artist_name: str = ""
+    external_url: str = ""
 
 
 @dataclass(slots=True)
@@ -485,6 +497,8 @@ class AlbumTrackGap:
     library_track_id: str | None = None
     preview_url: str | None = None
     disk_number: int = 1
+    artist_name: str | None = None
+    external_url: str | None = None
 
 
 @dataclass(slots=True)

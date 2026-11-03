@@ -16,6 +16,8 @@ from src.bot.keyboards.search import (
     AlbumGapCallback,
     SearchActionCallback,
     build_album_gap_keyboard,
+    build_search_other_platforms_keyboard,
+    build_search_preview_keyboard,
     build_search_results_keyboard,
 )
 from src.bot.ui import ack_callback, format_screen, resolve_oidc_url, safe_answer, safe_edit_text
@@ -23,6 +25,7 @@ from src.config.settings import AppSettings
 from src.core.audit import format_guest_access_denied_card
 from src.core.models import AlbumGapAnalysis, UnifiedSearchResult, UserAccount, UserRole
 from src.core.oidc import AuthentikOidcService
+from src.core.platform_links import build_streaming_platform_links
 from src.core.ports import CatalogRepositoryPort, GovernanceRepositoryPort
 from src.core.radar import ReleaseRadarService
 from src.core.search import AlbumSearchService
@@ -276,6 +279,9 @@ async def handle_album_gap_preview(
     callback_data: AlbumGapCallback,
     album_search_service: AlbumSearchService | None = None,
     radar_service: ReleaseRadarService | None = None,
+    current_user: UserAccount | None = None,
+    governance_repository: GovernanceRepositoryPort | None = None,
+    settings: AppSettings | None = None,
 ) -> None:
     """Download and deliver 30-second audio preview for a missing track in an album gap analysis."""
     if album_search_service is None or radar_service is None or query.message is None:
@@ -303,6 +309,26 @@ async def handle_album_gap_preview(
         return
 
     filename = f"preview_{gap.artist[:10]}_{target_track.title[:15]}.mp3"
+
+    priority = None
+    if current_user is not None and governance_repository is not None:
+        try:
+            prefs = await governance_repository.get_user_preferences(current_user.telegram_id)
+            priority = prefs.platform_priority_list
+        except Exception:
+            pass
+
+    web_url = settings.web_app_url.strip() if settings and settings.web_app_url else None
+    markup = build_search_preview_keyboard(
+        artist=gap.artist,
+        title=target_track.title,
+        deezer_url=getattr(target_track, "external_url", None) or gap.external_url,
+        platform_priority=priority,
+        web_app_url=web_url,
+        target_id=f"{gap.album_id}:{target_pos}",
+        query=f"{gap.artist} {target_track.title}",
+    )
+
     try:
         await query.message.answer_audio(
             BufferedInputFile(audio_bytes, filename=filename),
@@ -314,6 +340,7 @@ async def handle_album_gap_preview(
             performer=gap.artist,
             title=f"{target_track.title} (Preview)",
             duration=30,
+            reply_markup=markup,
         )
     except Exception as exc:
         logger.warning("Could not deliver album gap audio preview: %s", exc)
@@ -358,6 +385,9 @@ async def handle_search_track_preview(
     callback_data: SearchActionCallback,
     radar_service: ReleaseRadarService | None = None,
     catalog_repository: CatalogRepositoryPort | None = None,
+    current_user: UserAccount | None = None,
+    governance_repository: GovernanceRepositoryPort | None = None,
+    settings: AppSettings | None = None,
 ) -> None:
     """Download and deliver 30-second audio preview from search results."""
     if radar_service is None or query.message is None:
@@ -370,6 +400,8 @@ async def handle_search_track_preview(
     # Fetch preview url
     preview_url = None
     track_title = "Audio Preview (30s)"
+    artist_name = ""
+    external_url = None
 
     if hasattr(radar_service, "get_track_preview"):
         try:
@@ -380,9 +412,15 @@ async def handle_search_track_preview(
                     p_title = getattr(preview_res, "title", None)
                     if p_title:
                         track_title = f"{p_title} (Preview)"
-                elif isinstance(preview_res, tuple) and len(preview_res) == 2:
+                    artist_name = getattr(preview_res, "artist_name", "") or ""
+                    external_url = getattr(preview_res, "external_url", None)
+                elif isinstance(preview_res, tuple) and len(preview_res) >= 2:
                     track_title = f"{preview_res[0]} (Preview)"
                     preview_url = preview_res[1]
+                    if len(preview_res) >= 3 and preview_res[2]:
+                        artist_name = str(preview_res[2])
+                    if len(preview_res) >= 4 and preview_res[3]:
+                        external_url = str(preview_res[3])
         except Exception as exc:
             logger.debug("radar_service.get_track_preview failed: %s", exc)
 
@@ -394,6 +432,8 @@ async def handle_search_track_preview(
                 preview_url = matched.preview_url
                 if getattr(matched, "title", None):
                     track_title = f"{matched.title} (Preview)"
+                artist_name = getattr(matched, "artist_name", "") or ""
+                external_url = getattr(matched, "external_url", None)
         except Exception as exc:
             logger.warning("Failed to lookup preview URL for %s: %s", target_id, exc)
 
@@ -407,6 +447,27 @@ async def handle_search_track_preview(
         await ack_callback(query, "Failed to download preview audio stream.", show_alert=True)
         return
 
+    priority = None
+    if current_user is not None and governance_repository is not None:
+        try:
+            prefs = await governance_repository.get_user_preferences(current_user.telegram_id)
+            priority = prefs.platform_priority_list
+        except Exception:
+            pass
+
+    clean_title = track_title.removesuffix(" (Preview)")
+    resolved_artist = artist_name.strip() or callback_data.query.strip()
+    web_url = settings.web_app_url.strip() if settings and settings.web_app_url else None
+    markup = build_search_preview_keyboard(
+        artist=resolved_artist,
+        title=clean_title,
+        deezer_url=external_url,
+        platform_priority=priority,
+        web_app_url=web_url,
+        target_id=target_id,
+        query=callback_data.query,
+    )
+
     filename = f"search_preview_{target_id}.mp3"
     try:
         caption_query = html.escape(callback_data.query)
@@ -415,6 +476,72 @@ async def handle_search_track_preview(
             caption=f"🎧 <b>30-Second Audio Preview</b>\n<i>From search: {caption_query}</i>",
             title=track_title,
             duration=30,
+            reply_markup=markup,
         )
     except Exception as exc:
         logger.warning("Failed to deliver search audio preview: %s", exc)
+
+
+@search_router.callback_query(SearchActionCallback.filter(F.action == "other_links"))
+async def handle_search_other_links(
+    query: CallbackQuery,
+    callback_data: SearchActionCallback,
+) -> None:
+    """Show external streaming links across Deezer, Tidal, Qobuz, Spotify, Apple Music."""
+    await ack_callback(query)
+    raw_query = callback_data.query.strip()
+    artist = ""
+    title = raw_query
+    if " - " in raw_query:
+        parts = raw_query.split(" - ", maxsplit=1)
+        artist = parts[0].strip()
+        title = parts[1].strip()
+
+    links = build_streaming_platform_links(artist=artist, title=title)
+    card = format_screen(
+        title=f"🌐 Streaming Links — {title}",
+        context_lines=[
+            f"🎤 <b>Artist:</b> <code>{html.escape(artist or 'Artist')}</code>",
+            f"🎵 <b>Title:</b> <b>{html.escape(title)}</b>",
+            "",
+            "Tap any platform to open in web/app, or tap <b>📋 Copy</b> to copy its direct URL:",
+        ],
+        footer_lines=["External Streaming Links • <i>🔍 Search</i>"],
+    )
+    keyboard = build_search_other_platforms_keyboard(
+        artist=artist, title=title, links=links, back_query=raw_query
+    )
+    if query.message is not None:
+        await safe_edit_text(query.message, card, reply_markup=keyboard)
+
+
+@search_router.callback_query(F.data.startswith("srch~back~"))
+async def handle_search_back(
+    query: CallbackQuery,
+    album_search_service: AlbumSearchService | None = None,
+    current_user: UserAccount | None = None,
+    governance_repository: GovernanceRepositoryPort | None = None,
+    settings: AppSettings | None = None,
+) -> None:
+    """Return to search results from the other platforms screen."""
+    await ack_callback(query)
+    if (
+        query.message is None
+        or album_search_service is None
+        or current_user is None
+        or governance_repository is None
+    ):
+        return
+
+    raw_query = (query.data or "").removeprefix("srch~back~").strip()
+    if not raw_query:
+        return
+
+    prefs = await governance_repository.get_user_preferences(current_user.telegram_id)
+    scope = prefs.search_scope or "global"
+    result = await album_search_service.search(query=raw_query, scope=scope)
+
+    web_url = settings.web_app_url.strip() if settings and settings.web_app_url else None
+    card = format_search_results_card(result)
+    markup = build_search_results_keyboard(result, web_app_url=web_url)
+    await safe_edit_text(query.message, card, reply_markup=markup)

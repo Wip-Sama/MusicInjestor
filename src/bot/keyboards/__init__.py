@@ -73,6 +73,7 @@ from src.bot.keyboards.verification import (
     build_job_input_cancel_keyboard,
     build_job_lyrics_prompt_keyboard,
     build_manual_search_keyboard,
+    build_upgrade_confirmation_keyboard,
     build_verification_keyboard,
 )
 
@@ -143,5 +144,6 @@ __all__ = [
     "build_user_detail_keyboard",
     "build_user_list_keyboard",
     "build_verification_keyboard",
+    "build_upgrade_confirmation_keyboard",
     "format_toggle_label",
 ]

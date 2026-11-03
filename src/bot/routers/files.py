@@ -18,7 +18,10 @@ from src.bot.keyboards.admin import (
     build_batch_queued_keyboard,
     build_queued_job_keyboard,
 )
-from src.bot.keyboards.verification import build_verification_keyboard
+from src.bot.keyboards.verification import (
+    build_upgrade_confirmation_keyboard,
+    build_verification_keyboard,
+)
 from src.bot.states import IngestionStates
 from src.bot.ui import format_screen, safe_answer, safe_edit_text
 from src.config.settings import AppSettings
@@ -120,12 +123,34 @@ def render_job_stage_progress(job: IngestionJob) -> str:
 def format_ingestion_summary(result: IngestionResult) -> str:
     """Format a user-facing 3-tier Telegram HTML message summarizing an IngestionResult."""
     if result.duplicate is not None and result.duplicate.is_duplicate:
+        if result.duplicate.is_upgrade:
+            curr_q = (
+                result.duplicate.existing_quality.summary if result.duplicate.existing_quality else "Standard"
+            )
+            new_q = result.duplicate.new_quality.summary if result.duplicate.new_quality else "Higher Quality"
+            return format_screen(
+                title="✨ Quality Upgrade Available!",
+                context_lines=[
+                    "A higher-quality version of this song was detected in your upload:",
+                    f"• <b>Current in Library:</b> <code>{html.escape(curr_q)}</code>",
+                    f"• <b>Incoming Audio:</b> <code>{html.escape(new_q)}</code>",
+                    "",
+                    "Would you like to replace the existing file in your library "
+                    "with this higher-quality audio?",
+                ],
+                footer_lines=[f"<i>Job ID:</i> <code>{html.escape(result.job.job_id)}</code>"],
+            )
+
         reason = html.escape(result.duplicate.match_reason or "duplicate")
+        details = [f"Existing file: <code>{html.escape(str(result.duplicate.existing_path))}</code>"]
+        if result.duplicate.existing_quality and result.duplicate.new_quality:
+            details.append(
+                f"Quality: <code>{html.escape(result.duplicate.new_quality.summary)}</code> "
+                f"(Library has <code>{html.escape(result.duplicate.existing_quality.summary)}</code>)"
+            )
         return format_screen(
             title=f"⚠️ Duplicate Rejected ({reason})",
-            context_lines=[
-                f"Existing file: <code>{html.escape(str(result.duplicate.existing_path))}</code>",
-            ],
+            context_lines=details,
             footer_lines=[f"<i>Job ID:</i> <code>{html.escape(result.job.job_id)}</code>"],
         )
 
@@ -326,11 +351,16 @@ async def _dispatch_pipeline_result(
         if state is not None:
             await state.set_state(IngestionStates.awaiting_confirmation)
             await state.update_data(job_id=result.job.job_id)
+        reply_kb = (
+            build_upgrade_confirmation_keyboard(result.job.job_id)
+            if result.duplicate is not None and result.duplicate.is_upgrade
+            else build_verification_keyboard(result.job.job_id, result.job.candidates)
+        )
         await _edit_or_answer(
             message=message,
             status_message=status_message,
             text=summary,
-            reply_markup=build_verification_keyboard(result.job.job_id, result.job.candidates),
+            reply_markup=reply_kb,
         )
         return
 

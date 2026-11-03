@@ -12,8 +12,10 @@ import {
   Edit3,
   Link as LinkIcon,
   Loader2,
+  Sparkles,
+  RefreshCw,
 } from 'lucide-react';
-import { setJobReleaseLink } from '../../lib/queueApi';
+import { ignoreUpgrade, setJobReleaseLink, upgradeJob } from '../../lib/queueApi';
 import { QueueJob, CandidateItem } from '../../types/queue';
 import { UserProfile, canResolveOthersJobs } from '../../lib/auth';
 import { StageVisualizer } from './StageVisualizer';
@@ -115,7 +117,11 @@ export const JobCard: React.FC<JobCardProps> = ({
   let badgeBg = 'var(--tg-theme-secondary-bg-color, #2c2c2e)';
   let badgeColor = 'var(--tg-theme-subtitle-text-color, #8e8e93)';
 
-  if (isQueued) {
+  if (job.is_upgrade) {
+    badgeText = '✨ Upgrade Available';
+    badgeBg = 'rgba(48, 209, 88, 0.2)';
+    badgeColor = '#30d158';
+  } else if (isQueued) {
     badgeText = job.queue_position > 0 ? `Queued #${job.queue_position}` : 'Queued';
     badgeBg = 'rgba(10, 132, 255, 0.15)';
     badgeColor = 'var(--tg-theme-button-color, #0a84ff)';
@@ -376,6 +382,79 @@ export const JobCard: React.FC<JobCardProps> = ({
           <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {job.final_path || 'Successfully filed to library.'}
           </span>
+        </div>
+      )}
+
+      {/* Quality Upgrade Banner */}
+      {job.is_upgrade && (
+        <div
+          style={{
+            backgroundColor: 'rgba(48, 209, 88, 0.12)',
+            border: '1px solid rgba(48, 209, 88, 0.3)',
+            borderRadius: '8px',
+            padding: '10px 12px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '8px',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#30d158', fontSize: '13px', fontWeight: 600 }}>
+            <Sparkles size={16} />
+            <span>Quality Upgrade Available</span>
+          </div>
+          <div style={{ fontSize: '12px', color: 'var(--tg-theme-text-color, #fff)' }}>
+            This uploaded track has higher audio quality than the version currently in your library:
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px' }}>
+            <span style={{ color: 'var(--tg-theme-subtitle-text-color, #8e8e93)' }}>
+              Current: <code>{job.existing_quality || 'Standard'}</code>
+            </span>
+            <span style={{ color: '#30d158' }}>➔</span>
+            <span style={{ color: '#30d158', fontWeight: 600 }}>
+              Upgrade: <code>{job.new_quality || 'Higher Quality'}</code>
+            </span>
+          </div>
+          {canControl && (
+            <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
+              <button
+                type="button"
+                onClick={() => handleAction(async (id) => { await upgradeJob(id); })}
+                disabled={actionLoading}
+                style={{
+                  backgroundColor: '#30d158',
+                  color: '#fff',
+                  border: 'none',
+                  borderRadius: '6px',
+                  padding: '6px 12px',
+                  fontSize: '12px',
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '5px',
+                }}
+              >
+                <RefreshCw size={12} />
+                <span>Replace with Higher Quality</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleAction(async (id) => { await ignoreUpgrade(id); })}
+                disabled={actionLoading}
+                style={{
+                  backgroundColor: 'rgba(255, 255, 255, 0.08)',
+                  color: 'var(--tg-theme-subtitle-text-color, #8e8e93)',
+                  border: 'none',
+                  borderRadius: '6px',
+                  padding: '6px 10px',
+                  fontSize: '12px',
+                  cursor: 'pointer',
+                }}
+              >
+                Keep Existing
+              </button>
+            </div>
+          )}
         </div>
       )}
 
