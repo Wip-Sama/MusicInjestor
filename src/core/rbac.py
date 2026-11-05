@@ -34,6 +34,7 @@ ROLE_PERMISSIONS: dict[UserRole, frozenset[Permission]] = {
             Permission.LINK_OIDC,
             Permission.SUBMIT_ACCESS_REQUEST,
             Permission.VIEW_CATALOG,
+            Permission.REQUEST_SONG,
         }
     ),
     UserRole.UPLOADER: frozenset(
@@ -45,6 +46,7 @@ ROLE_PERMISSIONS: dict[UserRole, frozenset[Permission]] = {
             Permission.VIEW_OWN_JOBS,
             Permission.RESOLVE_OWN_DISAMBIGUATION,
             Permission.REQUEST_TAG_CORRECTION,
+            Permission.REQUEST_SONG,
         }
     ),
     UserRole.MODERATOR: frozenset(
@@ -59,6 +61,8 @@ ROLE_PERMISSIONS: dict[UserRole, frozenset[Permission]] = {
             Permission.VIEW_GLOBAL_QUEUE,
             Permission.RESOLVE_OTHERS_JOBS,
             Permission.APPROVE_TAG_CORRECTIONS,
+            Permission.REQUEST_SONG,
+            Permission.APPROVE_SONG_REQUEST,
         }
     ),
     UserRole.ADMIN: frozenset(
@@ -76,6 +80,9 @@ ROLE_PERMISSIONS: dict[UserRole, frozenset[Permission]] = {
             Permission.MANAGE_USERS,
             Permission.REVIEW_AUDIT_LOGS,
             Permission.CHANGE_CONCURRENCY_LIMIT,
+            Permission.REQUEST_SONG,
+            Permission.APPROVE_SONG_REQUEST,
+            Permission.MANAGE_PROVIDERS,
         }
     ),
     UserRole.OWNER: frozenset(
@@ -94,6 +101,9 @@ ROLE_PERMISSIONS: dict[UserRole, frozenset[Permission]] = {
             Permission.REVIEW_AUDIT_LOGS,
             Permission.CHANGE_CONCURRENCY_LIMIT,
             Permission.SYSTEM_DESTRUCTIVE_WIPE,
+            Permission.REQUEST_SONG,
+            Permission.APPROVE_SONG_REQUEST,
+            Permission.MANAGE_PROVIDERS,
         }
     ),
 }

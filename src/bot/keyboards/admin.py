@@ -74,6 +74,13 @@ class AccessReqApproveCallback(CallbackData, prefix="access_req"):
     role: str
 
 
+class SongReqApprovalCallback(CallbackData, prefix="song_req"):
+    """Callback schema for song acquisition request moderation (`song_req:<action>:<request_id>`)."""
+
+    action: str  # "approve" | "deny"
+    request_id: int
+
+
 class QueueActionCallback(CallbackData, prefix="queue"):
     """Callback schema for viewing personal or global queue (`queue:<action>`)."""
 
@@ -404,6 +411,28 @@ def build_access_request_approval_keyboard(request_id: int) -> InlineKeyboardMar
         InlineKeyboardButton(
             text="❌ Deny",
             callback_data=AccessReqDenyCallback(request_id=request_id).pack(),
+        ),
+    )
+    return builder.as_markup()
+
+
+def build_song_request_approval_keyboard(request_id: int) -> InlineKeyboardMarkup:
+    """Create the Admin Log Channel inline keyboard for approving or denying a song acquisition request."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="✅ Approve & Provision",
+            callback_data=SongReqApprovalCallback(
+                action="approve",
+                request_id=request_id,
+            ).pack(),
+        ),
+        InlineKeyboardButton(
+            text="❌ Reject",
+            callback_data=SongReqApprovalCallback(
+                action="deny",
+                request_id=request_id,
+            ).pack(),
         ),
     )
     return builder.as_markup()

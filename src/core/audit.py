@@ -8,6 +8,8 @@ from src.core.models import (
     AccessRequestRecord,
     IngestionJob,
     JobState,
+    SongRequestRecord,
+    SongRequestStatus,
     TrackMetadata,
     UserAccount,
     UserRole,
@@ -341,4 +343,43 @@ def format_user_detail_card(
         f"{changes_line}"
         "</blockquote>\n"
         f"<i>User ID:</i> <code>{user.telegram_id}</code> • <i>🧭 Home › Admin › Users › Detail</i>"
+    )
+
+
+def format_song_request_card(request: SongRequestRecord, user: UserAccount) -> str:
+    """Format the Admin Log Channel card for a new song acquisition request."""
+    ts = _format_utc_timestamp(request.created_at, include_seconds=False)
+    album_line = f"\n• Album: <code>{html.escape(request.album_name)}</code>" if request.album_name else ""
+    return (
+        f"<b>📥 Song Acquisition Request #{request.id}</b>\n"
+        "<blockquote>"
+        f"• User: {html.escape(user.mention_handle)} (ID: <code>{user.telegram_id}</code>)\n"
+        f"• Title: <b>{html.escape(request.track_title)}</b>\n"
+        f"• Artist: <code>{html.escape(request.artist_name)}</code>"
+        f"{album_line}\n"
+        f"• Type: <code>{request.request_type.value}</code>"
+        "</blockquote>\n"
+        f"<i>Timestamp: {ts}</i>"
+    )
+
+
+def format_song_request_resolved_event(
+    request: SongRequestRecord,
+    reviewer: UserAccount,
+    status: SongRequestStatus,
+    timestamp: datetime | None = None,
+) -> str:
+    """Format song request resolution audit event."""
+    ts = _format_utc_timestamp(timestamp)
+    status_emoji = "✅ APPROVED" if status == SongRequestStatus.APPROVED else "❌ REJECTED"
+    return (
+        f"<b>📥 SONG REQUEST: {status_emoji}</b>\n"
+        "<blockquote>"
+        f"• Request ID: <code>#{request.id}</code>\n"
+        f"• Title: <b>{html.escape(request.track_title)}</b> — "
+        f"<code>{html.escape(request.artist_name)}</code>\n"
+        f"• Reviewed By: {html.escape(reviewer.mention_handle)} (ID: <code>{reviewer.telegram_id}</code>)\n"
+        f"• Status: <code>{status.value}</code>"
+        "</blockquote>\n"
+        f"<i>Timestamp: {ts}</i>"
     )

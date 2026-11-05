@@ -12,6 +12,30 @@
 
 ## Completed Milestones
 
+### M44: External Music Provider Server Architecture, Cascading Quality Resolution, Song Request RBAC Lifecycle, & Instant Audio Streaming
+- **External Music Provider Server Specification & Reference Implementation (docs/MUSIC_PROVIDER_API.md):**
+  - Designed and authored comprehensive REST/OpenAPI contract for external music provider servers (GET /api/v1/capabilities, GET /api/v1/health, GET /api/v1/resolve/track, GET /api/v1/resolve/album, POST /api/v1/provision, GET /api/v1/jobs/{job_id}, DELETE /api/v1/jobs/{job_id}, GET /api/v1/stream/{provider_track_id}).
+  - Documented handshake parameters, supported sources (isrc, spotify, apple_music, deezer, qobuz, 	idal, youtube, musicbrainz), audio quality profiles (bit depth, sample rate, bitrate, formats), and synchronous vs asynchronous webhook/polling delivery.
+  - Provided ~120-line standalone production-grade FastAPI reference provider server implementation and Docker Compose integration snippet for local deployment.
+- **Provider Core Client & Multi-Provider Quality-Ranked Cascading (src/core/provider.py, src/core/models.py, src/core/ports.py, src/core/exceptions.py):**
+  - Implemented HttpMusicProviderClient satisfying MusicProviderPort with automatic auth bearer tokens, capability negotiation, track/album resolution, instant/queued provisioning, and audio stream proxying.
+  - Implemented MultiProviderService managing active providers registered in configuration or database, performing parallel/cascading resolution across multiple providers with ranking by highest audio quality (
+ank_quality: bit depth -> sample rate -> bitrate -> lossless) and server priority.
+  - Added secure streaming download helper download_file_with_checksum with streaming SHA-256 integrity validation.
+- **Song Request RBAC & Moderation Lifecycle (src/core/rbac.py, src/core/models.py, src/core/audit.py, src/bot/notifier.py):**
+  - Added Permission.REQUEST_SONG, APPROVE_SONG_REQUEST, and MANAGE_PROVIDERS to the 5-tier RBAC matrix.
+  - LISTENER tier (rank >= 1) can submit song requests which enter PENDING_APPROVAL, automatically dispatching an interactive moderation card to the Telegram Admin Log Channel with [ ✅ Approve & Provision ] and [ ❌ Reject ] inline buttons.
+  - UPLOADER tier (rank >= 2) auto-approves requests, queuing acquisition immediately without requiring moderator intervention.
+  - MODERATOR tier (rank >= 3) can review, approve, or reject pending requests, logging audit trail records (send_song_request_resolved_audit).
+- **Database Persistence Layer (src/db/models.py, src/db/repository.py):**
+  - Created SQLite tables and indexes provider_servers and song_requests with WAL mode persistence.
+  - Extended GovernanceRepositoryPort and SqliteCatalogRepository with full CRUD, filtering, prioritization, and health timestamp tracking for providers and song requests.
+- **Telegram Bot & WebApp Server Integration (src/bot/routers/search.py, src/bot/routers/admin.py, src/bot/keyboards/admin.py, src/bot/keyboards/search.py, src/bot/webapp_server.py, src/config/settings.py, main.py):**
+  - Added 📥 Request / Download Track inline button to Telegram /search 30-second audio preview cards.
+  - Added interactive moderation callback handler handle_song_request_approval in src/bot/routers/admin.py with in-place card updates.
+  - Added WebApp REST endpoints for song requests (POST /api/v1/app/requests, GET /api/v1/app/requests/me, GET /api/v1/app/requests/pending, POST /api/v1/app/requests/{request_id}/resolve), provider management (GET/POST/DELETE /api/v1/app/admin/providers, POST /api/v1/app/admin/providers/{provider_id}/test), provider stream proxy (GET /api/v1/app/stream/provider/{provider_id}/{provider_track_id}), and async provision callback webhook (POST /api/v1/webhooks/provision-complete).
+  - Added environment configurations DEFAULT_MUSIC_PROVIDER_URL, DEFAULT_MUSIC_PROVIDER_TOKEN, DEFAULT_MUSIC_PROVIDER_NAME, DEFAULT_MUSIC_PROVIDER_PRIORITY, AUTO_PROVISION_UPLOADER_REQUESTS, and PROVISION_DOWNLOAD_TIMEOUT_SECONDS with auto-handshake on startup in main.py.
+
 ### M43: Streaming Platform Links in Song Search Previews & Quality-Aware Song Upgrades
 - **External Streaming Platform Links in Song Search Previews (`src/bot/keyboards/search.py`, `src/bot/routers/search.py`, `webapp/src/components/catalog/AlbumGapModal.tsx`, `webapp/src/types/music.ts`):**
   - Added external streaming links (Deezer, Spotify, Tidal, Apple Music, Qobuz) to 30-second audio preview deliveries in Telegram song search.

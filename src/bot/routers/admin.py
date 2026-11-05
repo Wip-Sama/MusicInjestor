@@ -17,6 +17,7 @@ from src.bot.keyboards.admin import (
     RESERVED_MENU_BUTTONS,
     AdminActionCallback,
     MenuCallback,
+    SongReqApprovalCallback,
     append_escape_row,
     build_admin_dashboard_keyboard,
     build_admin_subscreen_keyboard,
@@ -70,7 +71,8 @@ from src.core.models import (
 from src.core.oidc import AuthentikOidcService
 from src.core.organizer import LibraryOrganizer
 from src.core.pipeline import IngestionPipeline
-from src.core.ports import CatalogRepositoryPort, GovernanceRepositoryPort
+from src.core.ports import AdminLogNotifierPort, CatalogRepositoryPort, GovernanceRepositoryPort
+from src.core.provider import MultiProviderService
 from src.core.queue import IngestionQueueWorker
 from src.core.rbac import GovernanceService, has_permission
 
@@ -1943,3 +1945,51 @@ async def handle_queue_cancel_callback(
         ),
         reply_markup=build_back_to_home_keyboard(back_callback=back_cb),
     )
+
+
+@admin_router.callback_query(SongReqApprovalCallback.filter())
+async def handle_song_request_approval(
+    callback: CallbackQuery,
+    callback_data: SongReqApprovalCallback,
+    current_user: UserAccount | None = None,
+    governance_repository: GovernanceRepositoryPort | None = None,
+    notifier: AdminLogNotifierPort | None = None,
+) -> None:
+    """Handle Moderator/Admin approval or rejection of a song acquisition request."""
+    if callback.message is None or current_user is None or governance_repository is None:
+        await ack_callback(callback, "Action unavailable.", show_alert=True)
+        return
+
+    if not has_permission(current_user, Permission.APPROVE_SONG_REQUEST):
+        await ack_callback(
+            callback,
+            "🔒 Access Denied: You must be at least a MODERATOR to review song requests.",
+            show_alert=True,
+        )
+        return
+
+    provider_service = MultiProviderService(repository=governance_repository, notifier=notifier)
+    is_approved = callback_data.action == "approve"
+
+    try:
+        updated = await provider_service.resolve_song_request_by_moderator(
+            request_id=callback_data.request_id,
+            reviewer=current_user,
+            approved=is_approved,
+        )
+        if updated is None:
+            await ack_callback(callback, "Request not found.", show_alert=True)
+            return
+
+        status_text = "✅ Approved & Provisioning Triggered" if is_approved else "❌ Rejected"
+        await ack_callback(callback, f"Request #{callback_data.request_id} {status_text}.")
+        reviewer_text = html.escape(current_user.mention_handle)
+        existing_text = callback.message.html_text if isinstance(callback.message, Message) else ""
+        await safe_edit_text(
+            callback.message,
+            f"{existing_text}\n\n<b>Decision:</b> <code>{status_text}</code> by {reviewer_text}",
+            reply_markup=None,
+        )
+    except Exception as exc:
+        logger.error("Error resolving song request #%d: %s", callback_data.request_id, exc)
+        await ack_callback(callback, f"Error: {exc}", show_alert=True)

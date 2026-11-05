@@ -26,7 +26,12 @@ from src.core.models import (
     JobState,
     LibraryTrackRecord,
     MetadataCandidate,
+    ProviderCapabilities,
+    ProviderServerRecord,
     ReleaseNotification,
+    SongRequestRecord,
+    SongRequestStatus,
+    SongRequestType,
     SourceType,
     TagCorrectionRequest,
     TagCorrectionStatus,
@@ -35,6 +40,7 @@ from src.core.models import (
     UserPreferences,
     UserRole,
 )
+from src.core.provider import _parse_audio_profiles, _parse_provider_features
 from src.db.database import SqliteDatabaseManager
 
 
@@ -2194,6 +2200,278 @@ class SqliteCatalogRepository:
             await conn.commit()
             return bool(cur.rowcount and cur.rowcount > 0)
 
+    async def upsert_provider_server(self, server: ProviderServerRecord) -> ProviderServerRecord:
+        """Insert or update a registered external music provider server."""
+        caps_json = "{}"
+        if server.capabilities:
+            caps_json = json.dumps(asdict(server.capabilities))
+
+        async with self._db.connect() as conn:
+            await conn.execute(
+                """
+                INSERT INTO provider_servers (
+                    id, name, base_url, api_token_encrypted, priority,
+                    is_enabled, capabilities_json, last_health_status,
+                    last_health_checked_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    base_url = excluded.base_url,
+                    api_token_encrypted = excluded.api_token_encrypted,
+                    priority = excluded.priority,
+                    is_enabled = excluded.is_enabled,
+                    capabilities_json = excluded.capabilities_json,
+                    last_health_status = excluded.last_health_status,
+                    last_health_checked_at = excluded.last_health_checked_at
+                """,
+                (
+                    server.id,
+                    server.name,
+                    server.base_url,
+                    server.api_token_encrypted,
+                    server.priority,
+                    1 if server.is_enabled else 0,
+                    caps_json,
+                    server.last_health_status,
+                    server.last_health_checked_at.isoformat() if server.last_health_checked_at else None,
+                    server.created_at.isoformat(),
+                ),
+            )
+            await conn.commit()
+        return server
+
+    async def get_provider_server(self, server_id: str) -> ProviderServerRecord | None:
+        """Retrieve a registered provider server by ID."""
+        async with (
+            self._db.connect() as conn,
+            conn.execute(
+                """
+            SELECT id, name, base_url, api_token_encrypted, priority,
+                   is_enabled, capabilities_json, last_health_status,
+                   last_health_checked_at, created_at
+            FROM provider_servers
+            WHERE id = ?
+            """,
+                (server_id,),
+            ) as cur,
+        ):
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            return _row_to_provider_server(row)
+
+    async def list_provider_servers(self, enabled_only: bool = False) -> list[ProviderServerRecord]:
+        """List registered provider servers ordered by priority ascending."""
+        query = (
+            "SELECT id, name, base_url, api_token_encrypted, priority, "
+            "is_enabled, capabilities_json, last_health_status, "
+            "last_health_checked_at, created_at "
+            "FROM provider_servers "
+        )
+        if enabled_only:
+            query += "WHERE is_enabled = 1 "
+        query += "ORDER BY priority ASC, name ASC"
+
+        async with self._db.connect() as conn, conn.execute(query) as cur:
+            rows = await cur.fetchall()
+            return [_row_to_provider_server(r) for r in rows]
+
+    async def delete_provider_server(self, server_id: str) -> bool:
+        """Delete a registered provider server by ID."""
+        async with self._db.connect() as conn:
+            cur = await conn.execute(
+                "DELETE FROM provider_servers WHERE id = ?",
+                (server_id,),
+            )
+            await conn.commit()
+            return bool(cur.rowcount and cur.rowcount > 0)
+
+    async def create_song_request(self, request: SongRequestRecord) -> SongRequestRecord:
+        """Persist a new song or album acquisition request."""
+        identifiers_json = json.dumps(request.identifiers) if request.identifiers else "{}"
+        async with self._db.connect() as conn:
+            cur = await conn.execute(
+                """
+                INSERT INTO song_requests (
+                    telegram_id, request_type, track_title, artist_name,
+                    album_name, identifiers_json, target_quality, provider_id,
+                    provider_track_id, status, reviewed_by, reviewed_at,
+                    rejection_reason, job_id, library_track_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request.telegram_id,
+                    request.request_type.value,
+                    request.track_title,
+                    request.artist_name,
+                    request.album_name,
+                    identifiers_json,
+                    request.target_quality,
+                    request.provider_id,
+                    request.provider_track_id,
+                    request.status.value,
+                    request.reviewed_by,
+                    request.reviewed_at.isoformat() if request.reviewed_at else None,
+                    request.rejection_reason,
+                    request.job_id,
+                    request.library_track_id,
+                    request.created_at.isoformat(),
+                    request.updated_at.isoformat(),
+                ),
+            )
+            await conn.commit()
+            new_id = int(str(cur.lastrowid))
+
+        return SongRequestRecord(
+            id=new_id,
+            telegram_id=request.telegram_id,
+            request_type=request.request_type,
+            track_title=request.track_title,
+            artist_name=request.artist_name,
+            album_name=request.album_name,
+            identifiers=request.identifiers,
+            target_quality=request.target_quality,
+            provider_id=request.provider_id,
+            provider_track_id=request.provider_track_id,
+            status=request.status,
+            reviewed_by=request.reviewed_by,
+            reviewed_at=request.reviewed_at,
+            rejection_reason=request.rejection_reason,
+            job_id=request.job_id,
+            library_track_id=request.library_track_id,
+            created_at=request.created_at,
+            updated_at=request.updated_at,
+        )
+
+    async def get_song_request(self, request_id: int) -> SongRequestRecord | None:
+        """Retrieve a song acquisition request by ID."""
+        async with (
+            self._db.connect() as conn,
+            conn.execute(
+                """
+            SELECT id, telegram_id, request_type, track_title, artist_name,
+                   album_name, identifiers_json, target_quality, provider_id,
+                   provider_track_id, status, reviewed_by, reviewed_at,
+                   rejection_reason, job_id, library_track_id, created_at, updated_at
+            FROM song_requests
+            WHERE id = ?
+            """,
+                (request_id,),
+            ) as cur,
+        ):
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            return _row_to_song_request(row)
+
+    async def list_song_requests(
+        self,
+        status: SongRequestStatus | None = None,
+        telegram_id: int | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[SongRequestRecord]:
+        """List song acquisition requests with optional status and user filtering."""
+        query = (
+            "SELECT id, telegram_id, request_type, track_title, artist_name, "
+            "album_name, identifiers_json, target_quality, provider_id, "
+            "provider_track_id, status, reviewed_by, reviewed_at, "
+            "rejection_reason, job_id, library_track_id, created_at, updated_at "
+            "FROM song_requests WHERE 1=1 "
+        )
+        params: list[object] = []
+        if status is not None:
+            query += "AND status = ? "
+            params.append(status.value)
+        if telegram_id is not None:
+            query += "AND telegram_id = ? "
+            params.append(telegram_id)
+
+        query += "ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+        async with self._db.connect() as conn, conn.execute(query, tuple(params)) as cur:
+            rows = await cur.fetchall()
+            return [_row_to_song_request(r) for r in rows]
+
+    async def count_song_requests(
+        self,
+        status: SongRequestStatus | None = None,
+        telegram_id: int | None = None,
+    ) -> int:
+        """Count song acquisition requests with optional status and user filtering."""
+        query = "SELECT COUNT(*) FROM song_requests WHERE 1=1 "
+        params: list[object] = []
+        if status is not None:
+            query += "AND status = ? "
+            params.append(status.value)
+        if telegram_id is not None:
+            query += "AND telegram_id = ? "
+            params.append(telegram_id)
+
+        async with self._db.connect() as conn, conn.execute(query, tuple(params)) as cur:
+            row = await cur.fetchone()
+            return int(str(row[0])) if row else 0
+
+    async def resolve_song_request(
+        self,
+        request_id: int,
+        status: SongRequestStatus,
+        reviewed_by: int,
+        rejection_reason: str = "",
+        job_id: str | None = None,
+        library_track_id: str | None = None,
+    ) -> SongRequestRecord | None:
+        """Update review status, reviewer, and optional job/track links for a request."""
+        async with self._db.connect() as conn:
+            await conn.execute(
+                """
+                UPDATE song_requests
+                SET status = ?,
+                    reviewed_by = ?,
+                    reviewed_at = CURRENT_TIMESTAMP,
+                    rejection_reason = ?,
+                    job_id = COALESCE(?, job_id),
+                    library_track_id = COALESCE(?, library_track_id),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    status.value,
+                    reviewed_by,
+                    rejection_reason,
+                    job_id,
+                    library_track_id,
+                    request_id,
+                ),
+            )
+            await conn.commit()
+        return await self.get_song_request(request_id)
+
+    async def update_song_request_job_and_track(
+        self,
+        request_id: int,
+        job_id: str | None = None,
+        library_track_id: str | None = None,
+        status: SongRequestStatus | None = None,
+    ) -> SongRequestRecord | None:
+        """Update provisioning job ID, final library track ID, and status for a request."""
+        status_val = status.value if status is not None else None
+        async with self._db.connect() as conn:
+            await conn.execute(
+                """
+                UPDATE song_requests
+                SET job_id = COALESCE(?, job_id),
+                    library_track_id = COALESCE(?, library_track_id),
+                    status = COALESCE(?, status),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (job_id, library_track_id, status_val, request_id),
+            )
+            await conn.commit()
+        return await self.get_song_request(request_id)
+
 
 _LIBRARY_TRACK_COLUMNS = (
     "id, job_id, uploaded_by, storage_path, fingerprint, "
@@ -2293,4 +2571,69 @@ def _row_to_discovered_release(row: Sequence[object]) -> DiscoveredRelease:
         in_library=bool(int(str(row[11]))),
         created_at=_parse_iso_datetime(row[12]) or datetime.now(UTC),
         library_track_id=str(row[13]) if len(row) > 13 and row[13] is not None else None,
+    )
+
+
+def _row_to_provider_server(row: Sequence[object]) -> ProviderServerRecord:
+    """Map a `provider_servers` table row into a `ProviderServerRecord`."""
+    caps: ProviderCapabilities | None = None
+    if row[6]:
+        try:
+            data = json.loads(str(row[6]))
+            sources_raw = data.get("supported_sources") or ()
+            sources = tuple(str(s).lower() for s in sources_raw)
+            caps = ProviderCapabilities(
+                provider_name=str(data.get("provider_name") or ""),
+                version=str(data.get("version") or ""),
+                supported_sources=sources,
+                audio_profiles=_parse_audio_profiles(data),
+                features=_parse_provider_features(data),
+            )
+        except Exception:
+            caps = None
+
+    return ProviderServerRecord(
+        id=str(row[0]),
+        name=str(row[1]),
+        base_url=str(row[2]),
+        api_token_encrypted=str(row[3]) if row[3] is not None else None,
+        priority=int(str(row[4])),
+        is_enabled=bool(int(str(row[5]))),
+        capabilities=caps,
+        last_health_status=str(row[7]) if row[7] is not None else "unknown",
+        last_health_checked_at=_parse_iso_datetime(row[8]),
+        created_at=_parse_iso_datetime(row[9]) or datetime.now(UTC),
+    )
+
+
+def _row_to_song_request(row: Sequence[object]) -> SongRequestRecord:
+    """Map a `song_requests` table row into a `SongRequestRecord`."""
+    identifiers: dict[str, str] = {}
+    if row[6]:
+        try:
+            raw = json.loads(str(row[6]))
+            if isinstance(raw, dict):
+                identifiers = {str(k): str(v) for k, v in raw.items()}
+        except Exception:
+            identifiers = {}
+
+    return SongRequestRecord(
+        id=int(str(row[0])),
+        telegram_id=int(str(row[1])),
+        request_type=SongRequestType(str(row[2])),
+        track_title=str(row[3]),
+        artist_name=str(row[4]),
+        album_name=str(row[5]) if row[5] is not None else "",
+        identifiers=identifiers,
+        target_quality=str(row[7]) if row[7] is not None else None,
+        provider_id=str(row[8]) if row[8] is not None else None,
+        provider_track_id=str(row[9]) if row[9] is not None else None,
+        status=SongRequestStatus(str(row[10])),
+        reviewed_by=int(str(row[11])) if row[11] is not None else None,
+        reviewed_at=_parse_iso_datetime(row[12]),
+        rejection_reason=str(row[13]) if row[13] is not None else "",
+        job_id=str(row[14]) if row[14] is not None else None,
+        library_track_id=str(row[15]) if row[15] is not None else None,
+        created_at=_parse_iso_datetime(row[16]) or datetime.now(UTC),
+        updated_at=_parse_iso_datetime(row[17]) or datetime.now(UTC),
     )

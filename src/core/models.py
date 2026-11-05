@@ -54,6 +54,9 @@ class Permission(StrEnum):
     REVIEW_AUDIT_LOGS = "REVIEW_AUDIT_LOGS"
     CHANGE_CONCURRENCY_LIMIT = "CHANGE_CONCURRENCY_LIMIT"
     SYSTEM_DESTRUCTIVE_WIPE = "SYSTEM_DESTRUCTIVE_WIPE"
+    REQUEST_SONG = "REQUEST_SONG"
+    APPROVE_SONG_REQUEST = "APPROVE_SONG_REQUEST"
+    MANAGE_PROVIDERS = "MANAGE_PROVIDERS"
 
 
 class AccessRequestStatus(StrEnum):
@@ -70,6 +73,24 @@ class TagCorrectionStatus(StrEnum):
     PENDING = "PENDING"
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
+
+
+class SongRequestStatus(StrEnum):
+    """Lifecycle states of a song/album acquisition request."""
+
+    PENDING_APPROVAL = "PENDING_APPROVAL"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    PROVISIONING = "PROVISIONING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
+class SongRequestType(StrEnum):
+    """Target item type for a song acquisition request."""
+
+    TRACK = "TRACK"
+    ALBUM = "ALBUM"
 
 
 class SourceType(StrEnum):
@@ -104,6 +125,13 @@ class AuditAction(StrEnum):
     JOB_PAUSED = "JOB_PAUSED"
     JOB_UNLOCKED = "JOB_UNLOCKED"
     BULK_METADATA_ENRICHED = "BULK_METADATA_ENRICHED"
+    SONG_REQUESTED = "SONG_REQUESTED"
+    SONG_REQUEST_APPROVED = "SONG_REQUEST_APPROVED"
+    SONG_REQUEST_REJECTED = "SONG_REQUEST_REJECTED"
+    SONG_PROVISIONED = "SONG_PROVISIONED"
+    PROVIDER_REGISTERED = "PROVIDER_REGISTERED"
+    PROVIDER_UPDATED = "PROVIDER_UPDATED"
+    PROVIDER_DELETED = "PROVIDER_DELETED"
 
 
 class JobState(StrEnum):
@@ -559,3 +587,186 @@ class UnifiedSearchResult:
     scope: str  # "global" or "library"
     albums: list[SearchResultItem] = field(default_factory=list)
     tracks: list[SearchResultItem] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class SongRequestRecord:
+    """Song or album acquisition request submitted by a user."""
+
+    id: int
+    telegram_id: int
+    request_type: SongRequestType
+    track_title: str
+    artist_name: str
+    album_name: str = ""
+    identifiers: dict[str, str] = field(default_factory=dict)
+    target_quality: str | None = None
+    provider_id: str | None = None
+    provider_track_id: str | None = None
+    status: SongRequestStatus = SongRequestStatus.PENDING_APPROVAL
+    reviewed_by: int | None = None
+    reviewed_at: datetime | None = None
+    rejection_reason: str = ""
+    job_id: str | None = None
+    library_track_id: str | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderAudioProfiles:
+    """Supported audio quality capabilities reported by a provider during handshake."""
+
+    supported_codecs: tuple[str, ...] = ("flac", "mp3")
+    min_bitrate_kbps: int = 128
+    max_bitrate_kbps: int = 9216
+    min_sample_rate_hz: int = 44100
+    max_sample_rate_hz: int = 192000
+    min_bit_depth: int = 16
+    max_bit_depth: int = 24
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderFeatures:
+    """Feature flags advertised by a provider server."""
+
+    streaming: bool = False
+    stream_formats: tuple[str, ...] = ("audio/mpeg",)
+    async_provisioning: bool = True
+    webhooks: bool = False
+    batch_provisioning: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderCapabilities:
+    """Full capabilities payload returned by `GET /api/v1/capabilities`."""
+
+    provider_name: str
+    version: str
+    supported_sources: tuple[str, ...]
+    audio_profiles: ProviderAudioProfiles = field(default_factory=ProviderAudioProfiles)
+    features: ProviderFeatures = field(default_factory=ProviderFeatures)
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderHealth:
+    """Health check outcome returned by `GET /api/v1/health`."""
+
+    status: str
+    version: str = ""
+    upstream_dependencies: dict[str, object] = field(default_factory=dict)
+    active_jobs_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class AvailableAudioQuality:
+    """Specific audio quality tier available for a resolved track."""
+
+    quality_id: str
+    codec: str
+    bit_depth: int = 16
+    sample_rate_hz: int = 44100
+    bitrate_kbps: int = 320
+    approx_file_size_bytes: int = 0
+
+    @property
+    def is_lossless(self) -> bool:
+        """Return True if codec is a lossless format."""
+        return self.codec.lower() in ("flac", "alac", "wav", "aiff")
+
+    @property
+    def display_badge(self) -> str:
+        """Formatted quality badge."""
+        fmt = self.codec.upper()
+        if self.is_lossless:
+            khz = round(self.sample_rate_hz / 1000, 1)
+            khz_str = f"{int(khz)}" if khz.is_integer() else f"{khz}"
+            return f"{fmt} ({self.bit_depth}-bit/{khz_str}kHz)"
+        return f"{fmt} ({self.bitrate_kbps} kbps)"
+
+
+@dataclass(frozen=True, slots=True)
+class TrackResolutionResult:
+    """Outcome of resolving a track against a provider via `POST /api/v1/resolve`."""
+
+    matched: bool
+    provider_track_id: str | None = None
+    matched_source: str | None = None
+    metadata: TrackMetadata | None = None
+    available_qualities: tuple[AvailableAudioQuality, ...] = ()
+    streaming_supported: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class AlbumTrackResolution:
+    """Individual track status within an album resolution result."""
+
+    position: int
+    title: str
+    provider_track_id: str | None = None
+    duration_seconds: int = 0
+    matched: bool = False
+    available_qualities: tuple[AvailableAudioQuality, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class AlbumResolutionResult:
+    """Outcome of resolving an entire album against a provider."""
+
+    matched: bool
+    provider_album_id: str | None = None
+    title: str = ""
+    artist: str = ""
+    total_tracks: int = 0
+    matched_tracks_count: int = 0
+    tracks: tuple[AlbumTrackResolution, ...] = ()
+    available_qualities: tuple[AvailableAudioQuality, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ProvisionResponse:
+    """Immediate response returned from `POST /api/v1/provision`."""
+
+    status: str  # "ready" | "queued" | "downloading" | "failed"
+    download_url: str | None = None
+    job_id: str | None = None
+    poll_url: str | None = None
+    expires_at: str | None = None
+    checksum_sha256: str | None = None
+    file_format: str | None = None
+    file_size_bytes: int = 0
+    sample_rate: int = 44100
+    bit_depth: int = 16
+    bitrate_kbps: int = 0
+    error_message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProvisionJobStatus:
+    """Status payload returned by `GET /api/v1/jobs/{job_id}`."""
+
+    job_id: str
+    status: str  # "queued" | "downloading" | "completed" | "failed"
+    progress_percent: float = 0.0
+    download_url: str | None = None
+    expires_at: str | None = None
+    checksum_sha256: str | None = None
+    file_format: str | None = None
+    file_size_bytes: int = 0
+    error: str | None = None
+
+
+@dataclass(slots=True)
+class ProviderServerRecord:
+    """Persisted external music provider server configuration in SQLite."""
+
+    id: str
+    name: str
+    base_url: str
+    api_token_encrypted: str | None = None
+    priority: int = 10
+    is_enabled: bool = True
+    capabilities: ProviderCapabilities | None = None
+    last_health_status: str = "unknown"
+    last_health_checked_at: datetime | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))

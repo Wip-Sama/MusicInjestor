@@ -6,17 +6,24 @@ from pathlib import Path
 from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup
 
-from src.bot.keyboards.admin import build_access_request_approval_keyboard
+from src.bot.keyboards.admin import (
+    build_access_request_approval_keyboard,
+    build_song_request_approval_keyboard,
+)
 from src.core.audit import (
     format_access_request_card,
     format_duplicate_rejected_event,
     format_ingest_success_event,
     format_oidc_sync_event,
     format_role_updated_event,
+    format_song_request_card,
+    format_song_request_resolved_event,
 )
 from src.core.models import (
     AccessRequestRecord,
     IngestionJob,
+    SongRequestRecord,
+    SongRequestStatus,
     TrackMetadata,
     UserAccount,
     UserRole,
@@ -143,4 +150,24 @@ class TelegramAdminLogNotifier:
             conflict_path=conflict_path,
             match_source=match_source,
         )
+        await self._dispatch(text)
+
+    async def send_song_request_card(
+        self,
+        request: SongRequestRecord,
+        user: UserAccount,
+    ) -> None:
+        """Post an interactive song acquisition request card to the Admin Log Channel."""
+        card = format_song_request_card(request, user)
+        keyboard = build_song_request_approval_keyboard(request.id)
+        await self._dispatch(card, reply_markup=keyboard)
+
+    async def send_song_request_resolved_audit(
+        self,
+        request: SongRequestRecord,
+        reviewer: UserAccount,
+        status: SongRequestStatus,
+    ) -> None:
+        """Post a song request resolution audit to the Admin Log Channel."""
+        text = format_song_request_resolved_event(request, reviewer, status)
         await self._dispatch(text)

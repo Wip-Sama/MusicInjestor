@@ -221,6 +221,14 @@ class AppSettings(BaseModel):
     radar_enabled: bool = Field(default=True)
     radar_sync_interval_seconds: int = Field(default=43200, ge=60)
 
+    # External Music Provider Server settings
+    default_music_provider_url: str = Field(default="")
+    default_music_provider_token: str = Field(default="")
+    default_music_provider_name: str = Field(default="default-provider")
+    default_music_provider_priority: int = Field(default=10, ge=1)
+    auto_provision_uploader_requests: bool = Field(default=True)
+    provision_download_timeout_seconds: float = Field(default=180.0, ge=10.0)
+
     @field_validator("auto_approve_confidence")
     @classmethod
     def validate_confidence_range(cls, value: float) -> float:
@@ -238,6 +246,7 @@ class AppSettings(BaseModel):
         "oidc_userinfo_url",
         "web_app_url",
         "cloudflared_tunnel_url",
+        "default_music_provider_url",
     )
     @classmethod
     def strip_trailing_slash(cls, value: str) -> str:

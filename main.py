@@ -27,9 +27,11 @@ from src.core.extractor import SevenZipArchiveExtractor
 from src.core.fingerprint import ChromaprintFingerprinter
 from src.core.lyrics import LrclibLyricsClient
 from src.core.metadata import MusicBrainzMetadataService
+from src.core.models import ProviderServerRecord
 from src.core.oidc import AuthentikOidcService
 from src.core.organizer import LibraryOrganizer
 from src.core.pipeline import IngestionPipeline
+from src.core.provider import MultiProviderService
 from src.core.queue import IngestionQueueWorker
 from src.core.radar import ReleaseRadarService
 from src.core.rbac import GovernanceService
@@ -354,6 +356,27 @@ async def run_app(settings: AppSettings | None = None) -> None:
     dispatcher["organizer"] = organizer
     dispatcher["radar_service"] = radar_service
     dispatcher["album_search_service"] = album_search_service
+    multi_provider_service = MultiProviderService(repository=repository, notifier=notifier)
+    if resolved_settings.default_music_provider_url.strip():
+        default_server = ProviderServerRecord(
+            id="default-provider",
+            name=resolved_settings.default_music_provider_name,
+            base_url=resolved_settings.default_music_provider_url,
+            api_token_encrypted=resolved_settings.default_music_provider_token or None,
+            priority=resolved_settings.default_music_provider_priority,
+            is_enabled=True,
+        )
+        try:
+            await multi_provider_service.handshake_and_update(default_server)
+            logger.info(
+                "Configured default music provider: %s (%s)",
+                default_server.name,
+                default_server.base_url,
+            )
+        except Exception as exc:
+            logger.warning("Default music provider handshake failed: %s", exc)
+
+    dispatcher["multi_provider_service"] = multi_provider_service
     dispatcher.include_router(build_root_router())
 
     web_server: BotWebServer | None = None
@@ -424,6 +447,7 @@ async def run_app(settings: AppSettings | None = None) -> None:
             album_search_service=album_search_service,
             bot=bot,
             bot_username=bot_username,
+            provider_service=multi_provider_service,
         )
         await web_server.start()
 

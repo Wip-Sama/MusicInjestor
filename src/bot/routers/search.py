@@ -23,11 +23,20 @@ from src.bot.keyboards.search import (
 from src.bot.ui import ack_callback, format_screen, resolve_oidc_url, safe_answer, safe_edit_text
 from src.config.settings import AppSettings
 from src.core.audit import format_guest_access_denied_card
-from src.core.models import AlbumGapAnalysis, UnifiedSearchResult, UserAccount, UserRole
+from src.core.models import (
+    AlbumGapAnalysis,
+    Permission,
+    SongRequestType,
+    UnifiedSearchResult,
+    UserAccount,
+    UserRole,
+)
 from src.core.oidc import AuthentikOidcService
 from src.core.platform_links import build_streaming_platform_links
-from src.core.ports import CatalogRepositoryPort, GovernanceRepositoryPort
+from src.core.ports import AdminLogNotifierPort, CatalogRepositoryPort, GovernanceRepositoryPort
+from src.core.provider import MultiProviderService
 from src.core.radar import ReleaseRadarService
+from src.core.rbac import has_permission
 from src.core.search import AlbumSearchService
 
 logger = logging.getLogger(__name__)
@@ -545,3 +554,69 @@ async def handle_search_back(
     card = format_search_results_card(result)
     markup = build_search_results_keyboard(result, web_app_url=web_url)
     await safe_edit_text(query.message, card, reply_markup=markup)
+
+
+@search_router.callback_query(SearchActionCallback.filter(F.action == "request"))
+async def handle_search_track_request(
+    query: CallbackQuery,
+    callback_data: SearchActionCallback,
+    current_user: UserAccount | None = None,
+    governance_repository: GovernanceRepositoryPort | None = None,
+    notifier: AdminLogNotifierPort | None = None,
+) -> None:
+    """Submit a song acquisition request from audio preview buttons."""
+    if query.message is None or current_user is None or governance_repository is None:
+        await ack_callback(query)
+        return
+
+    if not has_permission(current_user, Permission.REQUEST_SONG):
+        await ack_callback(
+            query,
+            "🔒 Access Denied: You must be at least a LISTENER to request songs.",
+            show_alert=True,
+        )
+        return
+
+    raw_query = callback_data.query.strip()
+    artist = ""
+    title = raw_query
+    if " - " in raw_query:
+        parts = raw_query.split(" - ", maxsplit=1)
+        artist = parts[0].strip()
+        title = parts[1].strip()
+
+    target_id = callback_data.value.strip()
+    identifiers: dict[str, str] = {}
+    if target_id:
+        identifiers["deezer_id"] = target_id
+
+    provider_service = MultiProviderService(repository=governance_repository, notifier=notifier)
+    try:
+        record, is_auto_approved = await provider_service.submit_song_request(
+            user=current_user,
+            request_type=SongRequestType.TRACK,
+            track_title=title or "Unknown Track",
+            artist_name=artist or "Unknown Artist",
+            identifiers=identifiers,
+        )
+        if is_auto_approved:
+            await ack_callback(
+                query,
+                "✅ Track download queued! You will be notified when ready.",
+                show_alert=True,
+            )
+            await query.message.answer(
+                f"⬇️ <b>Provisioning Queued</b>\n"
+                f"Your request for <b>{html.escape(title)}</b> — <code>{html.escape(artist)}</code> "
+                f"has been approved and queued for acquisition from the provider."
+            )
+        else:
+            await ack_callback(query, "📥 Song request submitted for moderator approval.", show_alert=True)
+            await query.message.answer(
+                f"📥 <b>Song Request Submitted (#{record.id})</b>\n"
+                f"Your request for <b>{html.escape(title)}</b> — <code>{html.escape(artist)}</code> "
+                f"has been placed in the moderator review queue. You will receive an alert once reviewed."
+            )
+    except Exception as exc:
+        logger.error("Failed to submit song request from search preview: %s", exc)
+        await ack_callback(query, f"Failed to submit request: {exc}", show_alert=True)

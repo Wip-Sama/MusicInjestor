@@ -204,6 +204,18 @@ def build_search_preview_keyboard(
         )
     builder.row(*extra_row)
 
+    # Row 3: Request / Provision Track
+    builder.row(
+        InlineKeyboardButton(
+            text="📥 Request / Download Track",
+            callback_data=SearchActionCallback(
+                action="request",
+                value=target_id[:20],
+                query=f"{artist} - {title}"[:30],
+            ).pack(),
+        )
+    )
+
     return builder.as_markup()
 
 

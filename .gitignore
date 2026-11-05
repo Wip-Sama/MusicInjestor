@@ -37,3 +37,4 @@ storage/library/*
 webapp/node_modules/
 webapp/dist/
 
+temp/

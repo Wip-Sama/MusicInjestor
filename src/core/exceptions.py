@@ -42,3 +42,19 @@ class QueueConcurrencyError(IngestionError):
 
 class AudioTranscodingError(IngestionError):
     """Raised when on-the-fly server-side audio transcoding fails."""
+
+
+class ProviderError(IngestionError):
+    """Base exception for external music provider server interactions."""
+
+
+class ProviderUnavailableError(ProviderError):
+    """Raised when an external music provider server is unreachable or reports unhealthy status."""
+
+
+class ProviderResolutionError(ProviderError):
+    """Raised when an external music provider server fails to resolve or match track/album metadata."""
+
+
+class ProvisioningFailedError(ProviderError):
+    """Raised when an external music provider fails to download, package, or deliver a requested track."""

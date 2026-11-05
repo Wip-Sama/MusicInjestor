@@ -186,6 +186,44 @@ CREATE TABLE IF NOT EXISTS release_notifications (
 );
 """
 
+CREATE_PROVIDER_SERVERS_TABLE = """
+CREATE TABLE IF NOT EXISTS provider_servers (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    api_token_encrypted TEXT,
+    priority INTEGER NOT NULL DEFAULT 10,
+    is_enabled INTEGER NOT NULL DEFAULT 1,
+    capabilities_json TEXT NOT NULL DEFAULT '{}',
+    last_health_status TEXT NOT NULL DEFAULT 'unknown',
+    last_health_checked_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+CREATE_SONG_REQUESTS_TABLE = """
+CREATE TABLE IF NOT EXISTS song_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_id INTEGER NOT NULL REFERENCES users(telegram_id),
+    request_type TEXT NOT NULL DEFAULT 'TRACK',
+    track_title TEXT NOT NULL,
+    artist_name TEXT NOT NULL,
+    album_name TEXT NOT NULL DEFAULT '',
+    identifiers_json TEXT NOT NULL DEFAULT '{}',
+    target_quality TEXT,
+    provider_id TEXT REFERENCES provider_servers(id),
+    provider_track_id TEXT,
+    status TEXT NOT NULL DEFAULT 'PENDING_APPROVAL',
+    reviewed_by INTEGER REFERENCES users(telegram_id),
+    reviewed_at TIMESTAMP,
+    rejection_reason TEXT NOT NULL DEFAULT '',
+    job_id TEXT,
+    library_track_id TEXT REFERENCES library_tracks(id),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
 CREATE_USERS_ROLE_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
 """
@@ -228,6 +266,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_release_notifications_user_release
 ON release_notifications(telegram_id, release_id);
 """
 
+CREATE_SONG_REQUESTS_STATUS_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_song_requests_status ON song_requests(status);
+"""
+
+CREATE_SONG_REQUESTS_USER_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_song_requests_user ON song_requests(telegram_id);
+"""
+
 TABLE_DDL_STATEMENTS: tuple[str, ...] = (
     CREATE_USERS_TABLE,
     CREATE_ACCESS_REQUESTS_TABLE,
@@ -240,6 +286,8 @@ TABLE_DDL_STATEMENTS: tuple[str, ...] = (
     CREATE_ARTIST_FOLLOWS_TABLE,
     CREATE_DISCOVERED_RELEASES_TABLE,
     CREATE_RELEASE_NOTIFICATIONS_TABLE,
+    CREATE_PROVIDER_SERVERS_TABLE,
+    CREATE_SONG_REQUESTS_TABLE,
 )
 
 INDEX_DDL_STATEMENTS: tuple[str, ...] = (
@@ -252,6 +300,8 @@ INDEX_DDL_STATEMENTS: tuple[str, ...] = (
     CREATE_DISCOVERED_RELEASES_ARTIST_INDEX,
     CREATE_DISCOVERED_RELEASES_DATE_INDEX,
     CREATE_RELEASE_NOTIFICATIONS_INDEX,
+    CREATE_SONG_REQUESTS_STATUS_INDEX,
+    CREATE_SONG_REQUESTS_USER_INDEX,
 )
 
 ALL_SCHEMA_STATEMENTS: tuple[str, ...] = (

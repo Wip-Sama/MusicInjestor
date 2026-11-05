@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlencode
 
+import httpx
 import mutagen
 from aiogram import Bot
 from aiogram.types import FSInputFile
@@ -45,7 +46,10 @@ from src.core.models import (
     LyricsData,
     MetadataCandidate,
     Permission,
+    ProviderServerRecord,
     RadarScanProgress,
+    SongRequestStatus,
+    SongRequestType,
     TrackMetadata,
     UserAccount,
     UserPreferences,
@@ -59,6 +63,7 @@ from src.core.platform_links import (
     resolve_primary_platform_link,
 )
 from src.core.ports import GovernanceRepositoryPort
+from src.core.provider import MultiProviderService
 from src.core.queue import IngestionQueueWorker
 from src.core.radar import ReleaseRadarService
 from src.core.rbac import (
@@ -542,6 +547,7 @@ def build_webapp_api(
     album_search_service: AlbumSearchService | None = None,
     bot: Bot | None = None,
     bot_username: str | None = None,
+    provider_service: MultiProviderService | None = None,
 ) -> web.Application:
     """Construct an `aiohttp.web.Application` exposing TMA API, OIDC callbacks, and static assets."""
 
@@ -3967,6 +3973,355 @@ def build_webapp_api(
 
         app.router.add_post("/api/v1/webhooks/authentik", authentik_webhook_handler)
 
+    active_provider_service = provider_service
+    if active_provider_service is None and catalog_repository is not None:
+        active_provider_service = MultiProviderService(repository=catalog_repository)
+
+    # 3.01 External Music Provider Server & Provisioning Endpoints
+
+    async def handle_provision_complete_webhook(request: web.Request) -> web.Response:
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON."}, status=400)
+
+        if not isinstance(data, dict):
+            return web.json_response({"error": "JSON object expected."}, status=400)
+
+        job_id = str(data.get("job_id") or "")
+        download_url = str(data.get("download_url") or "")
+        logger.info("Received provider provision-complete webhook for job %s: %s", job_id, download_url)
+        return web.json_response({"success": True, "job_id": job_id})
+
+    app.router.add_post("/api/v1/webhooks/provision-complete", handle_provision_complete_webhook)
+
+    async def handle_stream_provider_track(request: web.Request) -> web.StreamResponse:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        provider_id = request.match_info["provider_id"]
+        provider_track_id = request.match_info["provider_track_id"]
+
+        if catalog_repository is None:
+            raise web.HTTPServiceUnavailable(text="Catalog repository unavailable.")
+
+        srv = await catalog_repository.get_provider_server(provider_id)
+        if srv is None or not srv.is_enabled:
+            raise web.HTTPNotFound(text="Provider not found or disabled.")
+
+        ps = active_provider_service or MultiProviderService(repository=catalog_repository)
+        client = ps.get_provider_client(srv)
+        stream_url = client.get_stream_url(provider_track_id, quality=request.query.get("quality"))
+
+        req_headers: dict[str, str] = {}
+        if "Range" in request.headers:
+            req_headers["Range"] = request.headers["Range"]
+
+        async with (
+            httpx.AsyncClient(timeout=30.0) as http_c,
+            http_c.stream("GET", stream_url, headers=req_headers) as upstream_resp,
+        ):
+            response = web.StreamResponse(
+                status=upstream_resp.status_code,
+                headers={
+                    "Content-Type": upstream_resp.headers.get("Content-Type", "audio/mpeg"),
+                    "Accept-Ranges": "bytes",
+                },
+            )
+            if "Content-Range" in upstream_resp.headers:
+                response.headers["Content-Range"] = upstream_resp.headers["Content-Range"]
+            if "Content-Length" in upstream_resp.headers:
+                response.headers["Content-Length"] = upstream_resp.headers["Content-Length"]
+
+            await response.prepare(request)
+            async for chunk in upstream_resp.aiter_bytes():
+                await response.write(chunk)
+            return response
+
+    app.router.add_get(
+        "/api/v1/app/stream/provider/{provider_id}/{provider_track_id}",
+        handle_stream_provider_track,
+    )
+
+    async def handle_post_song_request(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON body."}, status=400)
+
+        if not isinstance(body, dict):
+            return web.json_response({"error": "JSON object expected."}, status=400)
+
+        req_type_str = str(body.get("request_type") or "TRACK").upper()
+        req_type = SongRequestType.ALBUM if req_type_str == "ALBUM" else SongRequestType.TRACK
+        title = str(body.get("track_title") or body.get("title") or "").strip()
+        artist = str(body.get("artist_name") or body.get("artist") or "").strip()
+        album = str(body.get("album_name") or body.get("album") or "").strip()
+        identifiers = dict(body.get("identifiers") or {})
+        target_quality = str(body.get("target_quality") or "") or None
+
+        if not title or not artist:
+            return web.json_response({"error": "track_title and artist_name are required."}, status=400)
+
+        ps = active_provider_service or MultiProviderService(repository=catalog_repository)
+        try:
+            record, is_auto_approved = await ps.submit_song_request(
+                user=user,
+                request_type=req_type,
+                track_title=title,
+                artist_name=artist,
+                album_name=album,
+                identifiers=identifiers,
+                target_quality=target_quality,
+            )
+            return web.json_response(
+                {
+                    "success": True,
+                    "request_id": record.id,
+                    "status": record.status.value,
+                    "is_auto_approved": is_auto_approved,
+                },
+                status=201,
+            )
+        except PermissionDeniedError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
+        except Exception as exc:
+            logger.error("Failed to submit song request: %s", exc)
+            return web.json_response({"error": str(exc)}, status=500)
+
+    app.router.add_post("/api/v1/app/requests", handle_post_song_request)
+
+    async def handle_get_my_song_requests(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        if catalog_repository is None:
+            return web.json_response([], status=200)
+
+        reqs = await catalog_repository.list_song_requests(telegram_id=user.telegram_id, limit=50)
+        items = [
+            {
+                "id": r.id,
+                "request_type": r.request_type.value,
+                "title": r.track_title,
+                "artist": r.artist_name,
+                "album": r.album_name,
+                "status": r.status.value,
+                "created_at": r.created_at.isoformat(),
+                "library_track_id": r.library_track_id,
+            }
+            for r in reqs
+        ]
+        return web.json_response(items)
+
+    app.router.add_get("/api/v1/app/requests/me", handle_get_my_song_requests)
+
+    async def handle_get_pending_song_requests(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        try:
+            require_permission(user, Permission.APPROVE_SONG_REQUEST)
+        except PermissionDeniedError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
+
+        if catalog_repository is None:
+            return web.json_response([], status=200)
+
+        reqs = await catalog_repository.list_song_requests(
+            status=SongRequestStatus.PENDING_APPROVAL, limit=50
+        )
+        items = [
+            {
+                "id": r.id,
+                "telegram_id": r.telegram_id,
+                "request_type": r.request_type.value,
+                "title": r.track_title,
+                "artist": r.artist_name,
+                "album": r.album_name,
+                "identifiers": r.identifiers,
+                "status": r.status.value,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in reqs
+        ]
+        return web.json_response(items)
+
+    app.router.add_get("/api/v1/app/requests/pending", handle_get_pending_song_requests)
+
+    async def handle_resolve_song_request(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        try:
+            require_permission(user, Permission.APPROVE_SONG_REQUEST)
+        except PermissionDeniedError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
+
+        request_id = int(request.match_info["request_id"])
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        approved = bool(body.get("approved", True))
+        reason = str(body.get("rejection_reason") or "")
+
+        ps = active_provider_service or MultiProviderService(repository=catalog_repository)
+        updated = await ps.resolve_song_request_by_moderator(
+            request_id=request_id,
+            reviewer=user,
+            approved=approved,
+            rejection_reason=reason,
+        )
+        if updated is None:
+            return web.json_response({"error": "Request not found."}, status=404)
+
+        return web.json_response({"success": True, "status": updated.status.value})
+
+    app.router.add_post("/api/v1/app/requests/{request_id}/resolve", handle_resolve_song_request)
+
+    async def handle_get_admin_providers(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        try:
+            require_permission(user, Permission.MANAGE_PROVIDERS)
+        except PermissionDeniedError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
+
+        if catalog_repository is None:
+            return web.json_response([], status=200)
+
+        servers = await catalog_repository.list_provider_servers(enabled_only=False)
+        items = [
+            {
+                "id": s.id,
+                "name": s.name,
+                "base_url": s.base_url,
+                "priority": s.priority,
+                "is_enabled": s.is_enabled,
+                "last_health_status": s.last_health_status,
+                "last_health_checked_at": (
+                    s.last_health_checked_at.isoformat() if s.last_health_checked_at else None
+                ),
+                "capabilities": {
+                    "provider_name": s.capabilities.provider_name,
+                    "version": s.capabilities.version,
+                    "supported_sources": list(s.capabilities.supported_sources),
+                    "streaming": s.capabilities.features.streaming,
+                }
+                if s.capabilities
+                else None,
+            }
+            for s in servers
+        ]
+        return web.json_response(items)
+
+    app.router.add_get("/api/v1/app/admin/providers", handle_get_admin_providers)
+
+    async def handle_post_admin_provider(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        try:
+            require_permission(user, Permission.MANAGE_PROVIDERS)
+        except PermissionDeniedError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON body."}, status=400)
+
+        srv_id = str(body.get("id") or "").strip() or str(uuid.uuid4())[:8]
+        name = str(body.get("name") or "External Provider").strip()
+        base_url = str(body.get("base_url") or "").strip().rstrip("/")
+        if not base_url:
+            return web.json_response({"error": "base_url is required."}, status=400)
+
+        record = ProviderServerRecord(
+            id=srv_id,
+            name=name,
+            base_url=base_url,
+            api_token_encrypted=str(body.get("api_token") or "").strip() or None,
+            priority=int(body.get("priority") or 10),
+            is_enabled=bool(body.get("is_enabled", True)),
+        )
+
+        ps = active_provider_service or MultiProviderService(repository=catalog_repository)
+        updated = await ps.handshake_and_update(record)
+        return web.json_response({"success": True, "id": updated.id, "health": updated.last_health_status})
+
+    app.router.add_post("/api/v1/app/admin/providers", handle_post_admin_provider)
+
+    async def handle_test_admin_provider(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        try:
+            require_permission(user, Permission.MANAGE_PROVIDERS)
+        except PermissionDeniedError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
+
+        provider_id = request.match_info["provider_id"]
+        srv = await catalog_repository.get_provider_server(provider_id)
+        if srv is None:
+            return web.json_response({"error": "Provider not found."}, status=404)
+
+        ps = active_provider_service or MultiProviderService(repository=catalog_repository)
+        updated = await ps.handshake_and_update(srv)
+        return web.json_response(
+            {
+                "success": True,
+                "status": updated.last_health_status,
+                "capabilities": {
+                    "provider_name": updated.capabilities.provider_name,
+                    "supported_sources": list(updated.capabilities.supported_sources),
+                }
+                if updated.capabilities
+                else None,
+            }
+        )
+
+    app.router.add_post("/api/v1/app/admin/providers/{provider_id}/test", handle_test_admin_provider)
+
+    async def handle_delete_admin_provider(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        try:
+            require_permission(user, Permission.MANAGE_PROVIDERS)
+        except PermissionDeniedError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
+
+        provider_id = request.match_info["provider_id"]
+        deleted = await catalog_repository.delete_provider_server(provider_id)
+        return web.json_response({"success": deleted})
+
+    app.router.add_delete("/api/v1/app/admin/providers/{provider_id}", handle_delete_admin_provider)
+
     # 3.1 Release Radar & Artist Monitoring Endpoints
 
     async def handle_get_radar_releases(request: web.Request) -> web.Response:
@@ -4837,6 +5192,7 @@ class BotWebServer:
         album_search_service: AlbumSearchService | None = None,
         bot: Bot | None = None,
         bot_username: str | None = None,
+        provider_service: MultiProviderService | None = None,
     ) -> None:
 
         self._bot_token = bot_token
@@ -4898,6 +5254,7 @@ class BotWebServer:
             album_search_service=album_search_service,
             bot=bot,
             bot_username=bot_username,
+            provider_service=provider_service,
         )
 
         self._runner: web.AppRunner | None = None

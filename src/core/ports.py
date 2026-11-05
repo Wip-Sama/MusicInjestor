@@ -7,6 +7,7 @@ from typing import Protocol, runtime_checkable
 from src.core.models import (
     AccessRequestRecord,
     AccessRequestStatus,
+    AlbumResolutionResult,
     AudioFingerprint,
     AuditLogEntry,
     DiscoveredRelease,
@@ -16,11 +17,19 @@ from src.core.models import (
     LibraryTrackRecord,
     LyricsData,
     MetadataCandidate,
+    ProviderCapabilities,
+    ProviderHealth,
+    ProviderServerRecord,
+    ProvisionJobStatus,
+    ProvisionResponse,
     ReleaseNotification,
     ReleaseTrackPreview,
+    SongRequestRecord,
+    SongRequestStatus,
     TagCorrectionRequest,
     TagCorrectionStatus,
     TrackMetadata,
+    TrackResolutionResult,
     UserAccount,
     UserPreferences,
     UserRole,
@@ -410,6 +419,70 @@ class GovernanceRepositoryPort(Protocol):
         """Mark a release notification as read."""
         ...
 
+    async def upsert_provider_server(self, server: ProviderServerRecord) -> ProviderServerRecord:
+        """Insert or update a registered external music provider server."""
+        ...
+
+    async def get_provider_server(self, server_id: str) -> ProviderServerRecord | None:
+        """Retrieve a registered provider server by ID."""
+        ...
+
+    async def list_provider_servers(self, enabled_only: bool = False) -> list[ProviderServerRecord]:
+        """List registered provider servers ordered by priority ascending."""
+        ...
+
+    async def delete_provider_server(self, server_id: str) -> bool:
+        """Delete a registered provider server by ID."""
+        ...
+
+    async def create_song_request(self, request: SongRequestRecord) -> SongRequestRecord:
+        """Persist a new song or album acquisition request."""
+        ...
+
+    async def get_song_request(self, request_id: int) -> SongRequestRecord | None:
+        """Retrieve a song acquisition request by ID."""
+        ...
+
+    async def list_song_requests(
+        self,
+        status: SongRequestStatus | None = None,
+        telegram_id: int | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[SongRequestRecord]:
+        """List song acquisition requests with optional status and user filtering."""
+        ...
+
+    async def count_song_requests(
+        self,
+        status: SongRequestStatus | None = None,
+        telegram_id: int | None = None,
+    ) -> int:
+        """Count song acquisition requests with optional status and user filtering."""
+        ...
+
+    async def resolve_song_request(
+        self,
+        request_id: int,
+        status: SongRequestStatus,
+        reviewed_by: int,
+        rejection_reason: str = "",
+        job_id: str | None = None,
+        library_track_id: str | None = None,
+    ) -> SongRequestRecord | None:
+        """Update review status, reviewer, and optional job/track links for a request."""
+        ...
+
+    async def update_song_request_job_and_track(
+        self,
+        request_id: int,
+        job_id: str | None = None,
+        library_track_id: str | None = None,
+        status: SongRequestStatus | None = None,
+    ) -> SongRequestRecord | None:
+        """Update provisioning job ID, final library track ID, and status for a request."""
+        ...
+
 
 @runtime_checkable
 class AdminLogNotifierPort(Protocol):
@@ -466,6 +539,23 @@ class AdminLogNotifierPort(Protocol):
         match_source: str,
     ) -> None:
         """Post Event D (`INGEST AUDIT: DUPLICATE_REJECTED`) to the Admin Log Channel."""
+        ...
+
+    async def send_song_request_card(
+        self,
+        request: SongRequestRecord,
+        user: UserAccount,
+    ) -> None:
+        """Post an interactive song request card to the Admin Log Channel."""
+        ...
+
+    async def send_song_request_resolved_audit(
+        self,
+        request: SongRequestRecord,
+        reviewer: UserAccount,
+        status: SongRequestStatus,
+    ) -> None:
+        """Post a song request resolution audit to the Admin Log Channel."""
         ...
 
 
@@ -591,4 +681,66 @@ class ReleaseRadarProviderPort(Protocol):
         provider_track_id: str,
     ) -> ReleaseTrackPreview | tuple[str, str] | None:
         """Fetch ReleaseTrackPreview or `(track_title, preview_mp3_url)` directly for an individual track."""
+        ...
+
+
+@runtime_checkable
+class MusicProviderPort(Protocol):
+    """External music provider server communication protocol."""
+
+    async def get_capabilities(self) -> ProviderCapabilities:
+        """Fetch provider capabilities, supported sources, codecs, and feature flags."""
+        ...
+
+    async def check_health(self) -> ProviderHealth:
+        """Check provider health and upstream service connectivity."""
+        ...
+
+    async def resolve_track(
+        self,
+        identifiers: dict[str, str],
+        fallback: dict[str, object] | None = None,
+    ) -> TrackResolutionResult:
+        """Query availability and audio quality tiers for a track."""
+        ...
+
+    async def resolve_album(
+        self,
+        identifiers: dict[str, str],
+        fallback: dict[str, object] | None = None,
+    ) -> AlbumResolutionResult:
+        """Query availability and audio quality tiers for an entire album."""
+        ...
+
+    async def request_provision(
+        self,
+        provider_track_id: str,
+        target_quality: str | None = None,
+        callback_url: str | None = None,
+        priority: str = "normal",
+    ) -> ProvisionResponse:
+        """Initiate track acquisition/download on the provider."""
+        ...
+
+    async def request_batch_provision(
+        self,
+        provider_album_id: str,
+        track_ids: Sequence[str],
+        target_quality: str | None = None,
+        callback_url: str | None = None,
+        priority: str = "normal",
+    ) -> ProvisionResponse:
+        """Initiate batch album acquisition/download on the provider."""
+        ...
+
+    async def get_job_status(self, job_id: str) -> ProvisionJobStatus:
+        """Poll the status of an asynchronous provisioning job."""
+        ...
+
+    async def cancel_job(self, job_id: str) -> bool:
+        """Cancel an in-progress provisioning job on the provider."""
+        ...
+
+    def get_stream_url(self, provider_track_id: str, quality: str | None = None) -> str:
+        """Build instant streaming endpoint URL for a track."""
         ...
