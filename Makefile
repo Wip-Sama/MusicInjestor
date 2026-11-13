@@ -1,4 +1,4 @@
-.PHONY: setup test lint format check
+.PHONY: setup test lint format check run run-with-provider
 
 setup:
 	uv sync
@@ -22,6 +22,9 @@ pre-push:
 
 run:
 	uv run python main.py
+
+run-with-provider:
+	uv run python provider/run_with_bot.py
 
 check: lint test
 

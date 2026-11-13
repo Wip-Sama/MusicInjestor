@@ -25,10 +25,18 @@ from src.bot.states import RadarStates
 from src.bot.ui import ack_callback, format_screen, safe_answer, safe_edit_text
 from src.config.settings import AppSettings
 from src.core.deezer import DeezerReleaseProvider
-from src.core.models import DiscoveredRelease, LibraryTrackRecord, UserAccount
+from src.core.models import (
+    DiscoveredRelease,
+    LibraryTrackRecord,
+    Permission,
+    SongRequestType,
+    UserAccount,
+)
 from src.core.platform_links import build_streaming_platform_links
-from src.core.ports import GovernanceRepositoryPort
+from src.core.ports import AdminLogNotifierPort, GovernanceRepositoryPort
+from src.core.provider import MultiProviderService
 from src.core.radar import ReleaseRadarService
+from src.core.rbac import has_permission
 
 logger = logging.getLogger(__name__)
 
@@ -1097,3 +1105,69 @@ async def handle_radar_other_links(
     )
     keyboard = build_other_platforms_keyboard(release, links, page=callback_data.page)
     await safe_edit_text(query.message, card, reply_markup=keyboard)
+
+
+@radar_router.callback_query(RadarCallback.filter(F.action == "request"))
+async def handle_radar_request_release(
+    query: CallbackQuery,
+    callback_data: RadarCallback,
+    current_user: UserAccount | None,
+    governance_repository: GovernanceRepositoryPort,
+    notifier: AdminLogNotifierPort | None = None,
+    multi_provider_service: MultiProviderService | None = None,
+) -> None:
+    """Request track or album acquisition for a Release Radar drop via configured music providers."""
+    if query.message is None or current_user is None:
+        await ack_callback(query)
+        return
+
+    if not has_permission(current_user, Permission.REQUEST_SONG):
+        await ack_callback(
+            query,
+            "🔒 Access Denied: You must be at least a LISTENER to request songs.",
+            show_alert=True,
+        )
+        return
+
+    release = await governance_repository.get_discovered_release(callback_data.target_id)
+    if not release:
+        await ack_callback(query, "Release not found.", show_alert=True)
+        return
+
+    req_type = (
+        SongRequestType.ALBUM
+        if (release.release_type == "album" or release.track_count > 1)
+        else SongRequestType.TRACK
+    )
+    identifiers: dict[str, str] = {}
+    if release.provider_release_id:
+        identifiers["deezer_id"] = release.provider_release_id
+
+    ps = multi_provider_service or MultiProviderService(
+        repository=governance_repository,
+        notifier=notifier,
+    )
+    try:
+        record, is_auto_approved = await ps.submit_song_request(
+            user=current_user,
+            request_type=req_type,
+            track_title=release.title,
+            artist_name=release.artist_name,
+            album_name=release.title,
+            identifiers=identifiers,
+        )
+        if is_auto_approved:
+            await ack_callback(
+                query,
+                "✅ Download queued! You will be notified when ready.",
+                show_alert=True,
+            )
+        else:
+            await ack_callback(
+                query,
+                f"📥 Request #{record.id} submitted for moderator approval.",
+                show_alert=True,
+            )
+    except Exception as exc:
+        logger.error("Failed to submit radar release request: %s", exc)
+        await ack_callback(query, f"Failed to submit request: {exc}", show_alert=True)

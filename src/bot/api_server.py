@@ -1,6 +1,9 @@
 """Local Telegram Bot API session factory and container-to-host file path resolver."""
 
+import asyncio
+import contextlib
 import logging
+import urllib.parse
 from pathlib import Path, PurePosixPath
 
 from aiogram import Bot
@@ -38,6 +41,27 @@ def build_bot_instance(settings: AppSettings) -> Bot:
         session=session,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+
+
+async def check_local_bot_api_reachable(
+    local_api_url: str,
+    timeout_seconds: float = 1.5,
+) -> bool:
+    """Return True if the configured `--local` telegram-bot-api TCP socket accepts connections."""
+    parsed = urllib.parse.urlparse(local_api_url.strip())
+    host = parsed.hostname
+    if not host:
+        return False
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout_seconds)
+        writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+        return True
+    except OSError, TimeoutError, ValueError:
+        return False
 
 
 def resolve_local_api_file_path(

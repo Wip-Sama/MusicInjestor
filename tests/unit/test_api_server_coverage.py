@@ -1,9 +1,18 @@
 """Targeted coverage tests for src.bot.api_server."""
 
+import asyncio
+import logging
 from pathlib import Path
 from unittest.mock import patch
 
-from src.bot.api_server import build_bot_instance, resolve_local_api_file_path
+import pytest
+
+from main import configure_logging
+from src.bot.api_server import (
+    build_bot_instance,
+    check_local_bot_api_reachable,
+    resolve_local_api_file_path,
+)
 from src.config.settings import AppSettings
 
 
@@ -57,3 +66,26 @@ def test_resolve_local_api_file_path_wsl_colon_and_nested(tmp_path: Path) -> Non
     with patch.object(Path, "iterdir", side_effect=OSError("Disk failure")):
         fallback = resolve_local_api_file_path("missing.mp3", settings)
         assert fallback == Path("missing.mp3")
+
+
+@pytest.mark.anyio
+async def test_check_local_bot_api_reachable() -> None:
+    """Verify check_local_bot_api_reachable succeeds on listening sockets and fails cleanly otherwise."""
+    server = await asyncio.start_server(lambda r, w: w.close(), host="127.0.0.1", port=0)
+    try:
+        sock = server.sockets[0]
+        port = sock.getsockname()[1]
+        assert await check_local_bot_api_reachable(f"http://127.0.0.1:{port}", timeout_seconds=1.0) is True
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert await check_local_bot_api_reachable("invalid-url", timeout_seconds=0.2) is False
+    assert await check_local_bot_api_reachable("http://127.0.0.1:1", timeout_seconds=0.3) is False
+
+
+def test_main_configure_logging_quiets_noisy_libraries() -> None:
+    """Verify DEBUG logging suppresses verbose aiosqlite, httpcore, and hpack debug spam."""
+    configure_logging("DEBUG")
+    for lib_name in ("aiosqlite", "httpcore", "hpack"):
+        assert logging.getLogger(lib_name).level == logging.WARNING

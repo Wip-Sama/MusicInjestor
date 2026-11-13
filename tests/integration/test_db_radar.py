@@ -125,6 +125,24 @@ async def test_sqlite_radar_follows_and_releases(tmp_path: Path) -> None:
     assert await repo.mark_notification_read(12345, notif_id) is True
     assert len(await repo.list_user_release_notifications(12345, unread_only=True)) == 0
 
+    # Re-inserting same (telegram_id, release_id) returns [] (duplicate suppressed)
+    dup_inserted = await repo.create_release_notifications(
+        [ReleaseNotification(id=0, telegram_id=12345, release_id="deezer:102")]
+    )
+    assert dup_inserted == []
+
+    # New release inserts and mark_release_notifications_delivered stamps delivered_at
+    new_inserted = await repo.create_release_notifications(
+        [ReleaseNotification(id=0, telegram_id=12345, release_id="deezer:101")]
+    )
+    assert len(new_inserted) == 1
+    assert new_inserted[0].release_id == "deezer:101"
+    assert new_inserted[0].delivered_at is None
+    await repo.mark_release_notifications_delivered([new_inserted[0].id])
+    refreshed = await repo.list_user_release_notifications(12345, unread_only=False)
+    delivered_row = next(n for n, _ in refreshed if n.id == new_inserted[0].id)
+    assert delivered_row.delivered_at is not None
+
     # 8. Unfollow artist
     assert await repo.unfollow_artist(12345, "Dua Lipa") is True
     assert await repo.is_artist_followed(12345, "Dua Lipa") is False

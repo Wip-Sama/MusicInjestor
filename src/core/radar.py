@@ -220,10 +220,15 @@ class ReleaseRadarService:
                 self._progress.discovered_count = len(discovered_releases)
 
                 if discovered_releases and hasattr(self._repository, "list_followers_of_artist"):
+                    seen_pairs: set[tuple[int, str]] = set()
                     for rel in discovered_releases:
                         followers = await self._repository.list_followers_of_artist(rel.artist_name)
                         if isinstance(followers, (list, tuple)):
                             for uid in followers:
+                                pair = (int(uid), rel.id)
+                                if pair in seen_pairs:
+                                    continue
+                                seen_pairs.add(pair)
                                 new_notifications.append(
                                     ReleaseNotification(
                                         id=0,
@@ -232,12 +237,16 @@ class ReleaseRadarService:
                                     )
                                 )
                 if new_notifications and hasattr(self._repository, "create_release_notifications"):
-                    await self._repository.create_release_notifications(new_notifications)
+                    created = await self._repository.create_release_notifications(new_notifications)
+                    if isinstance(created, list):
+                        new_notifications = created
 
                 logger.info(
-                    "Release Radar scan complete: processed %d artists, discovered %d recent releases.",
+                    "Release Radar scan complete: processed %d artists, discovered %d recent releases, "
+                    "%d new notifications.",
                     total,
                     len(discovered_releases),
+                    len(new_notifications),
                 )
                 return discovered_releases, new_notifications
             finally:

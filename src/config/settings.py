@@ -47,9 +47,18 @@ _YAML_SECTION_KEY_MAP: dict[str, dict[str, str]] = {
     "governance": {
         "owner_telegram_ids": "OWNER_TELEGRAM_IDS",
         "admin_log_channel_id": "ADMIN_LOG_CHANNEL_ID",
+        "admin_log_channel_url": "ADMIN_LOG_CHANNEL_URL",
         "queue_concurrency_limit": "QUEUE_CONCURRENCY_LIMIT",
         "secret_key": "SECRET_KEY",
         "node_name": "NODE_NAME",
+    },
+    "provider": {
+        "default_url": "DEFAULT_MUSIC_PROVIDER_URL",
+        "default_token": "DEFAULT_MUSIC_PROVIDER_TOKEN",
+        "default_name": "DEFAULT_MUSIC_PROVIDER_NAME",
+        "default_priority": "DEFAULT_MUSIC_PROVIDER_PRIORITY",
+        "auto_provision_uploader_requests": "AUTO_PROVISION_UPLOADER_REQUESTS",
+        "download_timeout_seconds": "PROVISION_DOWNLOAD_TIMEOUT_SECONDS",
     },
     "oidc": {
         "enabled": "OIDC_ENABLED",
@@ -396,6 +405,10 @@ def load_settings(
         "WEB_LISTEN_HOST": "web_listen_host",
         "CLOUDFLARED_TUNNEL_URL": "cloudflared_tunnel_url",
         "OIDC_REDIRECT_PATH": "oidc_redirect_path",
+        "ADMIN_LOG_CHANNEL_URL": "admin_log_channel_url",
+        "DEFAULT_MUSIC_PROVIDER_URL": "default_music_provider_url",
+        "DEFAULT_MUSIC_PROVIDER_TOKEN": "default_music_provider_token",
+        "DEFAULT_MUSIC_PROVIDER_NAME": "default_music_provider_name",
     }
     for env_key, field_name in str_mappings.items():
         if env_key in merged_env and merged_env[env_key] != "":
@@ -454,5 +467,27 @@ def load_settings(
 
     if "OIDC_ROLE_MAPPING" in merged_env and merged_env["OIDC_ROLE_MAPPING"] != "":
         raw_kwargs["oidc_role_mapping"] = _parse_role_mapping(merged_env["OIDC_ROLE_MAPPING"])
+
+    if "RADAR_ENABLED" in merged_env and merged_env["RADAR_ENABLED"] != "":
+        raw_kwargs["radar_enabled"] = _parse_bool(merged_env["RADAR_ENABLED"])
+
+    if "RADAR_SYNC_INTERVAL_SECONDS" in merged_env and merged_env["RADAR_SYNC_INTERVAL_SECONDS"] != "":
+        raw_kwargs["radar_sync_interval_seconds"] = int(merged_env["RADAR_SYNC_INTERVAL_SECONDS"])
+
+    prov_prio = merged_env.get("DEFAULT_MUSIC_PROVIDER_PRIORITY", "")
+    if prov_prio != "":
+        raw_kwargs["default_music_provider_priority"] = int(prov_prio)
+
+    auto_prov = merged_env.get("AUTO_PROVISION_UPLOADER_REQUESTS", "")
+    if auto_prov != "":
+        raw_kwargs["auto_provision_uploader_requests"] = _parse_bool(auto_prov)
+
+    if (
+        "PROVISION_DOWNLOAD_TIMEOUT_SECONDS" in merged_env
+        and merged_env["PROVISION_DOWNLOAD_TIMEOUT_SECONDS"] != ""
+    ):
+        raw_kwargs["provision_download_timeout_seconds"] = float(
+            merged_env["PROVISION_DOWNLOAD_TIMEOUT_SECONDS"]
+        )
 
     return AppSettings.model_validate(raw_kwargs)

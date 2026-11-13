@@ -75,3 +75,26 @@ services:
       TELEGRAM_LOCAL_API_HOST_DIR: /var/lib/telegram-bot-api
     command: ["uv", "run", "pytest"]
 
+  music-provider:
+    build:
+      context: ./provider
+      dockerfile: Dockerfile
+    container_name: music-provider
+    restart: unless-stopped
+    ports:
+      - "${PROVIDER_PORT:-8085}:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PROVIDER_HOST: 0.0.0.0
+      PROVIDER_PORT: 8000
+      PROVIDER_API_TOKEN: ${DEFAULT_MUSIC_PROVIDER_TOKEN:-}
+      PROVIDER_BOT_TOKEN: ${PROVIDER_BOT_TOKEN:-}
+      PROVIDER_AUTHORIZED_USER_IDS: ${PROVIDER_AUTHORIZED_USER_IDS:-}
+      PROVIDER_STORAGE_DIR: /data/artifacts
+      PROVIDER_DEFAULT_ENGINE: ${PROVIDER_DEFAULT_ENGINE:-composite}
+    volumes:
+      - ./storage/provider:/data/artifacts
+
+

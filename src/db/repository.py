@@ -2115,14 +2115,20 @@ class SqliteCatalogRepository:
     async def create_release_notifications(
         self,
         notifications: Sequence[ReleaseNotification],
-    ) -> None:
-        """Persist release notifications for followers."""
+    ) -> list[ReleaseNotification]:
+        """Persist release notifications for followers and return only newly created rows."""
         if not notifications:
-            return
+            return []
 
+        created: list[ReleaseNotification] = []
+        seen: set[tuple[int, str]] = set()
         async with self._db.connect() as conn:
             for n in notifications:
-                await conn.execute(
+                pair = (int(n.telegram_id), n.release_id)
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                cursor = await conn.execute(
                     """
                     INSERT OR IGNORE INTO release_notifications (
                         telegram_id, release_id, is_read, delivered_at, created_at
@@ -2134,6 +2140,38 @@ class SqliteCatalogRepository:
                         1 if n.is_read else 0,
                         n.delivered_at.isoformat() if n.delivered_at else None,
                     ),
+                )
+                if cursor.rowcount and cursor.rowcount > 0:
+                    created.append(
+                        ReleaseNotification(
+                            id=int(cursor.lastrowid or 0),
+                            telegram_id=n.telegram_id,
+                            release_id=n.release_id,
+                            is_read=n.is_read,
+                            delivered_at=n.delivered_at,
+                            created_at=n.created_at,
+                        )
+                    )
+            await conn.commit()
+        return created
+
+    async def mark_release_notifications_delivered(
+        self,
+        notification_ids: Sequence[int],
+    ) -> None:
+        """Record delivery timestamp for sent release notifications."""
+        valid_ids = [int(nid) for nid in notification_ids if int(nid) > 0]
+        if not valid_ids:
+            return
+        async with self._db.connect() as conn:
+            for nid in valid_ids:
+                await conn.execute(
+                    """
+                    UPDATE release_notifications
+                    SET delivered_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND delivered_at IS NULL
+                    """,
+                    (nid,),
                 )
             await conn.commit()
 
@@ -2352,7 +2390,7 @@ class SqliteCatalogRepository:
             SELECT id, telegram_id, request_type, track_title, artist_name,
                    album_name, identifiers_json, target_quality, provider_id,
                    provider_track_id, status, reviewed_by, reviewed_at,
-                   rejection_reason, job_id, library_track_id, created_at, updated_at
+                   rejection_reason, job_id, library_track_id, created_at, updated_at, error_message
             FROM song_requests
             WHERE id = ?
             """,
@@ -2376,7 +2414,7 @@ class SqliteCatalogRepository:
             "SELECT id, telegram_id, request_type, track_title, artist_name, "
             "album_name, identifiers_json, target_quality, provider_id, "
             "provider_track_id, status, reviewed_by, reviewed_at, "
-            "rejection_reason, job_id, library_track_id, created_at, updated_at "
+            "rejection_reason, job_id, library_track_id, created_at, updated_at, error_message "
             "FROM song_requests WHERE 1=1 "
         )
         params: list[object] = []
@@ -2454,8 +2492,10 @@ class SqliteCatalogRepository:
         job_id: str | None = None,
         library_track_id: str | None = None,
         status: SongRequestStatus | None = None,
+        provider_id: str | None = None,
+        error_message: str | None = None,
     ) -> SongRequestRecord | None:
-        """Update provisioning job ID, final library track ID, and status for a request."""
+        """Update provisioning job ID, final library track ID, provider ID, error, and status."""
         status_val = status.value if status is not None else None
         async with self._db.connect() as conn:
             await conn.execute(
@@ -2464,10 +2504,12 @@ class SqliteCatalogRepository:
                 SET job_id = COALESCE(?, job_id),
                     library_track_id = COALESCE(?, library_track_id),
                     status = COALESCE(?, status),
+                    provider_id = COALESCE(?, provider_id),
+                    error_message = COALESCE(?, error_message),
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (job_id, library_track_id, status_val, request_id),
+                (job_id, library_track_id, status_val, provider_id, error_message, request_id),
             )
             await conn.commit()
         return await self.get_song_request(request_id)
@@ -2634,6 +2676,7 @@ def _row_to_song_request(row: Sequence[object]) -> SongRequestRecord:
         rejection_reason=str(row[13]) if row[13] is not None else "",
         job_id=str(row[14]) if row[14] is not None else None,
         library_track_id=str(row[15]) if row[15] is not None else None,
+        error_message=str(row[18]) if len(row) > 18 and row[18] else None,
         created_at=_parse_iso_datetime(row[16]) or datetime.now(UTC),
         updated_at=_parse_iso_datetime(row[17]) or datetime.now(UTC),
     )

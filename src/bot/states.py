@@ -18,6 +18,7 @@ class AdminStates(StatesGroup):
 
     awaiting_new_user_id = State()
     awaiting_job_link = State()
+    awaiting_provider_config = State()
 
 
 class SongManagementStates(StatesGroup):

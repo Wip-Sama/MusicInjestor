@@ -609,6 +609,7 @@ class SongRequestRecord:
     rejection_reason: str = ""
     job_id: str | None = None
     library_track_id: str | None = None
+    error_message: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 

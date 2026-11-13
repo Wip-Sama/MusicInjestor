@@ -218,3 +218,39 @@ def test_apply_cloudflared_tunnel_overrides_dynamic_url() -> None:
     assert settings.cloudflared_tunnel_url == "https://dynamic-quick.trycloudflare.com"
     assert settings.web_app_url == "https://dynamic-quick.trycloudflare.com"
     assert settings.oidc_redirect_uri == "https://dynamic-quick.trycloudflare.com/api/v1/auth/callback"
+
+
+def test_load_settings_provider_and_radar_env_vars(tmp_path: Path) -> None:
+    """Verify load_settings loads external music provider, radar, and admin log URL env vars."""
+    dotenv_file = tmp_path / ".env"
+    dotenv_file.write_text(
+        "\n".join(
+            [
+                "ADMIN_LOG_CHANNEL_URL=https://t.me/+invite123",
+                "DEFAULT_MUSIC_PROVIDER_URL=http://127.0.0.1:8085/",
+                "DEFAULT_MUSIC_PROVIDER_TOKEN=prov-tok-xyz",
+                "DEFAULT_MUSIC_PROVIDER_NAME=Local Provider",
+                "DEFAULT_MUSIC_PROVIDER_PRIORITY=5",
+                "AUTO_PROVISION_UPLOADER_REQUESTS=false",
+                "PROVISION_DOWNLOAD_TIMEOUT_SECONDS=120",
+                "RADAR_ENABLED=false",
+                "RADAR_SYNC_INTERVAL_SECONDS=1800",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    loaded = load_settings(
+        dotenv_path=dotenv_file,
+        environ={},
+        yaml_path=tmp_path / "missing.yaml",
+    )
+    assert loaded.admin_log_channel_url == "https://t.me/+invite123"
+    assert loaded.default_music_provider_url == "http://127.0.0.1:8085"
+    assert loaded.default_music_provider_token == "prov-tok-xyz"
+    assert loaded.default_music_provider_name == "Local Provider"
+    assert loaded.default_music_provider_priority == 5
+    assert loaded.auto_provision_uploader_requests is False
+    assert loaded.provision_download_timeout_seconds == 120.0
+    assert loaded.radar_enabled is False
+    assert loaded.radar_sync_interval_seconds == 1800

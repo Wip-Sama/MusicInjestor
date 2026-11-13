@@ -9,7 +9,7 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher
 from aiogram.types import BotCommand, MenuButtonWebApp, WebAppInfo
 
-from src.bot.api_server import build_bot_instance
+from src.bot.api_server import build_bot_instance, check_local_bot_api_reachable
 from src.bot.keyboards.radar import build_release_notification_keyboard
 from src.bot.middlewares.rbac import RbacMiddleware
 from src.bot.notifier import TelegramAdminLogNotifier
@@ -27,14 +27,20 @@ from src.core.extractor import SevenZipArchiveExtractor
 from src.core.fingerprint import ChromaprintFingerprinter
 from src.core.lyrics import LrclibLyricsClient
 from src.core.metadata import MusicBrainzMetadataService
-from src.core.models import ProviderServerRecord
+from src.core.models import (
+    Permission,
+    ProviderServerRecord,
+    SongRequestRecord,
+    UserAccount,
+    UserRole,
+)
 from src.core.oidc import AuthentikOidcService
 from src.core.organizer import LibraryOrganizer
 from src.core.pipeline import IngestionPipeline
 from src.core.provider import MultiProviderService
 from src.core.queue import IngestionQueueWorker
 from src.core.radar import ReleaseRadarService
-from src.core.rbac import GovernanceService
+from src.core.rbac import GovernanceService, has_permission
 from src.core.search import AlbumSearchService
 from src.db.database import SqliteDatabaseManager
 from src.db.repository import SqliteCatalogRepository
@@ -66,6 +72,10 @@ def configure_logging(level_name: str) -> None:
         level=numeric_level,
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     )
+    # Suppress noisy per-query / HTTP frame debug logs from third-party libraries
+    logging.getLogger("aiosqlite").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("hpack").setLevel(logging.WARNING)
 
 
 def create_ingestion_pipeline(
@@ -200,15 +210,18 @@ async def run_periodic_release_radar_loop(
             logger.info("Executing scheduled Release Radar artist scan...")
             discovered, notifications = await radar_service.scan_monitored_artists()
             if bot is not None and notifications:
+                delivered_ids: list[int] = []
                 for notif in notifications:
                     rel = await repository.get_discovered_release(notif.release_id)
                     if rel is not None:
                         try:
+                            prefs = await repository.get_user_preferences(notif.telegram_id)
+                            if not prefs.notifications_enabled:
+                                continue
                             matching_tracks = await repository.find_library_tracks_for_release(
                                 rel.artist_name, rel.title
                             )
                             lib_track = matching_tracks[0] if matching_tracks else None
-                            prefs = await repository.get_user_preferences(notif.telegram_id)
                             web_url = settings.web_app_url if settings else None
                             text = format_release_notification_card(rel, lib_track)
                             keyboard = build_release_notification_keyboard(
@@ -223,10 +236,14 @@ async def run_periodic_release_radar_loop(
                                 reply_markup=keyboard,
                                 parse_mode="HTML",
                             )
+                            if notif.id > 0:
+                                delivered_ids.append(notif.id)
                         except Exception as n_exc:
                             logger.warning(
                                 "Failed to send release alert to user %d: %s", notif.telegram_id, n_exc
                             )
+                if delivered_ids:
+                    await repository.mark_release_notifications_delivered(delivered_ids)
         except Exception as exc:
             logger.warning("Scheduled Release Radar scan failed: %s", exc)
 
@@ -274,6 +291,17 @@ async def run_app(settings: AppSettings | None = None) -> None:
     """Initialize SQLite WAL storage, assemble RBAC/OIDC/Queue services, and start Telegram polling."""
     resolved_settings = settings or load_settings()
     configure_logging(resolved_settings.log_level)
+
+    if resolved_settings.telegram_use_local_api:
+        reachable = await check_local_bot_api_reachable(resolved_settings.telegram_local_api_url)
+        if not reachable:
+            logger.error(
+                "Local Telegram Bot API server at %s is unreachable. "
+                "Start it via 'docker compose up -d telegram-bot-api' or set "
+                "TELEGRAM_USE_LOCAL_API=false in .env to use standard Telegram Bot API.",
+                resolved_settings.telegram_local_api_url,
+            )
+            raise SystemExit(1)
 
     vite_proc = await start_vite_dev_server_if_needed(resolved_settings)
 
@@ -356,7 +384,54 @@ async def run_app(settings: AppSettings | None = None) -> None:
     dispatcher["organizer"] = organizer
     dispatcher["radar_service"] = radar_service
     dispatcher["album_search_service"] = album_search_service
-    multi_provider_service = MultiProviderService(repository=repository, notifier=notifier)
+
+    async def _on_provider_artifact_ready(
+        artifact_path: Path,
+        req: SongRequestRecord,
+        server: ProviderServerRecord,
+    ) -> str:
+        requester = await repository.get_user(req.telegram_id)
+        if requester is None:
+            requester = await governance_service.ensure_user(
+                req.telegram_id,
+                display_name=f"User {req.telegram_id}",
+            )
+        enqueue_actor = (
+            requester
+            if has_permission(requester, Permission.SUBMIT_INGESTION)
+            else UserAccount(
+                telegram_id=requester.telegram_id,
+                display_name=requester.display_name,
+                username=requester.username,
+                role=UserRole.UPLOADER,
+            )
+        )
+        job, _pos = await queue_worker.enqueue_job(
+            user=enqueue_actor,
+            source_path=artifact_path,
+            original_filename=f"{req.artist_name} - {req.track_title}{artifact_path.suffix}",
+        )
+        logger.info(
+            "Enqueued provisioned track from %s for request #%d -> job %s",
+            server.name,
+            req.id,
+            job.job_id,
+        )
+        return job.job_id
+
+    async def _notify_provider_requester(telegram_id: int, message_text: str) -> None:
+        with contextlib.suppress(Exception):
+            await bot.send_message(chat_id=telegram_id, text=message_text, parse_mode="HTML")
+
+    multi_provider_service = MultiProviderService(
+        repository=repository,
+        notifier=notifier,
+        staging_dir=resolved_settings.storage_scratch_dir / "provider_staging",
+        auto_provision_uploader_requests=resolved_settings.auto_provision_uploader_requests,
+        download_timeout_seconds=resolved_settings.provision_download_timeout_seconds,
+        on_artifact_ready=_on_provider_artifact_ready,
+        notify_requester=_notify_provider_requester,
+    )
     if resolved_settings.default_music_provider_url.strip():
         default_server = ProviderServerRecord(
             id="default-provider",
@@ -377,6 +452,7 @@ async def run_app(settings: AppSettings | None = None) -> None:
             logger.warning("Default music provider handshake failed: %s", exc)
 
     dispatcher["multi_provider_service"] = multi_provider_service
+    dispatcher["provider_service"] = multi_provider_service
     dispatcher.include_router(build_root_router())
 
     web_server: BotWebServer | None = None

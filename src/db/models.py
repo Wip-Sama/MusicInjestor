@@ -219,6 +219,7 @@ CREATE TABLE IF NOT EXISTS song_requests (
     rejection_reason TEXT NOT NULL DEFAULT '',
     job_id TEXT,
     library_track_id TEXT REFERENCES library_tracks(id),
+    error_message TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -343,3 +344,7 @@ USER_SETTINGS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 DISCOVERED_RELEASES_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (("library_track_id", "TEXT"),)
+
+SONG_REQUESTS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("error_message", "TEXT NOT NULL DEFAULT ''"),
+)

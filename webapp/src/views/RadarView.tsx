@@ -17,10 +17,12 @@ import {
   Check,
   ListMusic,
   Globe,
+  Download,
 } from 'lucide-react';
 import { Card, Subheadline, Caption, Spinner } from '@telegram-apps/telegram-ui';
 import { useAudioPlayer } from '../context/AudioPlayerContext';
 import { apiFetch } from '../lib/auth';
+import { fetchProvidersStatus, submitSongRequest } from '../lib/providerApi';
 import { connectQueueEvents } from '../lib/queueApi';
 import { RadarRelease, RadarFollowItem, TrackItem, ReleaseTrackPreview, RadarScanProgress } from '../types/music';
 
@@ -77,6 +79,9 @@ export const RadarView: React.FC<RadarViewProps> = ({ initialReleaseId }) => {
   const [loadingTracksFor, setLoadingTracksFor] = useState<string | null>(null);
   const [copiedReleaseId, setCopiedReleaseId] = useState<string | null>(null);
   const [platformMenuReleaseId, setPlatformMenuReleaseId] = useState<string | null>(null);
+  const [hasProviders, setHasProviders] = useState<boolean>(false);
+  const [requestStatuses, setRequestStatuses] = useState<Record<string, string>>({});
+  const [requestingIds, setRequestingIds] = useState<Record<string, boolean>>({});
   const longPressTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const isLongPressTriggeredRef = React.useRef<boolean>(false);
 
@@ -193,6 +198,45 @@ export const RadarView: React.FC<RadarViewProps> = ({ initialReleaseId }) => {
       loadFollows();
     }
   }, [activeTab, loadReleases, loadFollows]);
+
+  useEffect(() => {
+    fetchProvidersStatus()
+      .then((res) => setHasProviders(Boolean(res.has_providers && res.enabled_count > 0)))
+      .catch(() => setHasProviders(false));
+  }, []);
+
+  const handleRequestRelease = async (rel: RadarRelease) => {
+    if (requestingIds[rel.id]) return;
+    setRequestingIds((prev) => ({ ...prev, [rel.id]: true }));
+    setRequestStatuses((prev) => ({ ...prev, [rel.id]: 'Sending...' }));
+    const isAlbum = rel.track_count > 1 || rel.release_type === 'album' || rel.release_type === 'ep';
+    try {
+      const resp = await submitSongRequest({
+        request_type: isAlbum ? 'ALBUM' : 'TRACK',
+        track_title: rel.title,
+        artist_name: rel.artist_name,
+        album_name: isAlbum ? rel.title : undefined,
+        identifiers: {
+          ...(rel.id && rel.provider === 'deezer' ? { deezer: String(rel.id) } : {}),
+          ...(rel.primary_url || rel.external_url
+            ? { url: (rel.primary_url || rel.external_url) as string }
+            : {}),
+          ...(rel.external_links ? rel.external_links : {}),
+        },
+      });
+      triggerNotificationHaptic('success');
+      setRequestStatuses((prev) => ({
+        ...prev,
+        [rel.id]: resp.is_auto_approved ? 'Queued' : 'Pending',
+      }));
+    } catch (err: unknown) {
+      triggerNotificationHaptic('error');
+      const msg = err instanceof Error ? err.message : 'Failed';
+      setRequestStatuses((prev) => ({ ...prev, [rel.id]: msg.slice(0, 20) || 'Failed' }));
+    } finally {
+      setRequestingIds((prev) => ({ ...prev, [rel.id]: false }));
+    }
+  };
 
   const handleToggleFollow = async (artistName: string, _currentlyFollowed?: boolean) => {
     try {
@@ -862,6 +906,39 @@ export const RadarView: React.FC<RadarViewProps> = ({ initialReleaseId }) => {
                         >
                           {isCurrentlyPlaying ? <Pause size={13} /> : <Play size={13} />}
                           <span>{isCurrentlyPlaying ? 'Pause' : 'Preview'}</span>
+                        </button>
+                      )}
+
+                      {/* Request / Download via External Music Provider for unowned releases */}
+                      {hasProviders && !(rel.in_library && rel.library_track_id && rel.track_count === 1) && (
+                        <button
+                          onClick={() => handleRequestRelease(rel)}
+                          disabled={Boolean(requestingIds[rel.id])}
+                          title="Request / download via External Music Provider"
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '4px',
+                            padding: '5px 8px',
+                            borderRadius: '6px',
+                            border: 'none',
+                            backgroundColor:
+                              requestStatuses[rel.id] === 'Queued' ||
+                              requestStatuses[rel.id] === 'Pending'
+                                ? 'rgba(48, 209, 88, 0.2)'
+                                : 'rgba(191, 90, 242, 0.18)',
+                            color:
+                              requestStatuses[rel.id] === 'Queued' ||
+                              requestStatuses[rel.id] === 'Pending'
+                                ? '#30d158'
+                                : '#bf5af2',
+                            cursor: requestingIds[rel.id] ? 'default' : 'pointer',
+                            fontSize: '12px',
+                            fontWeight: 600,
+                          }}
+                        >
+                          <Download size={13} />
+                          <span>{requestStatuses[rel.id] || 'Request'}</span>
                         </button>
                       )}
 

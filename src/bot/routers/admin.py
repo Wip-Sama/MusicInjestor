@@ -4,6 +4,7 @@ import html
 import inspect
 import logging
 import re
+import uuid
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatAction
@@ -20,6 +21,8 @@ from src.bot.keyboards.admin import (
     SongReqApprovalCallback,
     append_escape_row,
     build_admin_dashboard_keyboard,
+    build_admin_providers_keyboard,
+    build_admin_song_requests_keyboard,
     build_admin_subscreen_keyboard,
     build_back_to_home_keyboard,
     build_main_menu_keyboard,
@@ -65,6 +68,8 @@ from src.core.models import (
     IngestionResult,
     JobState,
     Permission,
+    ProviderServerRecord,
+    SongRequestStatus,
     UserAccount,
     UserRole,
 )
@@ -122,6 +127,9 @@ def parse_admin_callback(data: str) -> tuple[str, int | None, UserRole | None]:
         "log_channel",
         "debug",
         "debug_test_radar",
+        "providers",
+        "prov_add",
+        "song_requests",
     }:
         return action, None, None
     if (
@@ -136,6 +144,8 @@ def parse_admin_callback(data: str) -> tuple[str, int | None, UserRole | None]:
             "tag_reject",
             "user_uploads",
             "user_changes",
+            "prov_test",
+            "prov_toggle",
         }
         and len(parts) == 3
     ):
@@ -708,6 +718,48 @@ async def _deliver_queued_job_file(
     return False
 
 
+async def _render_providers_screen(
+    msg: object,
+    servers: list[ProviderServerRecord],
+) -> None:
+    """Render the Administrator External Music Providers screen in-place."""
+    lines: list[str] = []
+    if not servers:
+        lines.append("<i>No external music providers registered.</i>")
+        lines.append("")
+        lines.append(
+            "Configure <code>DEFAULT_MUSIC_PROVIDER_URL</code> in <code>.env</code> "
+            "or tap <b>➕ Add Music Provider</b> below."
+        )
+    else:
+        for srv in servers:
+            if not srv.is_enabled:
+                badge = "⬜ Disabled"
+            elif srv.last_health_status in ("ok", "healthy", "ready"):
+                badge = f"🟢 {srv.last_health_status}"
+            else:
+                badge = f"🔴 {srv.last_health_status or 'untested'}"
+            sources = (
+                ", ".join(srv.capabilities.supported_sources)
+                if srv.capabilities and srv.capabilities.supported_sources
+                else "unknown"
+            )
+            lines.append(
+                f"• <b>{html.escape(srv.name)}</b> [{badge}] (prio <code>{srv.priority}</code>)\n"
+                f"  <code>{html.escape(srv.base_url)}</code>\n"
+                f"  <i>Sources:</i> <code>{html.escape(sources)}</code>"
+            )
+    await safe_edit_text(
+        msg,
+        format_screen(
+            title="🔌 External Music Providers",
+            context_lines=lines,
+            footer_lines=["<i>🧭 Home › Admin › Music Providers</i>"],
+        ),
+        reply_markup=build_admin_providers_keyboard(servers),
+    )
+
+
 @admin_router.callback_query(F.data.startswith("admin:"))
 async def handle_admin_dashboard_callback(
     callback: CallbackQuery,
@@ -719,6 +771,7 @@ async def handle_admin_dashboard_callback(
     pipeline: IngestionPipeline | None = None,
     settings: AppSettings | None = None,
     state: FSMContext | None = None,
+    multi_provider_service: MultiProviderService | None = None,
 ) -> None:
     """Handle interactive button navigation inside the `/admin` Control Panel in-place."""
     if not callback.data or current_user is None or governance_repository is None:
@@ -979,6 +1032,94 @@ async def handle_admin_dashboard_callback(
                 footer_lines=["<i>🧭 Home › Admin › Log Channel</i>"],
             ),
             reply_markup=kb.as_markup(),
+        )
+        return
+
+    if action == "providers":
+        await ack_callback(callback)
+        servers = await governance_repository.list_provider_servers(enabled_only=False)
+        await _render_providers_screen(msg, servers)
+        return
+
+    if action == "prov_add":
+        await ack_callback(callback)
+        if state is not None:
+            await state.set_state(AdminStates.awaiting_provider_config)
+        await safe_edit_text(
+            msg,
+            format_screen(
+                title="➕ Add External Music Provider",
+                context_lines=[
+                    "Send the provider details in this format:",
+                    "<code>Name | URL | OptionalToken</code>",
+                    "",
+                    "<i>Examples:</i>",
+                    "<code>Local Provider | http://127.0.0.1:8085</code>",
+                    "<code>Studio Node | https://music.example.com | my_secret_token</code>",
+                ],
+                footer_lines=["<i>Send /cancel to abort</i>"],
+            ),
+            reply_markup=build_admin_subscreen_keyboard(back_callback="admin:providers"),
+        )
+        return
+
+    if action in {"prov_test", "prov_toggle"} and target_id is not None:
+        servers = await governance_repository.list_provider_servers(enabled_only=False)
+        if target_id < 0 or target_id >= len(servers):
+            await ack_callback(callback, "Provider entry no longer exists.", show_alert=True)
+            return
+        srv = servers[target_id]
+        ps = multi_provider_service or MultiProviderService(repository=governance_repository)
+        if action == "prov_test":
+            await ack_callback(callback, f"🩺 Testing {srv.name}...")
+            await ps.handshake_and_update(srv, verify=True)
+        else:
+            toggled = ProviderServerRecord(
+                id=srv.id,
+                name=srv.name,
+                base_url=srv.base_url,
+                api_token_encrypted=srv.api_token_encrypted,
+                priority=srv.priority,
+                is_enabled=not srv.is_enabled,
+                capabilities=srv.capabilities,
+                last_health_status=srv.last_health_status,
+                last_health_checked_at=srv.last_health_checked_at,
+                created_at=srv.created_at,
+            )
+            await governance_repository.upsert_provider_server(toggled)
+            await ack_callback(
+                callback,
+                f"{'Enabled' if toggled.is_enabled else 'Disabled'} {srv.name}.",
+            )
+        refreshed = await governance_repository.list_provider_servers(enabled_only=False)
+        await _render_providers_screen(msg, refreshed)
+        return
+
+    if action == "song_requests":
+        await ack_callback(callback)
+        reqs = await governance_repository.list_song_requests(
+            status=SongRequestStatus.PENDING_APPROVAL,
+            limit=12,
+        )
+        lines: list[str] = []
+        if not reqs:
+            lines.append("<i>No pending song requests awaiting moderation.</i>")
+        else:
+            lines.append(f"<b>Pending Moderation Queue:</b> <code>{len(reqs)}</code>")
+            lines.append("")
+            for req in reqs[:8]:
+                lines.append(
+                    f"• <b>#{req.id}</b> {html.escape(req.artist_name)} — "
+                    f"<code>{html.escape(req.track_title)}</code> (User <code>{req.telegram_id}</code>)"
+                )
+        await safe_edit_text(
+            msg,
+            format_screen(
+                title="📥 Pending Song Requests",
+                context_lines=lines,
+                footer_lines=["<i>🧭 Home › Admin › Song Requests</i>"],
+            ),
+            reply_markup=build_admin_song_requests_keyboard(reqs),
         )
         return
 
@@ -1861,6 +2002,15 @@ async def handle_queue_job_control_callback(
         ):
             await ack_callback(callback, "🔎 Analyzing file for manual review...")
             await send_chat_action_safe(callback)
+            preview_name = html.escape(target_job.original_filename or target_job.source_path.name)
+            await safe_edit_text(
+                msg,
+                format_loading_card(
+                    "Preparing Manual Review",
+                    f"Fingerprinting &amp; searching metadata candidates for <code>{preview_name}</code>...",
+                    f"🧭 Home › Queue › Review {html.escape(target_job.job_id[:8])}",
+                ),
+            )
             try:
                 result = await queue_worker.review_job_manually(target_job.job_id, current_user)
             except (PermissionDeniedError, KeyError) as exc:
@@ -1954,6 +2104,7 @@ async def handle_song_request_approval(
     current_user: UserAccount | None = None,
     governance_repository: GovernanceRepositoryPort | None = None,
     notifier: AdminLogNotifierPort | None = None,
+    multi_provider_service: MultiProviderService | None = None,
 ) -> None:
     """Handle Moderator/Admin approval or rejection of a song acquisition request."""
     if callback.message is None or current_user is None or governance_repository is None:
@@ -1968,7 +2119,9 @@ async def handle_song_request_approval(
         )
         return
 
-    provider_service = MultiProviderService(repository=governance_repository, notifier=notifier)
+    provider_service = multi_provider_service or MultiProviderService(
+        repository=governance_repository, notifier=notifier
+    )
     is_approved = callback_data.action == "approve"
 
     try:
@@ -1993,3 +2146,54 @@ async def handle_song_request_approval(
     except Exception as exc:
         logger.error("Error resolving song request #%d: %s", callback_data.request_id, exc)
         await ack_callback(callback, f"Error: {exc}", show_alert=True)
+
+
+@admin_router.message(AdminStates.awaiting_provider_config)
+async def handle_provider_config_input(
+    message: Message,
+    state: FSMContext | None = None,
+    current_user: UserAccount | None = None,
+    governance_repository: GovernanceRepositoryPort | None = None,
+    multi_provider_service: MultiProviderService | None = None,
+) -> None:
+    """Register a new external music provider server from `Name | URL | OptionalToken` input."""
+    if (
+        current_user is None
+        or not has_permission(current_user, Permission.MANAGE_PROVIDERS)
+        or governance_repository is None
+    ):
+        await safe_answer(message, "🔒 Provider management requires ADMIN privileges.")
+        return
+
+    raw_text = (message.text or "").strip()
+    parts = [p.strip() for p in raw_text.split("|")]
+    if len(parts) < 2 or not parts[1].startswith(("http://", "https://")):
+        await safe_answer(
+            message,
+            "⚠️ Invalid format. Send <code>Name | http://host:port | OptionalToken</code> "
+            "(or <code>/cancel</code>).",
+        )
+        return
+
+    name = parts[0] or "External Provider"
+    base_url = parts[1].rstrip("/")
+    token = parts[2] if len(parts) >= 3 and parts[2] else None
+    server = ProviderServerRecord(
+        id=f"prov-{uuid.uuid4().hex[:8]}",
+        name=name,
+        base_url=base_url,
+        api_token_encrypted=token,
+        priority=20,
+        is_enabled=True,
+    )
+    ps = multi_provider_service or MultiProviderService(repository=governance_repository)
+    updated = await ps.handshake_and_update(server)
+    await reset_fsm_state(state)
+    await safe_answer(
+        message,
+        f"✅ Registered provider <b>{html.escape(updated.name)}</b> "
+        f"(status: <code>{html.escape(updated.last_health_status or 'unknown')}</code>).",
+        reply_markup=build_admin_providers_keyboard(
+            await governance_repository.list_provider_servers(enabled_only=False)
+        ),
+    )

@@ -3,11 +3,11 @@
 import asyncio
 import hashlib
 import logging
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -136,6 +136,19 @@ class HttpMusicProviderClient(MusicProviderPort):
             headers["Authorization"] = f"Bearer {self._api_token}"
         return headers
 
+    def get_auth_headers(self) -> dict[str, str]:
+        """Return authentication headers suitable for streaming/downloading artifacts."""
+        if self._api_token:
+            return {"Authorization": f"Bearer {self._api_token}"}
+        return {}
+
+    def resolve_artifact_url(self, download_url: str) -> str:
+        """Resolve relative artifact/download URLs against this provider client's base URL."""
+        cleaned = download_url.strip()
+        if cleaned.startswith(("http://", "https://")):
+            return cleaned
+        return urljoin(f"{self._base_url}/", cleaned.lstrip("/"))
+
     async def _get_client(self) -> httpx.AsyncClient:
         """Return injected or lazily initialized HTTP client."""
         if self._client is None or self._client.is_closed:
@@ -171,12 +184,13 @@ class HttpMusicProviderClient(MusicProviderPort):
             features=_parse_provider_features(data),
         )
 
-    async def check_health(self) -> ProviderHealth:
+    async def check_health(self, verify: bool = False) -> ProviderHealth:
         """Check provider service status from `GET /api/v1/health`."""
         client = await self._get_client()
         url = f"{self._base_url}/api/v1/health"
+        params = {"verify": "true"} if verify else None
         try:
-            resp = await client.get(url, headers=self._build_headers())
+            resp = await client.get(url, params=params, headers=self._build_headers())
             resp.raise_for_status()
             data = resp.json()
         except Exception as exc:
@@ -439,6 +453,13 @@ class HttpMusicProviderClient(MusicProviderPort):
         return f"{self._base_url}/api/v1/stream/{provider_track_id}{suffix}"
 
 
+ArtifactReadyCallback = Callable[
+    [Path, SongRequestRecord, ProviderServerRecord],
+    Awaitable[str | None],
+]
+RequesterNotifyCallback = Callable[[int, str], Awaitable[None]]
+
+
 class MultiProviderService:
     """Orchestrates multi-provider discovery, fallback cascading, quality ranking, and provisioning."""
 
@@ -447,26 +468,49 @@ class MultiProviderService:
         repository: GovernanceRepositoryPort,
         notifier: AdminLogNotifierPort | None = None,
         client_factory: Any = None,
+        *,
+        staging_dir: Path | None = None,
+        auto_provision_uploader_requests: bool = True,
+        download_timeout_seconds: float = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
+        on_artifact_ready: ArtifactReadyCallback | None = None,
+        notify_requester: RequesterNotifyCallback | None = None,
     ) -> None:
         self._repository = repository
         self._notifier = notifier
         self._client_factory = client_factory or (
             lambda url, token: HttpMusicProviderClient(base_url=url, api_token=token)
         )
-        self._clients: dict[str, MusicProviderPort] = {}
+        self._clients: dict[str, tuple[str, str | None, MusicProviderPort]] = {}
+        self._staging_dir = staging_dir
+        self._auto_provision_uploader_requests = auto_provision_uploader_requests
+        self._download_timeout_seconds = download_timeout_seconds
+        self._on_artifact_ready = on_artifact_ready
+        self._notify_requester = notify_requester
+        self._background_tasks: set[asyncio.Task[None]] = set()
 
     def get_provider_client(self, server: ProviderServerRecord) -> MusicProviderPort:
         """Return or instantiate a cached MusicProviderPort client for a server record."""
-        if server.id not in self._clients:
-            self._clients[server.id] = self._client_factory(server.base_url, server.api_token_encrypted)
-        return self._clients[server.id]
+        cached = self._clients.get(server.id)
+        if cached is not None and cached[0] == server.base_url and cached[1] == server.api_token_encrypted:
+            return cached[2]
+        client = self._client_factory(server.base_url, server.api_token_encrypted)
+        self._clients[server.id] = (server.base_url, server.api_token_encrypted, client)
+        return client
 
-    async def handshake_and_update(self, server: ProviderServerRecord) -> ProviderServerRecord:
+    async def handshake_and_update(
+        self,
+        server: ProviderServerRecord,
+        verify: bool = False,
+    ) -> ProviderServerRecord:
         """Execute handshake and health check, updating persisted record with live capabilities."""
         client = self.get_provider_client(server)
-        health = await client.check_health()
+        health = (
+            await client.check_health(verify=verify)
+            if verify and isinstance(client, HttpMusicProviderClient)
+            else await client.check_health()
+        )
         caps: ProviderCapabilities | None = None
-        if health.status in ("ok", "healthy", "ready"):
+        if health.status in ("ok", "healthy", "ready", "degraded"):
             try:
                 caps = await client.get_capabilities()
             except Exception as exc:
@@ -490,7 +534,7 @@ class MultiProviderService:
     async def resolve_track_cascading(
         self,
         identifiers: dict[str, str],
-        fallback: dict[str, object] | None = None,
+        fallback: Mapping[str, object] | None = None,
     ) -> tuple[ProviderServerRecord, TrackResolutionResult, AvailableAudioQuality | None] | None:
         """Resolve a track across all active providers concurrently, ranking by audio quality."""
         servers = await self._repository.list_provider_servers(enabled_only=True)
@@ -518,7 +562,8 @@ class MultiProviderService:
         ) -> tuple[ProviderServerRecord, TrackResolutionResult] | None:
             try:
                 client = self.get_provider_client(srv)
-                res = await client.resolve_track(identifiers, fallback)
+                fallback_dict = dict(fallback) if fallback is not None else None
+                res = await client.resolve_track(identifiers, fallback_dict)
                 if res.matched and res.provider_track_id:
                     return srv, res
             except Exception as exc:
@@ -560,6 +605,7 @@ class MultiProviderService:
         target_path: Path,
         expected_sha256: str | None = None,
         timeout_seconds: float = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
+        headers: dict[str, str] | None = None,
     ) -> Path:
         """Stream download file from URL to target_path and verify SHA-256."""
         target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -567,7 +613,7 @@ class MultiProviderService:
 
         async with (
             httpx.AsyncClient(timeout=timeout_seconds, follow_redirects=True) as client,
-            client.stream("GET", download_url) as resp,
+            client.stream("GET", download_url, headers=headers) as resp,
         ):
             resp.raise_for_status()
             with target_path.open("wb") as f:
@@ -649,6 +695,12 @@ class MultiProviderService:
                 await self._notifier.send_song_request_card(saved, user)
             except Exception as exc:
                 logger.error("Failed to post song request card to admin channel: %s", exc)
+        elif (
+            is_uploader_or_above
+            and self._auto_provision_uploader_requests
+            and self._on_artifact_ready is not None
+        ):
+            self.schedule_provision_request(saved.id)
 
         return saved, is_uploader_or_above
 
@@ -673,4 +725,150 @@ class MultiProviderService:
                 await self._notifier.send_song_request_resolved_audit(updated, reviewer, new_status)
             except Exception as exc:
                 logger.error("Failed to post song request resolution audit: %s", exc)
+        if updated and approved and self._on_artifact_ready is not None:
+            self.schedule_provision_request(updated.id)
         return updated
+
+    def schedule_provision_request(self, request_id: int) -> None:
+        """Launch asynchronous background provisioning for an approved song request."""
+        task = asyncio.create_task(self._safe_provision_request(request_id))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _safe_provision_request(self, request_id: int) -> None:
+        """Wrapper executing provisioning while logging unhandled failures."""
+        try:
+            await self.execute_provision_request(request_id)
+        except Exception as exc:
+            logger.error("Unhandled error provisioning song request #%d: %s", request_id, exc)
+
+    async def execute_provision_request(self, request_id: int) -> SongRequestRecord | None:
+        """Resolve, provision, download, verify, and enqueue an approved song request."""
+        record = await self._repository.get_song_request(request_id)
+        if record is None:
+            return None
+
+        fallback = {
+            "title": record.track_title,
+            "artist": record.artist_name,
+            "album": record.album_name,
+        }
+        try:
+            resolved = await self.resolve_track_cascading(
+                identifiers=record.identifiers,
+                fallback=fallback,
+            )
+            if resolved is None:
+                msg = "No configured music provider matched this request."
+                failed = await self._repository.update_song_request_job_and_track(
+                    request_id,
+                    status=SongRequestStatus.FAILED,
+                    error_message=msg,
+                )
+                await self._notify_user_safely(
+                    record.telegram_id,
+                    f"❌ Provisioning failed for <b>{record.track_title}</b>: {msg}",
+                )
+                return failed
+
+            server, track_res, best_quality = resolved
+            if not track_res.provider_track_id:
+                raise ProvisioningFailedError("Provider resolved track without a provider_track_id.")
+            client = self.get_provider_client(server)
+            chosen_quality = record.target_quality or (best_quality.quality_id if best_quality else None)
+
+            await self._repository.update_song_request_job_and_track(
+                request_id,
+                status=SongRequestStatus.PROVISIONING,
+                provider_id=server.id,
+            )
+
+            prov_resp = await client.request_provision(
+                provider_track_id=track_res.provider_track_id,
+                target_quality=chosen_quality,
+            )
+
+            download_url = prov_resp.download_url
+            expected_sha = prov_resp.checksum_sha256
+            if not download_url and prov_resp.job_id:
+                job_status = await self.poll_provision_completion(
+                    client,
+                    prov_resp.job_id,
+                    timeout_seconds=self._download_timeout_seconds,
+                )
+                download_url = job_status.download_url
+                expected_sha = expected_sha or job_status.checksum_sha256
+
+            if not download_url:
+                raise ProvisioningFailedError("Provider completed without supplying a download URL.")
+
+            if isinstance(client, HttpMusicProviderClient):
+                full_url = client.resolve_artifact_url(download_url)
+                auth_headers = client.get_auth_headers()
+            else:
+                full_url = (
+                    download_url
+                    if download_url.startswith(("http://", "https://"))
+                    else urljoin(f"{server.base_url.rstrip('/')}/", download_url.lstrip("/"))
+                )
+                auth_headers = (
+                    {"Authorization": f"Bearer {server.api_token_encrypted}"}
+                    if server.api_token_encrypted
+                    else {}
+                )
+
+            parsed_path = urlparse(full_url).path
+            ext = Path(parsed_path).suffix or ".flac"
+            safe_stem = f"req_{record.id}_{record.artist_name}_{record.track_title}"
+            cleaned_stem = "".join(c if c.isalnum() or c in " -_()" else "_" for c in safe_stem).strip()[:80]
+            base_dir = self._staging_dir or (Path("storage") / "scratch" / "provider_staging")
+            target_path = base_dir / f"{cleaned_stem}{ext}"
+
+            downloaded = await self.download_file_with_checksum(
+                download_url=full_url,
+                target_path=target_path,
+                expected_sha256=expected_sha,
+                timeout_seconds=self._download_timeout_seconds,
+                headers=auth_headers,
+            )
+
+            job_id: str | None = None
+            if self._on_artifact_ready is not None:
+                job_id = await self._on_artifact_ready(downloaded, record, server)
+
+            updated = await self._repository.update_song_request_job_and_track(
+                request_id,
+                job_id=job_id,
+                status=SongRequestStatus.COMPLETED,
+                provider_id=server.id,
+            )
+            await self._notify_user_safely(
+                record.telegram_id,
+                f"✅ <b>Provider Acquisition Ready</b>\n"
+                f"Downloaded <b>{record.track_title}</b> — <code>{record.artist_name}</code> "
+                f"via <i>{server.name}</i> and queued for library ingestion.",
+            )
+            return updated
+        except Exception as exc:
+            logger.warning("Provisioning failed for request #%d: %s", request_id, exc)
+            failed = await self._repository.update_song_request_job_and_track(
+                request_id,
+                status=SongRequestStatus.FAILED,
+                error_message=str(exc)[:300],
+            )
+            await self._notify_user_safely(
+                record.telegram_id,
+                f"❌ <b>Provisioning Failed (#{request_id})</b>\n"
+                f"Track: <b>{record.track_title}</b>\n"
+                f"Reason: <code>{str(exc)[:180]}</code>",
+            )
+            return failed
+
+    async def _notify_user_safely(self, telegram_id: int, message: str) -> None:
+        """Dispatch user status notifications cleanly without propagating errors."""
+        if self._notify_requester is None or telegram_id <= 0:
+            return
+        try:
+            await self._notify_requester(telegram_id, message)
+        except Exception as exc:
+            logger.debug("Failed to notify requester %d: %s", telegram_id, exc)

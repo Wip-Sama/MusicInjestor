@@ -13,6 +13,7 @@ from src.bot.keyboards.search import (
 )
 from src.bot.routers.search import (
     handle_album_gap_preview,
+    handle_album_gap_request,
     handle_album_gap_view,
     handle_chat_text_message,
     handle_search_command,
@@ -366,3 +367,46 @@ async def test_handle_search_track_preview() -> None:
     query.message.answer_audio.assert_called_once()
     call_kwargs = query.message.answer_audio.call_args[1]
     assert call_kwargs["title"] == "Idol (Preview)"
+
+
+@pytest.mark.anyio
+async def test_handle_album_gap_request_submits_provider_request() -> None:
+    query = AsyncMock()
+    query.message = AsyncMock()
+    user = UserAccount(telegram_id=123, display_name="Uploader", role=UserRole.UPLOADER)
+    cb = AlbumGapCallback(action="request", album_id="deezer:302127", track_pos=2)
+
+    mock_search = AsyncMock()
+    mock_search.analyze_album_gap.return_value = AlbumGapAnalysis(
+        album_id="deezer:302127",
+        title="Discovery",
+        artist="Daft Punk",
+        total_tracks=2,
+        owned_tracks_count=1,
+        missing_tracks_count=1,
+        tracks=[
+            AlbumTrackGap(
+                position=2,
+                title="Aerodynamic",
+                is_owned=False,
+                external_url="https://www.deezer.com/track/22",
+            ),
+        ],
+    )
+    mock_provider_svc = AsyncMock()
+    mock_provider_svc.submit_song_request.return_value = (MagicMock(id=77), True)
+
+    await handle_album_gap_request(
+        query=query,
+        callback_data=cb,
+        current_user=user,
+        governance_repository=AsyncMock(),
+        album_search_service=mock_search,
+        multi_provider_service=mock_provider_svc,
+    )
+
+    mock_provider_svc.submit_song_request.assert_awaited_once()
+    req_kwargs = mock_provider_svc.submit_song_request.call_args.kwargs
+    assert req_kwargs["track_title"] == "Aerodynamic"
+    assert req_kwargs["artist_name"] == "Daft Punk"
+    assert req_kwargs["identifiers"] == {"url": "https://www.deezer.com/track/22"}

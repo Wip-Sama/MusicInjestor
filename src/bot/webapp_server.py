@@ -63,7 +63,7 @@ from src.core.platform_links import (
     resolve_primary_platform_link,
 )
 from src.core.ports import GovernanceRepositoryPort
-from src.core.provider import MultiProviderService
+from src.core.provider import HttpMusicProviderClient, MultiProviderService
 from src.core.queue import IngestionQueueWorker
 from src.core.radar import ReleaseRadarService
 from src.core.rbac import (
@@ -4016,6 +4016,10 @@ def build_webapp_api(
         stream_url = client.get_stream_url(provider_track_id, quality=request.query.get("quality"))
 
         req_headers: dict[str, str] = {}
+        if isinstance(client, HttpMusicProviderClient):
+            req_headers.update(client.get_auth_headers())
+        elif srv.api_token_encrypted:
+            req_headers["Authorization"] = f"Bearer {srv.api_token_encrypted}"
         if "Range" in request.headers:
             req_headers["Range"] = request.headers["Range"]
 
@@ -4116,6 +4120,10 @@ def build_webapp_api(
                 "artist": r.artist_name,
                 "album": r.album_name,
                 "status": r.status.value,
+                "provider_id": r.provider_id,
+                "job_id": r.job_id,
+                "error_message": r.error_message,
+                "target_quality": r.target_quality,
                 "created_at": r.created_at.isoformat(),
                 "library_track_id": r.library_track_id,
             }
@@ -4289,7 +4297,7 @@ def build_webapp_api(
             return web.json_response({"error": "Provider not found."}, status=404)
 
         ps = active_provider_service or MultiProviderService(repository=catalog_repository)
-        updated = await ps.handshake_and_update(srv)
+        updated = await ps.handshake_and_update(srv, verify=True)
         return web.json_response(
             {
                 "success": True,
@@ -4321,6 +4329,132 @@ def build_webapp_api(
         return web.json_response({"success": deleted})
 
     app.router.add_delete("/api/v1/app/admin/providers/{provider_id}", handle_delete_admin_provider)
+
+    async def handle_toggle_admin_provider(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        try:
+            require_permission(user, Permission.MANAGE_PROVIDERS)
+        except PermissionDeniedError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
+
+        provider_id = request.match_info["provider_id"]
+        srv = await catalog_repository.get_provider_server(provider_id)
+        if srv is None:
+            return web.json_response({"error": "Provider not found."}, status=404)
+
+        updated_srv = ProviderServerRecord(
+            id=srv.id,
+            name=srv.name,
+            base_url=srv.base_url,
+            api_token_encrypted=srv.api_token_encrypted,
+            priority=srv.priority,
+            is_enabled=not srv.is_enabled,
+            capabilities=srv.capabilities,
+            last_health_status=srv.last_health_status,
+            last_health_checked_at=srv.last_health_checked_at,
+            created_at=srv.created_at,
+        )
+        saved = await catalog_repository.upsert_provider_server(updated_srv)
+        return web.json_response({"success": True, "id": saved.id, "is_enabled": saved.is_enabled})
+
+    app.router.add_post("/api/v1/app/admin/providers/{provider_id}/toggle", handle_toggle_admin_provider)
+
+    async def handle_get_providers_status(request: web.Request) -> web.Response:
+        await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        if catalog_repository is None:
+            return web.json_response({"has_providers": False, "enabled_count": 0, "providers": []})
+
+        servers = await catalog_repository.list_provider_servers(enabled_only=True)
+        providers_info = [
+            {
+                "id": s.id,
+                "name": s.name,
+                "health": s.last_health_status or "unknown",
+                "supported_sources": list(s.capabilities.supported_sources) if s.capabilities else [],
+                "streaming": s.capabilities.features.streaming if s.capabilities else False,
+            }
+            for s in servers
+        ]
+        return web.json_response(
+            {
+                "has_providers": len(servers) > 0,
+                "enabled_count": len(servers),
+                "providers": providers_info,
+            }
+        )
+
+    app.router.add_get("/api/v1/app/providers/status", handle_get_providers_status)
+
+    async def handle_resolve_provider_track(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        try:
+            require_permission(user, Permission.REQUEST_SONG)
+        except PermissionDeniedError as exc:
+            return web.json_response({"error": str(exc)}, status=403)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON body."}, status=400)
+
+        if not isinstance(body, dict):
+            return web.json_response({"error": "JSON object expected."}, status=400)
+
+        identifiers = dict(body.get("identifiers") or {})
+        fallback = {
+            "title": str(body.get("title") or body.get("track_title") or "").strip(),
+            "artist": str(body.get("artist") or body.get("artist_name") or "").strip(),
+            "album": str(body.get("album") or body.get("album_name") or "").strip(),
+        }
+        ps = active_provider_service or MultiProviderService(repository=catalog_repository)
+        resolved = await ps.resolve_track_cascading(identifiers=identifiers, fallback=fallback)
+        if resolved is None:
+            return web.json_response({"matched": False, "qualities": []})
+
+        srv, res, best_q = resolved
+        stream_supported = (
+            bool(srv.capabilities and srv.capabilities.features.streaming) or res.streaming_supported
+        )
+        return web.json_response(
+            {
+                "matched": True,
+                "provider_id": srv.id,
+                "provider_name": srv.name,
+                "provider_track_id": res.provider_track_id,
+                "matched_source": res.matched_source,
+                "best_quality": best_q.quality_id if best_q else None,
+                "stream_url": (
+                    f"/api/v1/app/stream/provider/{srv.id}/{res.provider_track_id}"
+                    if stream_supported
+                    else None
+                ),
+                "qualities": [
+                    {
+                        "quality_id": q.quality_id,
+                        "codec": q.codec,
+                        "bit_depth": q.bit_depth,
+                        "sample_rate_hz": q.sample_rate_hz,
+                        "bitrate_kbps": q.bitrate_kbps,
+                        "approx_file_size_bytes": q.approx_file_size_bytes,
+                    }
+                    for q in res.available_qualities
+                ],
+            }
+        )
+
+    app.router.add_post("/api/v1/app/providers/resolve", handle_resolve_provider_track)
 
     # 3.1 Release Radar & Artist Monitoring Endpoints
 

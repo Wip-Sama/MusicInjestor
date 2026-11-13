@@ -60,18 +60,30 @@ def build_search_results_keyboard(
                     callback_data=f"songs:view:{trk.library_track_id[:12]}",
                 )
             )
-        elif trk.preview_url:
-            btn_label = f"🎧 Preview: {trk.title[:24]}"
-            builder.row(
+        else:
+            row_btns: list[InlineKeyboardButton] = []
+            if trk.preview_url:
+                row_btns.append(
+                    InlineKeyboardButton(
+                        text=f"🎧 Preview: {trk.title[:16]}",
+                        callback_data=SearchActionCallback(
+                            action="preview",
+                            value=trk.id,
+                            query=result.query[:20],
+                        ).pack(),
+                    )
+                )
+            row_btns.append(
                 InlineKeyboardButton(
-                    text=btn_label,
+                    text=f"📥 Request: {trk.title[:14]}" if not row_btns else "📥 Request",
                     callback_data=SearchActionCallback(
-                        action="preview",
-                        value=trk.id,
-                        query=result.query[:20],
+                        action="request",
+                        value=trk.id[:20],
+                        query=f"{trk.artist} - {trk.title}"[:24],
                     ).pack(),
                 )
             )
+            builder.row(*row_btns)
 
     # 3. Scope toggle button
     next_scope = "library" if result.scope == "global" else "global"
@@ -111,8 +123,9 @@ def build_album_gap_keyboard(
     """Build keyboard for album gap analysis, offering track previews and library play buttons."""
     builder = InlineKeyboardBuilder()
 
-    # Track actions (preview missing tracks or play library tracks)
+    # Track actions (preview/request missing tracks or play library tracks)
     # Up to 8 tracks displayed as direct buttons to avoid huge keyboards
+    missing_count = 0
     for trk in gap.tracks[:8]:
         if trk.is_owned and trk.library_track_id:
             builder.row(
@@ -121,17 +134,43 @@ def build_album_gap_keyboard(
                     callback_data=f"songs:view:{trk.library_track_id[:12]}",
                 )
             )
-        elif trk.preview_url:
-            builder.row(
+        else:
+            missing_count += 1
+            row_btns: list[InlineKeyboardButton] = []
+            if trk.preview_url:
+                row_btns.append(
+                    InlineKeyboardButton(
+                        text=f"🎧 Preview #{trk.position} {trk.title[:14]}",
+                        callback_data=AlbumGapCallback(
+                            action="preview",
+                            album_id=gap.album_id,
+                            track_pos=trk.position,
+                        ).pack(),
+                    )
+                )
+            row_btns.append(
                 InlineKeyboardButton(
-                    text=f"🎧 Preview #{trk.position} {trk.title[:22]} (30s)",
+                    text="📥 Request" if row_btns else f"📥 Request #{trk.position} {trk.title[:16]}",
                     callback_data=AlbumGapCallback(
-                        action="preview",
+                        action="request",
                         album_id=gap.album_id,
                         track_pos=trk.position,
                     ).pack(),
                 )
             )
+            builder.row(*row_btns)
+
+    if missing_count > 0 or gap.owned_tracks_count < gap.total_tracks:
+        builder.row(
+            InlineKeyboardButton(
+                text="💿 Request Album via Provider",
+                callback_data=AlbumGapCallback(
+                    action="request",
+                    album_id=gap.album_id,
+                    track_pos=0,
+                ).pack(),
+            )
+        )
 
     # External streaming link if present
     if gap.external_url and gap.external_url.startswith("http"):

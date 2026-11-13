@@ -402,8 +402,15 @@ class GovernanceRepositoryPort(Protocol):
     async def create_release_notifications(
         self,
         notifications: Sequence[ReleaseNotification],
+    ) -> list[ReleaseNotification]:
+        """Persist release notifications for followers, returning only newly created alerts."""
+        ...
+
+    async def mark_release_notifications_delivered(
+        self,
+        notification_ids: Sequence[int],
     ) -> None:
-        """Persist release notifications for followers."""
+        """Record delivery timestamps for sent release notifications."""
         ...
 
     async def list_user_release_notifications(
@@ -479,8 +486,10 @@ class GovernanceRepositoryPort(Protocol):
         job_id: str | None = None,
         library_track_id: str | None = None,
         status: SongRequestStatus | None = None,
+        provider_id: str | None = None,
+        error_message: str | None = None,
     ) -> SongRequestRecord | None:
-        """Update provisioning job ID, final library track ID, and status for a request."""
+        """Update provisioning job ID, final library track ID, provider ID, error, and status."""
         ...
 
 

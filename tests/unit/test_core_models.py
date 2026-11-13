@@ -1045,3 +1045,59 @@ def test_primary_artist_character_stripping_and_bilingual_genius_lastfm_enrichme
     )
     assert final_plain.with_suffix(".lrc").is_file()
     assert final_plain.with_suffix(".lrc").read_text(encoding="utf-8") == "Plain unsynced lyrics line"
+
+
+def test_metadata_find_candidates_caches_and_honors_budget() -> None:
+    """Verify metadata candidate lookups cache repeated queries when search_fn is not overridden."""
+    service = MusicBrainzMetadataService(
+        enable_network=True,
+        candidate_lookup_budget_seconds=5.0,
+    )
+    meta = TrackMetadata(title="Digital Love", artist="Daft Punk", album="Discovery")
+    expected_candidate = MetadataCandidate(
+        metadata=TrackMetadata(title="Digital Love", artist="Daft Punk", album="Discovery"),
+        confidence=0.98,
+    )
+
+    with (
+        patch.object(service._throttler, "throttle", new=AsyncMock()),
+        patch.object(
+            service,
+            "_search_all_providers_sync",
+            return_value=[expected_candidate],
+        ) as mock_search_all,
+    ):
+        first = asyncio.run(service.find_candidates(meta))
+        second = asyncio.run(service.find_candidates(meta))
+        assert len(first) == 1
+        assert len(second) == 1
+        assert mock_search_all.call_count == 1
+
+
+@pytest.mark.anyio
+async def test_chromaprint_fingerprinter_timeout_kills_process(tmp_path: Path) -> None:
+    """Verify hung fpcalc subprocesses are terminated after timeout."""
+    audio_file = tmp_path / "hung.flac"
+    audio_file.write_bytes(MINIMAL_FLAC_BYTES)
+
+    mock_proc = AsyncMock()
+    mock_proc.kill = lambda: None
+    mock_proc.wait = AsyncMock(return_value=-9)
+
+    async def _slow_communicate():
+        await asyncio.sleep(1.0)
+        return b"", b""
+
+    mock_proc.communicate = _slow_communicate
+
+    async def _fake_wait_for(coro, timeout: float):
+        coro.close()
+        raise TimeoutError
+
+    fp = ChromaprintFingerprinter(fpcalc_binary="fpcalc")
+    with (
+        patch("src.core.fingerprint.asyncio.create_subprocess_exec", return_value=mock_proc),
+        patch("src.core.fingerprint.asyncio.wait_for", side_effect=_fake_wait_for),
+        pytest.raises(FingerprintingError, match="timed out"),
+    ):
+        await fp.compute_fingerprint(audio_file)

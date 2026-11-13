@@ -30,6 +30,7 @@ from src.bot.routers.radar import (
     handle_radar_play_full_track,
     handle_radar_preview_audio,
     handle_radar_preview_individual_track,
+    handle_radar_request_release,
     handle_radar_test_alert,
     handle_radar_toggle_follow,
     handle_radar_view_release,
@@ -541,3 +542,45 @@ async def test_handle_radar_test_alert() -> None:
     assert call_args["chat_id"] == 123
     assert "[TEST NOTIFICATION]" in call_args["text"]
     assert "YOASOBI" in call_args["text"]
+
+
+@pytest.mark.anyio
+async def test_radar_release_keyboard_has_request_button_and_submits() -> None:
+    """Verify unowned Radar releases expose Request button and submit via MultiProviderService."""
+    rel = DiscoveredRelease(
+        id="deezer:rel_77",
+        artist_name="YOASOBI",
+        title="Idol",
+        release_type="single",
+        release_date="2023-04-12",
+        provider_release_id="rel_77",
+        external_url="https://www.deezer.com/album/77",
+    )
+    kb = build_release_detail_keyboard(rel, is_followed=True)
+    flat_texts = [btn.text for row in kb.inline_keyboard for btn in row]
+    assert any("Request" in t for t in flat_texts)
+
+    repo = AsyncMock(spec=GovernanceRepositoryPort)
+    repo.get_discovered_release.return_value = rel
+    user = UserAccount(telegram_id=123, display_name="Uploader", role=UserRole.UPLOADER)
+
+    query = MagicMock(spec=CallbackQuery)
+    query.from_user = User(id=123, is_bot=False, first_name="Uploader")
+    query.answer = AsyncMock()
+    query.message = MagicMock(spec=Message)
+
+    mock_ps = AsyncMock()
+    mock_ps.submit_song_request.return_value = (MagicMock(id=88), True)
+
+    await handle_radar_request_release(
+        query=query,
+        callback_data=RadarCallback(action="request", target_id="deezer:rel_77"),
+        current_user=user,
+        governance_repository=repo,
+        multi_provider_service=mock_ps,
+    )
+    mock_ps.submit_song_request.assert_awaited_once()
+    kwargs = mock_ps.submit_song_request.call_args.kwargs
+    assert kwargs["track_title"] == "Idol"
+    assert kwargs["artist_name"] == "YOASOBI"
+    assert kwargs["identifiers"] == {"deezer_id": "rel_77"}

@@ -48,6 +48,19 @@ _URL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Short-lived in-memory lookup mapping short track IDs to (title, artist, album) so inline buttons
+# stay within Telegram's 64-byte callback_data limit without truncating artist/title metadata.
+_SEARCH_ITEM_CACHE: dict[str, tuple[str, str, str]] = {}
+
+
+def _cache_search_result_items(result: UnifiedSearchResult) -> None:
+    """Record full metadata from search results for follow-up preview/request callbacks."""
+    for trk in result.tracks:
+        if trk.id:
+            if len(_SEARCH_ITEM_CACHE) >= 512:
+                _SEARCH_ITEM_CACHE.pop(next(iter(_SEARCH_ITEM_CACHE)))
+            _SEARCH_ITEM_CACHE[trk.id[:20]] = (trk.title, trk.artist, trk.album)
+
 
 def format_search_results_card(result: UnifiedSearchResult) -> str:
     """Format unified search results screen presenting albums and tracks."""
@@ -239,6 +252,7 @@ async def handle_chat_text_message(
     prefs = await governance_repository.get_user_preferences(current_user.telegram_id)
     scope = prefs.search_scope or "global"
     result = await album_search_service.search(query=text, scope=scope)
+    _cache_search_result_items(result)
 
     web_url = settings.web_app_url.strip() if settings and settings.web_app_url else None
     card = format_search_results_card(result)
@@ -381,6 +395,7 @@ async def handle_search_scope_toggle(
 
     await ack_callback(query, f"Switched scope to {new_scope.capitalize()}!")
     result = await album_search_service.search(query=callback_data.query, scope=new_scope)
+    _cache_search_result_items(result)
 
     web_url = settings.web_app_url.strip() if settings and settings.web_app_url else None
     card = format_search_results_card(result)
@@ -549,11 +564,96 @@ async def handle_search_back(
     prefs = await governance_repository.get_user_preferences(current_user.telegram_id)
     scope = prefs.search_scope or "global"
     result = await album_search_service.search(query=raw_query, scope=scope)
+    _cache_search_result_items(result)
 
     web_url = settings.web_app_url.strip() if settings and settings.web_app_url else None
     card = format_search_results_card(result)
     markup = build_search_results_keyboard(result, web_app_url=web_url)
     await safe_edit_text(query.message, card, reply_markup=markup)
+
+
+@search_router.callback_query(AlbumGapCallback.filter(F.action == "request"))
+async def handle_album_gap_request(
+    query: CallbackQuery,
+    callback_data: AlbumGapCallback,
+    current_user: UserAccount | None = None,
+    governance_repository: GovernanceRepositoryPort | None = None,
+    album_search_service: AlbumSearchService | None = None,
+    notifier: AdminLogNotifierPort | None = None,
+    multi_provider_service: MultiProviderService | None = None,
+) -> None:
+    """Submit a song or full-album acquisition request from Album Gap Analysis."""
+    if query.message is None or current_user is None or governance_repository is None:
+        await ack_callback(query)
+        return
+
+    if not has_permission(current_user, Permission.REQUEST_SONG):
+        await ack_callback(
+            query,
+            "🔒 Access Denied: You must be at least a LISTENER to request songs.",
+            show_alert=True,
+        )
+        return
+
+    if album_search_service is None:
+        await ack_callback(query, "Search service unavailable.", show_alert=True)
+        return
+
+    alb_id = callback_data.album_id
+    provider_id = alb_id.replace("deezer:", "", 1) if alb_id.startswith("deezer:") else None
+    gap = await album_search_service.analyze_album_gap(
+        artist="",
+        album="",
+        provider_release_id=provider_id,
+    )
+
+    target_pos = callback_data.track_pos
+    req_type = SongRequestType.ALBUM if target_pos <= 0 else SongRequestType.TRACK
+    identifiers: dict[str, str] = {}
+    if target_pos > 0:
+        target_track = next((t for t in gap.tracks if t.position == target_pos), None)
+        title = target_track.title if target_track else gap.title
+        if target_track and target_track.external_url:
+            identifiers["url"] = target_track.external_url
+        elif provider_id:
+            identifiers["deezer_id"] = provider_id
+    else:
+        title = gap.title
+        if provider_id:
+            identifiers["deezer_id"] = provider_id
+
+    provider_service = multi_provider_service or MultiProviderService(
+        repository=governance_repository, notifier=notifier
+    )
+    try:
+        record, is_auto_approved = await provider_service.submit_song_request(
+            user=current_user,
+            request_type=req_type,
+            track_title=title or "Unknown Track",
+            artist_name=gap.artist or "Unknown Artist",
+            album_name=gap.title,
+            identifiers=identifiers,
+        )
+        if is_auto_approved:
+            await ack_callback(
+                query,
+                "✅ Provisioning queued! You will be notified when ready.",
+                show_alert=True,
+            )
+            await query.message.answer(
+                f"⬇️ <b>Provisioning Queued</b>\n"
+                f"Requested <b>{html.escape(title)}</b> — <code>{html.escape(gap.artist)}</code>."
+            )
+        else:
+            await ack_callback(query, "📥 Song request submitted for moderator approval.", show_alert=True)
+            await query.message.answer(
+                f"📥 <b>Song Request Submitted (#{record.id})</b>\n"
+                f"Your request for <b>{html.escape(title)}</b> — <code>{html.escape(gap.artist)}</code> "
+                f"is awaiting moderator approval."
+            )
+    except Exception as exc:
+        logger.error("Failed to submit album gap request: %s", exc)
+        await ack_callback(query, f"Failed to submit request: {exc}", show_alert=True)
 
 
 @search_router.callback_query(SearchActionCallback.filter(F.action == "request"))
@@ -563,8 +663,9 @@ async def handle_search_track_request(
     current_user: UserAccount | None = None,
     governance_repository: GovernanceRepositoryPort | None = None,
     notifier: AdminLogNotifierPort | None = None,
+    multi_provider_service: MultiProviderService | None = None,
 ) -> None:
-    """Submit a song acquisition request from audio preview buttons."""
+    """Submit a song acquisition request from search results or audio preview buttons."""
     if query.message is None or current_user is None or governance_repository is None:
         await ack_callback(query)
         return
@@ -586,17 +687,27 @@ async def handle_search_track_request(
         title = parts[1].strip()
 
     target_id = callback_data.value.strip()
+    album_name = ""
+    cached = _SEARCH_ITEM_CACHE.get(target_id)
+    if cached is not None:
+        title, artist, album_name = cached
+
     identifiers: dict[str, str] = {}
     if target_id:
-        identifiers["deezer_id"] = target_id
+        clean_id = target_id.replace("deezer:", "", 1).split(":")[0]
+        if clean_id:
+            identifiers["deezer_id"] = clean_id
 
-    provider_service = MultiProviderService(repository=governance_repository, notifier=notifier)
+    provider_service = multi_provider_service or MultiProviderService(
+        repository=governance_repository, notifier=notifier
+    )
     try:
         record, is_auto_approved = await provider_service.submit_song_request(
             user=current_user,
             request_type=SongRequestType.TRACK,
             track_title=title or "Unknown Track",
             artist_name=artist or "Unknown Artist",
+            album_name=album_name,
             identifiers=identifiers,
         )
         if is_auto_approved:

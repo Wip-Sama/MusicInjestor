@@ -228,9 +228,11 @@ def test_admin_and_onboarding_keyboards_and_parsers() -> None:
     assert paused_kb.inline_keyboard[1][1].callback_data == "queue:cancel:job-uuid-1"
 
     dash_kb = build_admin_dashboard_keyboard(queued_count=3, concurrency_limit=2)
-    assert len(dash_kb.inline_keyboard) == 4
+    assert len(dash_kb.inline_keyboard) == 5
     assert "View Queue (3)" in dash_kb.inline_keyboard[0][1].text
     assert "Concurrency: [2]" in dash_kb.inline_keyboard[1][1].text
+    assert "Music Providers" in dash_kb.inline_keyboard[2][0].text
+    assert "Song Requests" in dash_kb.inline_keyboard[2][1].text
 
     sample_user = UserAccount(
         telegram_id=987654321,

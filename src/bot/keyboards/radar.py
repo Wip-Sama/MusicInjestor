@@ -142,6 +142,13 @@ def build_release_detail_keyboard(
                 callback_data=SongsTrackCallback(action="view", track_id=resolved_track).pack(),
             )
         )
+    elif not release.in_library:
+        builder.row(
+            InlineKeyboardButton(
+                text="📥 Request / Download via Provider",
+                callback_data=RadarCallback(action="request", target_id=release.id, page=page).pack(),
+            )
+        )
 
     # Follow/Unfollow toggle
     follow_text = f"🔕 Unfollow {release.artist_name}" if is_followed else f"🔔 Follow {release.artist_name}"
@@ -332,6 +339,12 @@ def build_release_notification_keyboard(
             )
         )
         builder.row(*row1)
+        builder.row(
+            InlineKeyboardButton(
+                text="📥 Request / Download via Provider",
+                callback_data=RadarCallback(action="request", target_id=release.id).pack(),
+            )
+        )
 
         if web_app_url and web_app_url.strip():
             builder.row(

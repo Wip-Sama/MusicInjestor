@@ -9,10 +9,12 @@ import {
   ListFilter,
   Lock,
   Sparkles,
+  Download,
 } from 'lucide-react';
 import { FileDropzone } from '../components/ingest/FileDropzone';
 import { JobCard } from '../components/queue/JobCard';
 import { JobEditModal } from '../components/queue/JobEditModal';
+import { SongRequestItem, fetchMySongRequests } from '../lib/providerApi';
 import {
   fetchQueue,
   pauseJob,
@@ -42,11 +44,16 @@ export const IngestQueueView: React.FC<IngestQueueViewProps> = ({ profile }) => 
   const [sseConnected, setSseConnected] = useState<boolean>(false);
   const [editingJob, setEditingJob] = useState<QueueJob | null>(null);
   const [editingCandidate, setEditingCandidate] = useState<CandidateItem | null>(null);
+  const [myRequests, setMyRequests] = useState<SongRequestItem[]>([]);
 
   const loadQueue = useCallback(async () => {
     try {
-      const data = await fetchQueue(activeTab === 'mine');
+      const [data, reqs] = await Promise.all([
+        fetchQueue(activeTab === 'mine'),
+        fetchMySongRequests().catch(() => [] as SongRequestItem[]),
+      ]);
       setQueueData(data);
+      setMyRequests(reqs);
       if (data.active_bulk_research !== undefined) {
         setBulkResearch(data.active_bulk_research);
       }
@@ -535,6 +542,96 @@ export const IngestQueueView: React.FC<IngestQueueViewProps> = ({ profile }) => 
           }}
         >
           {error}
+        </div>
+      )}
+
+      {/* My External Provider Requests */}
+      {myRequests.length > 0 && (
+        <div
+          style={{
+            backgroundColor: 'var(--tg-theme-bg-color, #1c1c1e)',
+            borderRadius: '12px',
+            border: '1px solid var(--tg-theme-secondary-bg-color, #2c2c2e)',
+            padding: '10px 12px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '8px',
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              fontSize: '12px',
+              fontWeight: 700,
+              color: '#bf5af2',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <Download size={14} />
+              <span>My Provider Song Requests ({myRequests.length})</span>
+            </div>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+            {myRequests.slice(0, 8).map((req) => {
+              const statusColor =
+                req.status === 'COMPLETED'
+                  ? '#30d158'
+                  : req.status === 'FAILED' || req.status === 'REJECTED'
+                    ? '#ff453a'
+                    : req.status === 'PROVISIONING' || req.status === 'APPROVED'
+                      ? '#0a84ff'
+                      : '#ff9f0a';
+              return (
+                <div
+                  key={req.id}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: '8px',
+                    padding: '6px 8px',
+                    borderRadius: '8px',
+                    backgroundColor: 'var(--tg-theme-secondary-bg-color, #2c2c2e)',
+                  }}
+                >
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div
+                      style={{
+                        fontSize: '12px',
+                        fontWeight: 600,
+                        color: 'var(--tg-theme-text-color, #ffffff)',
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                      }}
+                    >
+                      {req.artist} — {req.title}
+                    </div>
+                    <div style={{ fontSize: '10px', color: 'var(--tg-theme-subtitle-text-color, #8e8e93)' }}>
+                      {req.request_type}
+                      {req.album ? ` • ${req.album}` : ''}
+                      {req.error_message ? ` • ${req.error_message}` : ''}
+                    </div>
+                  </div>
+                  <span
+                    style={{
+                      fontSize: '10px',
+                      fontWeight: 700,
+                      padding: '2px 6px',
+                      borderRadius: '4px',
+                      backgroundColor: `${statusColor}22`,
+                      color: statusColor,
+                      flexShrink: 0,
+                    }}
+                  >
+                    {req.status}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
         </div>
       )}
 

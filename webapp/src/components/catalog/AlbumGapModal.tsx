@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { X, Play, Pause, ExternalLink, Disc, Send, Bot, Check, Globe } from 'lucide-react';
+import { X, Play, Pause, ExternalLink, Disc, Send, Bot, Check, Globe, Download } from 'lucide-react';
 import { hapticFeedback } from '@telegram-apps/sdk-react';
 import { useAudioPlayer } from '../../context/AudioPlayerContext';
 import { apiFetch } from '../../lib/auth';
+import { fetchProvidersStatus, submitSongRequest, SubmitSongRequestPayload } from '../../lib/providerApi';
 import { AlbumGapAnalysis, TrackItem } from '../../types/music';
 
 interface AlbumGapModalProps {
@@ -38,6 +39,9 @@ export const AlbumGapModal: React.FC<AlbumGapModalProps> = ({
   const [copiedLinkId, setCopiedLinkId] = useState<string | null>(null);
   const [platformMenuTrackPos, setPlatformMenuTrackPos] = useState<number | null>(null);
   const [showAlbumPlatformMenu, setShowAlbumPlatformMenu] = useState<boolean>(false);
+  const [hasProviders, setHasProviders] = useState<boolean>(false);
+  const [requestStatuses, setRequestStatuses] = useState<Record<string, string>>({});
+  const [requestingKeys, setRequestingKeys] = useState<Record<string, boolean>>({});
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isLongPressTriggeredRef = useRef<boolean>(false);
 
@@ -101,6 +105,48 @@ export const AlbumGapModal: React.FC<AlbumGapModalProps> = ({
       setSendingTrackId(null);
     }, 2000);
   };
+
+  const handleRequestViaProvider = async (
+    key: string,
+    payload: SubmitSongRequestPayload
+  ) => {
+    if (requestingKeys[key]) return;
+    setRequestingKeys((prev) => ({ ...prev, [key]: true }));
+    setRequestStatuses((prev) => ({ ...prev, [key]: 'Sending...' }));
+    try {
+      const resp = await submitSongRequest(payload);
+      try {
+        if (hapticFeedback.notificationOccurred.isAvailable()) {
+          hapticFeedback.notificationOccurred('success');
+        }
+      } catch {
+        // ignore outside Telegram
+      }
+      setRequestStatuses((prev) => ({
+        ...prev,
+        [key]: resp.is_auto_approved ? 'Queued' : 'Pending',
+      }));
+    } catch (err: unknown) {
+      try {
+        if (hapticFeedback.notificationOccurred.isAvailable()) {
+          hapticFeedback.notificationOccurred('error');
+        }
+      } catch {
+        // ignore outside Telegram
+      }
+      const msg = err instanceof Error ? err.message : 'Failed';
+      setRequestStatuses((prev) => ({ ...prev, [key]: msg.slice(0, 24) || 'Failed' }));
+    } finally {
+      setRequestingKeys((prev) => ({ ...prev, [key]: false }));
+    }
+  };
+
+  useEffect(() => {
+    if (!isOpen) return;
+    fetchProvidersStatus()
+      .then((res) => setHasProviders(Boolean(res.has_providers && res.enabled_count > 0)))
+      .catch(() => setHasProviders(false));
+  }, [isOpen]);
 
   useEffect(() => {
     if (!isOpen || !albumId) {
@@ -336,7 +382,7 @@ export const AlbumGapModal: React.FC<AlbumGapModalProps> = ({
               </div>
 
               {/* Album Actions Row */}
-              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
                 {gapData.owned_tracks_count > 0 && (
                   <button
                     onClick={handleSendAlbumToChat}
@@ -365,6 +411,53 @@ export const AlbumGapModal: React.FC<AlbumGapModalProps> = ({
                   >
                     <Send size={14} />
                     <span>{albumSendStatus || `Send All Owned (${gapData.owned_tracks_count})`}</span>
+                  </button>
+                )}
+
+                {hasProviders && gapData.missing_tracks_count > 0 && (
+                  <button
+                    onClick={() =>
+                      handleRequestViaProvider(`album_${gapData.album_id}`, {
+                        request_type: 'ALBUM',
+                        track_title: gapData.title,
+                        artist_name: gapData.artist,
+                        album_name: gapData.title,
+                        identifiers: {
+                          ...(gapData.album_id ? { deezer: String(gapData.album_id) } : {}),
+                          ...(gapData.external_url ? { url: gapData.external_url } : {}),
+                        },
+                      })
+                    }
+                    disabled={Boolean(requestingKeys[`album_${gapData.album_id}`])}
+                    title="Request missing album via configured External Music Provider"
+                    style={{
+                      flex: 1,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: '6px',
+                      padding: '8px 12px',
+                      borderRadius: '8px',
+                      border: 'none',
+                      backgroundColor:
+                        requestStatuses[`album_${gapData.album_id}`] === 'Queued' ||
+                        requestStatuses[`album_${gapData.album_id}`] === 'Pending'
+                          ? 'rgba(48, 209, 88, 0.2)'
+                          : 'rgba(191, 90, 242, 0.18)',
+                      color:
+                        requestStatuses[`album_${gapData.album_id}`] === 'Queued' ||
+                        requestStatuses[`album_${gapData.album_id}`] === 'Pending'
+                          ? '#30d158'
+                          : '#bf5af2',
+                      cursor: requestingKeys[`album_${gapData.album_id}`] ? 'default' : 'pointer',
+                      fontSize: '12px',
+                      fontWeight: 600,
+                    }}
+                  >
+                    <Download size={14} />
+                    <span>
+                      {requestStatuses[`album_${gapData.album_id}`] || 'Request Missing Album'}
+                    </span>
                   </button>
                 )}
 
@@ -498,6 +591,51 @@ export const AlbumGapModal: React.FC<AlbumGapModalProps> = ({
                           </button>
                         ) : (
                           <span style={{ fontSize: '11px', color: '#8e8e93' }}>No preview</span>
+                        )}
+
+                        {hasProviders && !trk.is_owned && (
+                          <button
+                            onClick={() =>
+                              handleRequestViaProvider(`trk_${trk.position}_${trk.title}`, {
+                                request_type: 'TRACK',
+                                track_title: trk.title,
+                                artist_name: gapData.artist,
+                                album_name: gapData.title,
+                                identifiers: {
+                                  ...(trk.external_url || trk.primary_url
+                                    ? { url: (trk.external_url || trk.primary_url) as string }
+                                    : {}),
+                                  ...(trk.external_links ? trk.external_links : {}),
+                                },
+                              })
+                            }
+                            disabled={Boolean(requestingKeys[`trk_${trk.position}_${trk.title}`])}
+                            title="Request & download track via External Music Provider"
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '4px',
+                              padding: '5px 8px',
+                              borderRadius: '6px',
+                              border: 'none',
+                              backgroundColor:
+                                requestStatuses[`trk_${trk.position}_${trk.title}`] === 'Queued' ||
+                                requestStatuses[`trk_${trk.position}_${trk.title}`] === 'Pending'
+                                  ? 'rgba(48, 209, 88, 0.2)'
+                                  : 'rgba(191, 90, 242, 0.18)',
+                              color:
+                                requestStatuses[`trk_${trk.position}_${trk.title}`] === 'Queued' ||
+                                requestStatuses[`trk_${trk.position}_${trk.title}`] === 'Pending'
+                                  ? '#30d158'
+                                  : '#bf5af2',
+                              cursor: requestingKeys[`trk_${trk.position}_${trk.title}`] ? 'default' : 'pointer',
+                              fontSize: '11px',
+                              fontWeight: 600,
+                            }}
+                          >
+                            <Download size={12} />
+                            <span>{requestStatuses[`trk_${trk.position}_${trk.title}`] || 'Request'}</span>
+                          </button>
                         )}
 
                         {/* Streaming Platform Link for Track (tap to open, long-press to copy) */}

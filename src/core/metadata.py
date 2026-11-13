@@ -3,7 +3,10 @@
 import asyncio
 import logging
 import re
+import threading
+import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -925,6 +928,8 @@ class MusicBrainzMetadataService:
         release_lookup_fn: ReleaseLookupFn | None = None,
         http_transport: httpx.BaseTransport | None = None,
         throttler: ApiThrottler | None = None,
+        candidate_cache_ttl_seconds: float = 600.0,
+        candidate_lookup_budget_seconds: float = 8.0,
     ) -> None:
         self._app_name = app_name
         self._app_version = app_version
@@ -936,6 +941,10 @@ class MusicBrainzMetadataService:
         self._release_lookup_fn = release_lookup_fn
         self._http_transport = http_transport
         self._throttler = throttler or default_api_throttler
+        self._candidate_cache_ttl_seconds = max(0.0, candidate_cache_ttl_seconds)
+        self._candidate_lookup_budget_seconds = max(1.0, candidate_lookup_budget_seconds)
+        self._candidate_cache: dict[tuple[str, ...], tuple[float, list[MetadataCandidate]]] = {}
+        self._cache_lock = threading.Lock()
         musicbrainzngs.set_useragent(self._app_name, self._app_version, self._contact)
 
     async def read_local_metadata(self, audio_path: Path) -> TrackMetadata:
@@ -1079,6 +1088,23 @@ class MusicBrainzMetadataService:
 
         return tracks
 
+    def _build_cache_key(
+        self,
+        local_metadata: TrackMetadata,
+        fingerprint: AudioFingerprint | None,
+    ) -> tuple[str, ...]:
+        """Build a normalized cache key for metadata candidate lookups."""
+        fp_mbid = fingerprint.acoustid_mbid or "" if fingerprint is not None else ""
+        return (
+            local_metadata.artist.strip().lower(),
+            local_metadata.title.strip().lower(),
+            local_metadata.album.strip().lower(),
+            (local_metadata.recording_mbid or "").strip().lower(),
+            (local_metadata.release_mbid or "").strip().lower(),
+            (local_metadata.isrc or "").strip().lower(),
+            fp_mbid.strip().lower(),
+        )
+
     async def find_candidates(
         self,
         local_metadata: TrackMetadata,
@@ -1092,19 +1118,40 @@ class MusicBrainzMetadataService:
             self._app_name,
             self._app_version,
         )
+        cache_key = self._build_cache_key(local_metadata, fingerprint)
+        if self._candidate_cache_ttl_seconds > 0 and self._search_fn is None:
+            now = time.monotonic()
+            with self._cache_lock:
+                cached = self._candidate_cache.get(cache_key)
+                if cached is not None and now < cached[0]:
+                    logger.debug(
+                        "Returning cached metadata candidates for %s - %s",
+                        local_metadata.artist,
+                        local_metadata.title,
+                    )
+                    return list(cached[1])
+
         if self._enable_network or self._search_fn is not None or self._http_transport is not None:
             if self._enable_network:
-                await self._throttler.throttle("musicbrainz")
+                throttle_tasks = [self._throttler.throttle("musicbrainz")]
                 if self._genius_access_token:
-                    await self._throttler.throttle("genius")
+                    throttle_tasks.append(self._throttler.throttle("genius"))
                 if self._lastfm_api_key:
-                    await self._throttler.throttle("lastfm")
+                    throttle_tasks.append(self._throttler.throttle("lastfm"))
+                await asyncio.gather(*throttle_tasks)
             candidates = await asyncio.to_thread(
                 self._search_all_providers_sync,
                 local_metadata,
                 fingerprint,
             )
             if candidates:
+                if self._candidate_cache_ttl_seconds > 0 and self._search_fn is None:
+                    expires_at = time.monotonic() + self._candidate_cache_ttl_seconds
+                    with self._cache_lock:
+                        if len(self._candidate_cache) >= 256:
+                            oldest_key = next(iter(self._candidate_cache))
+                            del self._candidate_cache[oldest_key]
+                        self._candidate_cache[cache_key] = (expires_at, list(candidates))
                 return candidates
 
         return [self._build_fallback_candidate(local_metadata, fingerprint)]
@@ -1172,11 +1219,11 @@ class MusicBrainzMetadataService:
         try:
             with httpx.Client(
                 transport=self._http_transport,
-                timeout=8.0,
+                timeout=5.0,
                 follow_redirects=True,
                 headers=headers,
             ) as client:
-                for q in dict.fromkeys(queries):
+                for q in list(dict.fromkeys(queries))[:2]:
                     if not q.strip():
                         continue
                     search_url = (
@@ -1291,7 +1338,7 @@ class MusicBrainzMetadataService:
         try:
             with httpx.Client(
                 transport=self._http_transport,
-                timeout=8.0,
+                timeout=5.0,
             ) as client:
                 params: dict[str, str | int] = {
                     "method": "track.search",
@@ -1573,6 +1620,7 @@ class MusicBrainzMetadataService:
                 logger.debug("MusicBrainz ISRC search (%s) failed: %s", local_metadata.isrc, exc)
 
         # 4. Title + Artist (including primary singer, CV decomposition, and English alias -> arid lookup)
+        deadline = time.monotonic() + self._candidate_lookup_budget_seconds
         if not recordings and primary_title and primary_title != "Unknown Title":
             artist_variants = extract_artist_search_variants(local_metadata.artist)
             if not artist_variants:
@@ -1588,7 +1636,10 @@ class MusicBrainzMetadataService:
                     logger.warning("MusicBrainz search_recordings failed: %s", exc)
             else:
                 for t_var in title_variants[:2]:
-                    for variant in artist_variants[:3]:
+                    for variant in artist_variants[:2]:
+                        if time.monotonic() >= deadline:
+                            logger.debug("MusicBrainz lookup budget exhausted during title+artist fallback.")
+                            return recordings
                         try:
                             search_resp = musicbrainzngs.search_recordings(
                                 recording=t_var,
@@ -1606,11 +1657,13 @@ class MusicBrainzMetadataService:
                     if recordings:
                         break
 
-                if not recordings:
-                    arids = self._resolve_artist_mbids(artist_variants)
+                if not recordings and time.monotonic() < deadline:
+                    arids = self._resolve_artist_mbids(artist_variants[:2])
                     if arids:
                         arid_clause = " OR ".join(f"arid:{aid}" for aid in arids)
                         for t_var in title_variants[:2]:
+                            if time.monotonic() >= deadline:
+                                break
                             lucene_query = f'recording:"{_escape_lucene(t_var)}" AND ({arid_clause})'
                             try:
                                 arid_resp = musicbrainzngs.search_recordings(query=lucene_query, limit=5)
@@ -1623,7 +1676,7 @@ class MusicBrainzMetadataService:
                             except Exception as exc:
                                 logger.warning("MusicBrainz arid search_recordings failed: %s", exc)
 
-                if not recordings:
+                if not recordings and time.monotonic() < deadline:
                     escaped_artist = _escape_lucene(artist_variants[0])
                     escaped_title = _escape_lucene(primary_title)
                     try:
@@ -1659,8 +1712,11 @@ class MusicBrainzMetadataService:
         extra_titles = [c.metadata.title for c in mb_candidates[:2]] if mb_candidates else []
         external_metas: list[TrackMetadata] = []
         if needs_enrichment:
-            external_metas.extend(self._query_genius_enrichment_sync(local_metadata, extra_titles))
-            external_metas.extend(self._query_lastfm_enrichment_sync(local_metadata))
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                genius_fut = pool.submit(self._query_genius_enrichment_sync, local_metadata, extra_titles)
+                lastfm_fut = pool.submit(self._query_lastfm_enrichment_sync, local_metadata)
+                external_metas.extend(genius_fut.result())
+                external_metas.extend(lastfm_fut.result())
 
         if mb_candidates and external_metas:
             best_ext = external_metas[0]

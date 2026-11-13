@@ -16,6 +16,8 @@ from src.core.models import (
     JobState,
     LibraryTrackRecord,
     Permission,
+    ProviderServerRecord,
+    SongRequestRecord,
     UserAccount,
     UserRole,
 )
@@ -608,6 +610,16 @@ def build_admin_dashboard_keyboard(
             callback_data=AdminActionCallback(action="concurrency").pack(),
         ),
     )
+    builder.row(
+        InlineKeyboardButton(
+            text="🔌 Music Providers",
+            callback_data=AdminActionCallback(action="providers").pack(),
+        ),
+        InlineKeyboardButton(
+            text="📥 Song Requests",
+            callback_data=AdminActionCallback(action="song_requests").pack(),
+        ),
+    )
     if pending_tags_count > 0:
         builder.row(
             InlineKeyboardButton(
@@ -911,5 +923,73 @@ def build_user_uploads_keyboard(
         builder,
         back_callback=effective_back,
         include_home=effective_back != MenuCallback(action="home").pack(),
+    )
+    return builder.as_markup()
+
+
+def build_admin_providers_keyboard(
+    servers: list[ProviderServerRecord],
+    *,
+    back_callback: str = "admin:panel",
+) -> InlineKeyboardMarkup:
+    """Create the inline keyboard for inspecting, testing, and toggling external music providers."""
+    builder = InlineKeyboardBuilder()
+    for idx, srv in enumerate(servers[:10]):
+        status_icon = (
+            "🟢"
+            if (srv.is_enabled and srv.last_health_status in ("ok", "healthy", "ready"))
+            else ("⬜" if not srv.is_enabled else "🔴")
+        )
+        builder.row(
+            InlineKeyboardButton(
+                text=f"🩺 Test {status_icon} {srv.name[:22]}",
+                callback_data=AdminTargetCallback(action="prov_test", target_id=idx).pack(),
+            ),
+            InlineKeyboardButton(
+                text="⏸ Disable" if srv.is_enabled else "▶️ Enable",
+                callback_data=AdminTargetCallback(action="prov_toggle", target_id=idx).pack(),
+            ),
+        )
+    builder.row(
+        InlineKeyboardButton(
+            text="➕ Add Music Provider",
+            callback_data=AdminActionCallback(action="prov_add").pack(),
+        ),
+        InlineKeyboardButton(
+            text="📥 Pending Requests",
+            callback_data=AdminActionCallback(action="song_requests").pack(),
+        ),
+    )
+    append_escape_row(
+        builder,
+        back_callback=back_callback,
+        include_home=back_callback != MenuCallback(action="home").pack(),
+    )
+    return builder.as_markup()
+
+
+def build_admin_song_requests_keyboard(
+    requests: list[SongRequestRecord],
+    *,
+    back_callback: str = "admin:panel",
+) -> InlineKeyboardMarkup:
+    """Create the inline keyboard for reviewing pending song acquisition requests inside `/admin`."""
+    builder = InlineKeyboardBuilder()
+    for req in requests[:8]:
+        title_snippet = f"{req.artist_name} - {req.track_title}"[:24]
+        builder.row(
+            InlineKeyboardButton(
+                text=f"✅ {title_snippet}",
+                callback_data=SongReqApprovalCallback(action="approve", request_id=req.id).pack(),
+            ),
+            InlineKeyboardButton(
+                text="❌ Reject",
+                callback_data=SongReqApprovalCallback(action="deny", request_id=req.id).pack(),
+            ),
+        )
+    append_escape_row(
+        builder,
+        back_callback=back_callback,
+        include_home=back_callback != MenuCallback(action="home").pack(),
     )
     return builder.as_markup()

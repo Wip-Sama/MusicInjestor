@@ -1,19 +1,28 @@
 """Unit tests for Song Request RBAC permissions and moderation lifecycle."""
 
-from unittest.mock import AsyncMock
+import hashlib
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from src.core.exceptions import PermissionDeniedError
 from src.core.models import (
+    AvailableAudioQuality,
     Permission,
+    ProviderServerRecord,
+    ProvisionJobStatus,
+    ProvisionResponse,
     SongRequestRecord,
     SongRequestStatus,
     SongRequestType,
+    TrackMetadata,
+    TrackResolutionResult,
     UserAccount,
     UserRole,
 )
-from src.core.provider import MultiProviderService
+from src.core.provider import HttpMusicProviderClient, MultiProviderService
 from src.core.rbac import has_permission
 
 
@@ -174,3 +183,141 @@ async def test_moderator_resolves_song_request() -> None:
     notifier.send_song_request_resolved_audit.assert_awaited_once_with(
         mock_approved, mod, SongRequestStatus.APPROVED
     )
+
+
+@pytest.mark.anyio
+async def test_execute_provision_request_downloads_with_bearer_and_enqueues(tmp_path: Path) -> None:
+    """Verify end-to-end provisioning resolves, downloads relative URLs with Bearer auth, and enqueues."""
+    artifact_bytes = b"fLaC-mock-audio-payload"
+    artifact_sha = hashlib.sha256(artifact_bytes).hexdigest()
+    captured_headers: list[str] = []
+
+    def _download_handler(request: httpx.Request) -> httpx.Response:
+        captured_headers.append(request.headers.get("Authorization", ""))
+        if request.url.path == "/api/v1/artifacts/song.flac":
+            return httpx.Response(status_code=200, content=artifact_bytes)
+        return httpx.Response(status_code=404)
+
+    transport = httpx.MockTransport(_download_handler)
+    client = HttpMusicProviderClient(
+        base_url="http://127.0.0.1:8085",
+        api_token="secret-prov-token",
+        client=httpx.AsyncClient(transport=transport),
+    )
+    client.resolve_track = AsyncMock(  # type: ignore[method-assign]
+        return_value=TrackResolutionResult(
+            matched=True,
+            provider_track_id="prov-trk-1",
+            matched_source="fallback",
+            metadata=TrackMetadata(title="COPERTE", artist="Andrea Cerrato", album="COPERTE"),
+            available_qualities=(
+                AvailableAudioQuality(quality_id="lossless", codec="flac", bitrate_kbps=1411),
+            ),
+        )
+    )
+    client.request_provision = AsyncMock(  # type: ignore[method-assign]
+        return_value=ProvisionResponse(
+            status="queued",
+            job_id="prov-job-1",
+            download_url=None,
+        )
+    )
+    client.get_job_status = AsyncMock(  # type: ignore[method-assign]
+        return_value=ProvisionJobStatus(
+            job_id="prov-job-1",
+            status="completed",
+            progress_percent=100.0,
+            download_url="/api/v1/artifacts/song.flac",
+            checksum_sha256=artifact_sha,
+        )
+    )
+
+    server = ProviderServerRecord(
+        id="prov-default",
+        name="Default Provider",
+        base_url="http://127.0.0.1:8085",
+        api_token_encrypted="secret-prov-token",
+        priority=10,
+        is_enabled=True,
+    )
+    req_record = SongRequestRecord(
+        id=501,
+        telegram_id=285978883,
+        request_type=SongRequestType.TRACK,
+        track_title="COPERTE",
+        artist_name="Andrea Cerrato",
+        status=SongRequestStatus.APPROVED,
+    )
+
+    repo = AsyncMock()
+    repo.get_song_request.return_value = req_record
+    repo.list_provider_servers.return_value = [server]
+    completed_record = SongRequestRecord(
+        id=501,
+        telegram_id=285978883,
+        request_type=SongRequestType.TRACK,
+        track_title="COPERTE",
+        artist_name="Andrea Cerrato",
+        provider_id="prov-default",
+        job_id="ingest-job-99",
+        status=SongRequestStatus.COMPLETED,
+    )
+    repo.update_song_request_job_and_track.return_value = completed_record
+
+    enqueued_paths: list[Path] = []
+
+    async def _on_ready(path: Path, rec: SongRequestRecord, srv: ProviderServerRecord) -> str:
+        enqueued_paths.append(path)
+        assert path.read_bytes() == artifact_bytes
+        return "ingest-job-99"
+
+    notified: list[tuple[int, str]] = []
+
+    async def _notify(uid: int, text: str) -> None:
+        notified.append((uid, text))
+
+    service = MultiProviderService(
+        repository=repo,
+        client_factory=MagicMock(return_value=client),
+        staging_dir=tmp_path / "staging",
+        on_artifact_ready=_on_ready,
+        notify_requester=_notify,
+    )
+
+    real_async_client = httpx.AsyncClient
+    with patch(
+        "src.core.provider.httpx.AsyncClient",
+        side_effect=lambda *args, **kwargs: real_async_client(
+            transport=transport,
+            timeout=kwargs.get("timeout", 30.0),
+            follow_redirects=kwargs.get("follow_redirects", True),
+        ),
+    ):
+        result = await service.execute_provision_request(501)
+    assert result is not None
+    assert result.status == SongRequestStatus.COMPLETED
+    assert captured_headers == ["Bearer secret-prov-token"]
+    assert len(enqueued_paths) == 1
+    assert any(
+        call.kwargs.get("status") == SongRequestStatus.COMPLETED
+        and call.kwargs.get("job_id") == "ingest-job-99"
+        for call in repo.update_song_request_job_and_track.call_args_list
+    )
+    assert notified and "COPERTE" in notified[0][1]
+
+    # Verify failure path when no provider matches
+    repo.list_provider_servers.return_value = []
+    repo.update_song_request_job_and_track.reset_mock()
+    with patch(
+        "src.core.provider.httpx.AsyncClient",
+        side_effect=lambda *args, **kwargs: real_async_client(
+            transport=transport,
+            timeout=kwargs.get("timeout", 30.0),
+            follow_redirects=kwargs.get("follow_redirects", True),
+        ),
+    ):
+        await service.execute_provision_request(501)
+    repo.update_song_request_job_and_track.assert_awaited()
+    fail_kwargs = repo.update_song_request_job_and_track.call_args.kwargs
+    assert fail_kwargs["status"] == SongRequestStatus.FAILED
+    assert "No configured music provider matched" in fail_kwargs["error_message"]

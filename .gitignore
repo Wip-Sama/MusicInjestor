@@ -38,3 +38,6 @@ webapp/node_modules/
 webapp/dist/
 
 temp/
+provider/artifacts/
+provider/.venv/
+run_with_provider.py

@@ -54,7 +54,13 @@ class ChromaprintFingerprinter:
             )
             raise FingerprintingError(msg) from exc
 
-        stdout_bytes, stderr_bytes = await process.communicate()
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=15.0)
+        except TimeoutError as exc:
+            process.kill()
+            await process.wait()
+            msg = f"fpcalc timed out after 15s for {audio_path.name}"
+            raise FingerprintingError(msg) from exc
         if process.returncode != 0:
             err_msg = stderr_bytes.decode("utf-8", errors="replace").strip()
             msg = f"fpcalc failed for {audio_path.name} (exit {process.returncode}): {err_msg}"

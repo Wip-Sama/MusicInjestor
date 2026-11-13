@@ -64,3 +64,8 @@ markers = [
     "docker: smoke tests requiring the WSL Docker telegram-bot-api container",
 ]
 
+[tool.uv.workspace]
+members = [
+    "provider",
+]
+

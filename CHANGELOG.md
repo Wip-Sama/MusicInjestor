@@ -12,6 +12,63 @@
 
 ## Completed Milestones
 
+### M49: Provider Turnstile `/auth/challenge` Popup Bridge & Debug Log Filtering
+- **Hosted Turnstile Bridge & Auto-Close Fix (`provider/`):** Identified that `api.zarz.moe/v2/challenge` strips `http(s)://` `cb` parameters and runs `window.close()` after 250ms when `window.opener` is absent. Added `GET /auth/challenge` (and `/api/v1/auth/challenge`) as a popup opener + `postMessage` (`zarz_grant`) bridge forwarding grants to `GET /session-grant?format=json`, paired with non-closing `spotiflac://session-grant` fallback links and full `/auth/challenge` & `/session-grant` request logging.
+- **Clean `DEBUG` Logging (`main.py`, `provider/src/provider/main.py`):** Suppressed verbose `aiosqlite`, `httpcore`, and `hpack` library chatter (`WARNING` threshold) when `LOG_LEVEL=DEBUG`, and escalated `cloudflared` tunnel errors in `provider/src/provider/tunnel.py` to `WARNING`.
+
+### M48: Provider Reachable Turnstile `/session-grant` Callback, Session Validation & LucidaDL Removal
+- **Provider Callback & Tunnel Routing (`provider/`):** Replaced hardcoded `127.0.0.1:8085` Turnstile redirects with `PROVIDER_PUBLIC_URL` + optional automatic `cloudflared` Quick Tunnel (`PROVIDER_USE_CLOUDFLARED_TUNNEL`) and implemented public `GET /session-grant` (and `GET /api/v1/auth/session-grant`) nonce-validated auto-exchange handlers with Telegram activation notifications.
+- **Live Session Validation & LucidaDL Removal (`provider/`):** Added automatic pruning/clearing of expired or gateway-rejected `zarz-v2` sessions and invalid direct credentials; removed IP-bound `lucidadl` dependency, engine, and `/clearance` commands cleanly while keeping all provider engine dependencies strictly isolated in `provider/`.
+
+### M47: Provider Live Verification Protocol, Anti-Bot Diagnostics & Session Auth Fixes
+- **Main App Live Provider Health Test (`src/core/provider.py`, `src/bot/routers/admin.py`, `src/bot/webapp_server.py`):**
+  - Updated `HttpMusicProviderClient.check_health(verify=...)` and `MultiProviderService.handshake_and_update(..., verify=True)` to query `/api/v1/health?verify=true` during admin provider test actions and still refresh `/capabilities` when a reachable provider reports `degraded`, strictly over HTTP without introducing any provider-backend dependencies into `src/` or root `tests/`.
+- **Provider Microservice Auth & Live Verification (`provider/`):**
+  - Migrated provider SpotiFLAC verification from the retired HTML-serving legacy bootstrap to `zarz-v2` extension signed sessions with HTML/non-JSON guardrails and backoff cooldown cleanup.
+  - Aligned LucidaDL Chrome/131 User-Agent handling, fixed SpotiFLAC -> LucidaDL track failover URL resolution, replaced static ready flags with honest readiness + live Cloudflare interstitial checks, and added `/api/v1/verify`, `/api/v1/health?verify=true`, Telegram `/verify`, and isolated unit tests in `provider/tests/test_provider.py`.
+
+### M46: Radar Notification Deduplication, Manual Review Performance, & External Provider Wiring + UI
+- **Release Radar Notification Deduplication (`src/core/radar.py`, `src/db/repository.py`, `main.py`):**
+  - Updated `SqliteCatalogRepository.create_release_notifications` to deduplicate `(telegram_id, release_id)`, use `INSERT OR IGNORE`, and return only newly created `ReleaseNotification` rows so repeated 12-hour scans never re-emit alerts for previously discovered releases.
+  - Added `mark_release_notifications_delivered` to stamp `delivered_at` after Telegram notification delivery and skip users with `notifications_enabled = False`.
+- **Fast Manual Review & Bounded Metadata / Fingerprint Lookups (`src/core/fingerprint.py`, `src/core/metadata.py`, `src/bot/routers/admin.py`):**
+  - Added a 15-second `asyncio.wait_for` timeout around `fpcalc -json` in `ChromaprintFingerprinter`, killing hung processes cleanly.
+  - Added a thread-safe bounded TTL cache (`256` entries, `600s` TTL) to `MusicBrainzMetadataService.find_candidates`, bounded MB recording lookups with an 8-second `candidate_lookup_budget_seconds` deadline, lowered Genius/Last.fm HTTP timeouts to `5.0s`, and parallelized Genius and Last.fm enrichment queries via `ThreadPoolExecutor(max_workers=2)`.
+  - Added immediate `"Preparing Manual Review"` loading card feedback in `/queue -> Manual Review & Tag` before candidate resolution completes.
+- **External Music Provider Config, End-to-End Provisioning, Bearer Auth, & UI (`src/config/settings.py`, `src/core/provider.py`, `src/db/`, `src/bot/`, `webapp/`, `provider/run_with_bot.py`):**
+  - Fixed `load_settings()` environment variable parsing and YAML mapping for `DEFAULT_MUSIC_PROVIDER_URL`, `DEFAULT_MUSIC_PROVIDER_TOKEN`, `DEFAULT_MUSIC_PROVIDER_NAME`, `DEFAULT_MUSIC_PROVIDER_PRIORITY`, `AUTO_PROVISION_UPLOADER_REQUESTS`, `PROVISION_DOWNLOAD_TIMEOUT_SECONDS`, `RADAR_ENABLED`, `RADAR_SYNC_INTERVAL_SECONDS`, and `ADMIN_LOG_CHANNEL_URL`, and forwarded `PROVIDER_API_TOKEN` in `provider/run_with_bot.py`.
+  - Implemented end-to-end async provisioning in `MultiProviderService` (`execute_provision_request`, `schedule_provision_request`) that resolves across enabled providers, requests provisioning, polls completion, downloads artifacts with `Authorization: Bearer` headers and SHA-256 verification, enqueues into `IngestionQueueWorker`, updates `song_requests` (`COMPLETED` / `FAILED` + `error_message` column with SQLite migration), and notifies the requester.
+  - Added Bearer auth forwarding and relative artifact URL resolution to `HttpMusicProviderClient` and `/api/v1/app/providers/{id}/stream/{track_id}`.
+  - Added Telegram Bot UI: `🔌 Music Providers` (health check, toggle, add) & `📥 Song Requests` moderation inside `/admin`, `📥 Request` track/album buttons in `/search` and Album Gap Analysis, and `📥 Request / Download via Provider` buttons on Radar release cards and notifications.
+  - Added React WebApp UI (`webapp/`): typed `providerApi.ts` client, `Request` / `Request Missing Album` buttons in `AlbumGapModal.tsx` and `RadarView.tsx`, **External Music Providers** + **Pending Song Requests** governance cards in `GovernanceView.tsx`, and **My Provider Song Requests** status panel in `IngestQueueView.tsx`.
+
+### M45: External Music Provider Microservice, Silent Whitelist Management Bot & Docker Containerization
+- **Modular Provider Microservice (`provider/` uv project):**
+  - Built standalone external music acquisition server fully implementing the `MUSIC_PROVIDER_API.md` specification with FastAPI.
+  - Implemented all specification endpoints: `GET /api/v1/capabilities`, `GET /api/v1/health`, `POST /api/v1/resolve` (tracks & albums), `POST /api/v1/provision` (instant 200 OK / async 202 Accepted), `GET /api/v1/jobs/{job_id}`, `DELETE /api/v1/jobs/{job_id}`, `GET /api/v1/artifacts/{filename}`, and `GET /api/v1/stream/{track_id}`.
+  - Added optional Bearer token security via `PROVIDER_API_TOKEN` (`Authorization: Bearer <token>`).
+- **Pluggable Acquisition Backends & Composite Fallback Engine (`provider/src/provider/engines/`):**
+  - Abstracted acquisition engine protocol (`BaseEngine`) decoupling catalog resolution and audio provisioning from backend services.
+  - Built cascading composite engine (`CompositeEngine`) with automated multi-backend failover and deterministic testing simulation mode (`SimulationEngine`).
+  - Provider-specific backend integrations, architecture, and developer setup documented exclusively within `provider/` markdown documentation.
+- **Telegram Management Bot with Silent Whitelist Authorization (`provider/src/provider/bot/`):**
+  - Built dedicated `aiogram` 3.x management bot running concurrently with the FastAPI REST server.
+  - **Strict Silent Authorization (`AuthorizedUserMiddleware`):** Parses `PROVIDER_AUTHORIZED_USER_IDS` / `AUTHORIZED_USER_IDS` from `.env`; any update from an unauthorized user is **completely dropped without replying, notifying, or acknowledging**.
+  - Admin commands: `/start` & `/help` (command palette), `/status` (system health, active/completed jobs, disk usage), `/resolve <query>` (track inspection with inline `[ ⬇️ Download / Provision ]` button), `/download <query>` (provisions and sends audio file directly to Telegram chat with metadata tags), `/jobs` (active/recent job list with inline cancel buttons), `/cancel <job_id>`, `/clean` (purges old artifacts), and `/config` (displays active runtime configuration).
+- **Containerization & Deployment (`provider/Dockerfile`, `docker-compose.yml`, `docker-compose.example.yaml`, `.env.example`):**
+  - Production `Dockerfile` installing Python 3.14, `ffmpeg`, `curl`, `ca-certificates`, and `uv`.
+  - Added `music-provider` service definition to `docker-compose.yml` and `docker-compose.example.yaml`.
+  - Updated root `.env.example` with provider service environment variables.
+- **Local Testing Launcher & Dynamic Port Resolution (`provider/run_with_bot.py`, `run_with_provider.py`, `Makefile`):**
+  - Created concurrent runner launching the local provider microservice, probing health check readiness with automatic TCP port conflict fallback (handling Windows socket reservation conflicts), and starting the main ingestion bot with `DEFAULT_MUSIC_PROVIDER_URL` automatically configured.
+  - Resolved WebApp server port collision: shifted default provider port to `8085` and strictly isolated bot ports (`8080` for WebApp / `WEB_LISTEN_PORT`, `5173` for Vite, and `8081`/`8082` for local Telegram Bot API) from provider port candidates so the WebApp and Vite dev server launch uninterrupted.
+  - Resolved `0.0.0.0` client connect address issue: when the provider binds to `0.0.0.0` (from `PROVIDER_HOST=0.0.0.0`), the health check probe and main bot connect URL automatically target `127.0.0.1` (loopback) to prevent Windows `WinError 10049` socket connect errors.
+  - Added git-ignored root convenience script `run_with_provider.py` and `make run-with-provider` target supporting CLI flags (`--engine simulation|composite|...`, `--provider-only`, `--bot-only`, `--provider-port`).
+- **Provider Search URL Parsing & Simulation Fallback Isolation (`provider/`):**
+  - Added URL query parser to automatically extract and unquote search terms from streaming search links (e.g. `deezer.com/search/...`) and resolve direct track links.
+  - Enabled combined artist/title fallback searching across acquisition backends even when metadata is not pre-split.
+  - Disabled automatic silent fallback to synthetic simulation audio by default (`allow_simulation_fallback=False`), ensuring upstream failures report informative errors instead of returning fake test audio.
+
 ### M44: External Music Provider Server Architecture, Cascading Quality Resolution, Song Request RBAC Lifecycle, & Instant Audio Streaming
 - **External Music Provider Server Specification & Reference Implementation (docs/MUSIC_PROVIDER_API.md):**
   - Designed and authored comprehensive REST/OpenAPI contract for external music provider servers (GET /api/v1/capabilities, GET /api/v1/health, GET /api/v1/resolve/track, GET /api/v1/resolve/album, POST /api/v1/provision, GET /api/v1/jobs/{job_id}, DELETE /api/v1/jobs/{job_id}, GET /api/v1/stream/{provider_track_id}).

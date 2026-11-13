@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
-from src.core.models import DiscoveredRelease, FollowedArtist
+from src.core.models import DiscoveredRelease, FollowedArtist, ReleaseNotification
 from src.core.ports import GovernanceRepositoryPort, ReleaseRadarProviderPort
 from src.core.radar import ReleaseRadarService, is_release_recent
 
@@ -200,3 +200,54 @@ async def test_radar_service_extra_coverage() -> None:
     mock_http.get.side_effect = None
     mock_http.get.return_value = mock_resp_short
     assert await service_err.get_preview_audio_bytes("https://valid.url/preview.mp3") is None
+
+
+@pytest.mark.anyio
+async def test_scan_monitored_artists_suppresses_duplicate_notifications() -> None:
+    """Verify repeated scans only emit notifications for newly created rows."""
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    rel = DiscoveredRelease(
+        id="deezer:999",
+        artist_name="Andrea Cerrato",
+        title="COPERTE",
+        release_type="single",
+        release_date=today,
+        provider="deezer",
+        provider_release_id="999",
+    )
+
+    mock_provider = AsyncMock(spec=ReleaseRadarProviderPort)
+    mock_provider.search_artist.return_value = "art_999"
+    mock_provider.get_artist_recent_releases.return_value = [rel]
+
+    seen_pairs: set[tuple[int, str]] = set()
+
+    async def _create_notifs(notifs: list[ReleaseNotification]) -> list[ReleaseNotification]:
+        created: list[ReleaseNotification] = []
+        for idx, n in enumerate(notifs, start=1):
+            key = (n.telegram_id, n.release_id)
+            if key not in seen_pairs:
+                seen_pairs.add(key)
+                created.append(
+                    ReleaseNotification(
+                        id=idx,
+                        telegram_id=n.telegram_id,
+                        release_id=n.release_id,
+                    )
+                )
+        return created
+
+    mock_repo = AsyncMock(spec=GovernanceRepositoryPort)
+    mock_repo.list_all_monitored_artists.return_value = ["Andrea Cerrato"]
+    mock_repo.upsert_discovered_releases.return_value = [rel]
+    mock_repo.list_followers_of_artist.return_value = [285978883]
+    mock_repo.create_release_notifications.side_effect = _create_notifs
+
+    service = ReleaseRadarService(provider=mock_provider, repository=mock_repo)
+
+    _, notifs_first = await service.scan_monitored_artists(max_days_back=30)
+    assert len(notifs_first) == 1
+    assert notifs_first[0].release_id == "deezer:999"
+
+    _, notifs_second = await service.scan_monitored_artists(max_days_back=30)
+    assert notifs_second == []
