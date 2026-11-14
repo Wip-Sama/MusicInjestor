@@ -68,6 +68,8 @@ export const GovernanceView: React.FC<GovernanceViewProps> = ({ profile }) => {
   const [newProvUrl, setNewProvUrl] = useState<string>('');
   const [newProvToken, setNewProvToken] = useState<string>('');
   const [newProvPriority, setNewProvPriority] = useState<number>(100);
+  const [newProvRole, setNewProvRole] = useState<'both' | 'streaming' | 'archival'>('both');
+  const [newProvMinQuality, setNewProvMinQuality] = useState<string>('');
   const [operatingProviderId, setOperatingProviderId] = useState<string | null>(null);
   const [operatingSongReqId, setOperatingSongReqId] = useState<number | null>(null);
 
@@ -120,11 +122,16 @@ export const GovernanceView: React.FC<GovernanceViewProps> = ({ profile }) => {
         api_token: newProvToken.trim() || undefined,
         priority: Number.isFinite(newProvPriority) ? newProvPriority : 100,
         is_enabled: true,
+        role: newProvRole,
+        min_archival_quality:
+          newProvRole === 'streaming' ? null : newProvMinQuality || null,
       });
       setNewProvName('');
       setNewProvUrl('');
       setNewProvToken('');
       setNewProvPriority(100);
+      setNewProvRole('both');
+      setNewProvMinQuality('');
       setShowAddProvider(false);
       setActionSuccess('Provider saved and health-checked');
       setTimeout(() => setActionSuccess(null), 3000);
@@ -512,6 +519,52 @@ export const GovernanceView: React.FC<GovernanceViewProps> = ({ profile }) => {
                   }}
                 />
               </div>
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                <select
+                  value={newProvRole}
+                  onChange={(e) =>
+                    setNewProvRole(e.target.value as 'both' | 'streaming' | 'archival')
+                  }
+                  aria-label="Provider Role"
+                  style={{
+                    flex: 1,
+                    minWidth: '150px',
+                    padding: '8px 10px',
+                    borderRadius: '8px',
+                    border: '1px solid rgba(255,255,255,0.12)',
+                    backgroundColor: 'var(--tg-theme-bg-color, #1c1c1e)',
+                    color: 'var(--tg-theme-text-color, #ffffff)',
+                    fontSize: '12px',
+                  }}
+                >
+                  <option value="both">Role: Auto / Dual (From Capabilities)</option>
+                  <option value="streaming">Override: Streaming Only (Fast / Lossy)</option>
+                  <option value="archival">Override: Archival Only (FLAC / Lossless)</option>
+                </select>
+                {newProvRole !== 'streaming' && (
+                  <select
+                    value={newProvMinQuality}
+                    onChange={(e) => setNewProvMinQuality(e.target.value)}
+                    aria-label="Minimum Archival Quality"
+                    style={{
+                      flex: 1,
+                      minWidth: '140px',
+                      padding: '8px 10px',
+                      borderRadius: '8px',
+                      border: '1px solid rgba(255,255,255,0.12)',
+                      backgroundColor: 'var(--tg-theme-bg-color, #1c1c1e)',
+                      color: 'var(--tg-theme-text-color, #ffffff)',
+                      fontSize: '12px',
+                    }}
+                  >
+                    <option value="">Min Archive: Global Default</option>
+                    <option value="lossless">Min Archive: Lossless (FLAC)</option>
+                    <option value="hires">Min Archive: Hi-Res (24-bit+)</option>
+                    <option value="lossy_high">Min Archive: Lossy High (256k+)</option>
+                    <option value="any">Min Archive: Any Quality</option>
+                  </select>
+                )}
+              </div>
               <button
                 type="submit"
                 disabled={operatingProviderId === 'new'}
@@ -542,11 +595,40 @@ export const GovernanceView: React.FC<GovernanceViewProps> = ({ profile }) => {
               color: 'var(--tg-theme-subtitle-text-color, #8e8e93)',
             }}
           >
-            No external music providers configured yet. Add one above or set DEFAULT_MUSIC_PROVIDER_URL in .env.
+            No external music providers configured yet. Add one above or configure{' '}
+            <code>providers:</code> in <code>config.yaml</code>.
           </Card>
         ) : (
           providers.map((prov) => {
             const isHealthy = prov.last_health_status === 'ok' || prov.last_health_status === 'healthy';
+            const canStream =
+              prov.supports_streaming ??
+              (prov.allow_streaming !== false &&
+                (prov.capabilities ? prov.capabilities.streaming : true));
+            const canArchive =
+              prov.supports_archiving ??
+              (prov.allow_archiving !== false &&
+                (prov.capabilities ? prov.capabilities.provisioning !== false : true));
+            let roleLabel = 'No Active Role';
+            let roleBg = 'rgba(142, 142, 147, 0.16)';
+            let roleColor = '#8e8e93';
+            if (canStream && canArchive) {
+              roleLabel = prov.min_archival_quality
+                ? `Stream + Archive (≥${prov.min_archival_quality})`
+                : 'Stream + Archive';
+              roleBg = 'rgba(191, 90, 242, 0.16)';
+              roleColor = '#bf5af2';
+            } else if (canStream) {
+              roleLabel = 'Streaming Only';
+              roleBg = 'rgba(10, 132, 255, 0.16)';
+              roleColor = '#0a84ff';
+            } else if (canArchive) {
+              roleLabel = prov.min_archival_quality
+                ? `Archiver (≥${prov.min_archival_quality})`
+                : 'FLAC Archiver';
+              roleBg = 'rgba(94, 92, 230, 0.18)';
+              roleColor = '#9b99ff';
+            }
             return (
               <Card
                 key={prov.id}
@@ -564,7 +646,7 @@ export const GovernanceView: React.FC<GovernanceViewProps> = ({ profile }) => {
               >
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                   <div style={{ minWidth: 0 }}>
-                    <div style={{ fontSize: '13px', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <div style={{ fontSize: '13px', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' }}>
                       <span>{prov.name}</span>
                       <span
                         style={{
@@ -576,6 +658,17 @@ export const GovernanceView: React.FC<GovernanceViewProps> = ({ profile }) => {
                         }}
                       >
                         {prov.last_health_status || 'unknown'}
+                      </span>
+                      <span
+                        style={{
+                          fontSize: '10px',
+                          padding: '2px 6px',
+                          borderRadius: '4px',
+                          backgroundColor: roleBg,
+                          color: roleColor,
+                        }}
+                      >
+                        {roleLabel}
                       </span>
                       {!prov.is_enabled && (
                         <span

@@ -4,13 +4,18 @@ import contextlib
 import json
 import logging
 import os
+import re
 from pathlib import Path
-from typing import Self
+from typing import Any, Self
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
+
+_VALID_ARCHIVAL_QUALITIES: frozenset[str] = frozenset({"none", "any", "lossy_high", "lossless", "hires"})
+_VALID_GLOBAL_ARCHIVAL_QUALITIES: frozenset[str] = frozenset({"any", "lossy_high", "lossless", "hires"})
+_SLUG_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
 _YAML_SECTION_KEY_MAP: dict[str, dict[str, str]] = {
     "telegram": {
@@ -25,6 +30,7 @@ _YAML_SECTION_KEY_MAP: dict[str, dict[str, str]] = {
     "storage": {
         "scratch_dir": "STORAGE_SCRATCH_DIR",
         "library_dir": "STORAGE_LIBRARY_DIR",
+        "stream_cache_dir": "STORAGE_STREAM_CACHE_DIR",
         "database_path": "DATABASE_PATH",
         "umask": "UMASK",
     },
@@ -59,6 +65,9 @@ _YAML_SECTION_KEY_MAP: dict[str, dict[str, str]] = {
         "default_priority": "DEFAULT_MUSIC_PROVIDER_PRIORITY",
         "auto_provision_uploader_requests": "AUTO_PROVISION_UPLOADER_REQUESTS",
         "download_timeout_seconds": "PROVISION_DOWNLOAD_TIMEOUT_SECONDS",
+        "min_archival_quality": "MUSIC_PROVIDER_MIN_ARCHIVAL_QUALITY",
+        "stream_cache_ttl_seconds": "STREAM_CACHE_TTL_SECONDS",
+        "stream_cache_max_mb": "STREAM_CACHE_MAX_MB",
     },
     "oidc": {
         "enabled": "OIDC_ENABLED",
@@ -128,9 +137,14 @@ def _parse_yaml_config_file(yaml_path: Path) -> dict[str, str]:
                     continue
                 norm_sub = str(sub_key).strip().lower()
                 env_key = section_map.get(norm_sub, str(sub_key).strip().upper())
+                if lower_section == "provider" and norm_sub == "servers" and isinstance(sub_val, list):
+                    values["MUSIC_PROVIDERS"] = json.dumps(sub_val)
+                    continue
                 str_val = _stringify_yaml_scalar(sub_val)
                 if str_val != "":
                     values[env_key] = str_val
+        elif lower_section == "providers" and isinstance(top_val, list):
+            values["MUSIC_PROVIDERS"] = json.dumps(top_val)
         elif top_val is not None and not isinstance(top_val, dict):
             str_val = _stringify_yaml_scalar(top_val)
             if str_val != "":
@@ -155,6 +169,75 @@ def _parse_dotenv_file(dotenv_path: Path) -> dict[str, str]:
         if cleaned_key:
             values[cleaned_key] = cleaned_val
     return values
+
+
+def _slugify_provider_id(name: str, index: int) -> str:
+    """Create a deterministic, URL-safe ID prefix `cfg-<slug>` when config entry omits `id`."""
+    slug = _SLUG_NON_ALNUM_RE.sub("-", name.strip().lower()).strip("-")
+    if not slug:
+        slug = f"provider-{index + 1}"
+    return f"cfg-{slug[:40]}"
+
+
+class ConfiguredProviderSettings(BaseModel):
+    """Typed entry inside `config.yaml` `providers:` list or `MUSIC_PROVIDERS` JSON env var."""
+
+    id: str = ""
+    name: str
+    base_url: str
+    api_token: str = ""
+    priority: int = Field(default=10, ge=1)
+    is_enabled: bool = True
+    allow_streaming: bool = True
+    allow_archiving: bool = True
+    min_archival_quality: str | None = None
+    role: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_aliases(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        if "base_url" not in normalized and "url" in normalized:
+            normalized["base_url"] = normalized.pop("url")
+        if "api_token" not in normalized and "token" in normalized:
+            normalized["api_token"] = normalized.pop("token")
+        if "is_enabled" not in normalized and "enabled" in normalized:
+            normalized["is_enabled"] = normalized.pop("enabled")
+
+        role_raw = str(normalized.get("role") or "").strip().lower()
+        if role_raw in ("streaming", "stream", "stream-only"):
+            normalized.setdefault("allow_streaming", True)
+            normalized.setdefault("allow_archiving", False)
+        elif role_raw in ("archival", "archive", "download", "flac"):
+            normalized.setdefault("allow_streaming", False)
+            normalized.setdefault("allow_archiving", True)
+        elif role_raw in ("both", "all"):
+            normalized.setdefault("allow_streaming", True)
+            normalized.setdefault("allow_archiving", True)
+        return normalized
+
+    @field_validator("base_url")
+    @classmethod
+    def _validate_base_url(cls, value: str) -> str:
+        cleaned = value.strip().rstrip("/")
+        if not cleaned:
+            msg = "Configured provider entry requires a non-empty base_url/url"
+            raise ValueError(msg)
+        return cleaned
+
+    @field_validator("min_archival_quality")
+    @classmethod
+    def _validate_min_quality(cls, value: str | None) -> str | None:
+        if value is None or not str(value).strip():
+            return None
+        cleaned = str(value).strip().lower()
+        if cleaned not in _VALID_ARCHIVAL_QUALITIES:
+            allowed = sorted(_VALID_ARCHIVAL_QUALITIES)
+            msg = f"Invalid provider min_archival_quality '{value}'; expected one of {allowed}"
+            raise ValueError(msg)
+        return cleaned
 
 
 class AppSettings(BaseModel):
@@ -182,6 +265,7 @@ class AppSettings(BaseModel):
     # Storage & SQLite settings
     storage_scratch_dir: Path = Field(default=Path("./storage/scratch"))
     storage_library_dir: Path = Field(default=Path("./storage/library"))
+    storage_stream_cache_dir: Path = Field(default=Path("./storage/cache/streams"))
     database_path: Path = Field(default=Path("./storage/library.db"))
     umask: str = Field(default="0022")
 
@@ -231,12 +315,46 @@ class AppSettings(BaseModel):
     radar_sync_interval_seconds: int = Field(default=43200, ge=60)
 
     # External Music Provider Server settings
+    music_providers: tuple[ConfiguredProviderSettings, ...] = Field(default=())
+    min_archival_quality: str = Field(default="lossless")
+    stream_cache_ttl_seconds: int = Field(default=3600, ge=60)
+    stream_cache_max_mb: int = Field(default=256, ge=16)
     default_music_provider_url: str = Field(default="")
     default_music_provider_token: str = Field(default="")
     default_music_provider_name: str = Field(default="default-provider")
     default_music_provider_priority: int = Field(default=10, ge=1)
     auto_provision_uploader_requests: bool = Field(default=True)
     provision_download_timeout_seconds: float = Field(default=180.0, ge=10.0)
+
+    @field_validator("min_archival_quality")
+    @classmethod
+    def _validate_global_archival_quality(cls, value: str) -> str:
+        """Ensure global archival quality threshold is valid."""
+        cleaned = value.strip().lower() or "lossless"
+        if cleaned not in _VALID_GLOBAL_ARCHIVAL_QUALITIES:
+            msg = (
+                f"min_archival_quality must be one of {sorted(_VALID_GLOBAL_ARCHIVAL_QUALITIES)}, "
+                f"got '{value}'"
+            )
+            raise ValueError(msg)
+        return cleaned
+
+    @property
+    def effective_music_providers(self) -> tuple[ConfiguredProviderSettings, ...]:
+        """Return configured `music_providers` merged cleanly with legacy `default_music_provider_url`."""
+        providers = list(self.music_providers)
+        legacy_url = self.default_music_provider_url.strip().rstrip("/")
+        if legacy_url and not any(p.base_url.rstrip("/") == legacy_url for p in providers):
+            providers.append(
+                ConfiguredProviderSettings(
+                    id="default-provider",
+                    name=self.default_music_provider_name,
+                    base_url=legacy_url,
+                    api_token=self.default_music_provider_token,
+                    priority=self.default_music_provider_priority,
+                )
+            )
+        return tuple(providers)
 
     @field_validator("auto_approve_confidence")
     @classmethod
@@ -294,17 +412,19 @@ class AppSettings(BaseModel):
         return self.update_cloudflared_tunnel_url(self.cloudflared_tunnel_url)
 
     def ensure_directories(self) -> None:
-        """Apply optional process umask and create required scratch, library, and DB directories."""
+        """Apply optional process umask and create required scratch, library, cache, and DB directories."""
         if self.umask.strip():
             with contextlib.suppress(ValueError, OSError):
                 os.umask(int(self.umask.strip(), 8))
         self.storage_scratch_dir.mkdir(parents=True, exist_ok=True)
         self.storage_library_dir.mkdir(parents=True, exist_ok=True)
+        self.storage_stream_cache_dir.mkdir(parents=True, exist_ok=True)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         logger.debug(
-            "Verified runtime storage directories: scratch=%s, library=%s, db=%s (umask=%s)",
+            "Verified runtime storage directories: scratch=%s, library=%s, stream_cache=%s, db=%s (umask=%s)",
             self.storage_scratch_dir,
             self.storage_library_dir,
+            self.storage_stream_cache_dir,
             self.database_path,
             self.umask,
         )
@@ -351,6 +471,42 @@ def _parse_role_mapping(raw: object) -> dict[str, str]:
             if grp and role_name:
                 result[grp] = role_name
     return result
+
+
+def _parse_music_providers(raw: object) -> tuple[ConfiguredProviderSettings, ...]:
+    """Parse configured music providers from a JSON list string or Python list."""
+    if not raw:
+        return ()
+    items_raw: object = raw
+    if isinstance(raw, str):
+        cleaned = raw.strip()
+        if not cleaned:
+            return ()
+        try:
+            items_raw = json.loads(cleaned)
+        except Exception as exc:
+            logger.warning("Failed to parse MUSIC_PROVIDERS JSON: %s", exc)
+            return ()
+    if not isinstance(items_raw, (list, tuple)):
+        return ()
+
+    parsed_entries: list[ConfiguredProviderSettings] = []
+    seen_ids: set[str] = set()
+    for idx, entry in enumerate(items_raw):
+        if not isinstance(entry, dict):
+            continue
+        model = ConfiguredProviderSettings.model_validate(entry)
+        base_id = model.id.strip() or _slugify_provider_id(model.name, idx)
+        unique_id = base_id
+        suffix = 2
+        while unique_id in seen_ids:
+            unique_id = f"{base_id}-{suffix}"
+            suffix += 1
+        seen_ids.add(unique_id)
+        if model.id != unique_id:
+            model = model.model_copy(update={"id": unique_id})
+        parsed_entries.append(model)
+    return tuple(parsed_entries)
 
 
 def load_settings(
@@ -409,6 +565,7 @@ def load_settings(
         "DEFAULT_MUSIC_PROVIDER_URL": "default_music_provider_url",
         "DEFAULT_MUSIC_PROVIDER_TOKEN": "default_music_provider_token",
         "DEFAULT_MUSIC_PROVIDER_NAME": "default_music_provider_name",
+        "MUSIC_PROVIDER_MIN_ARCHIVAL_QUALITY": "min_archival_quality",
     }
     for env_key, field_name in str_mappings.items():
         if env_key in merged_env and merged_env[env_key] != "":
@@ -419,6 +576,7 @@ def load_settings(
         "TELEGRAM_LOCAL_API_HOST_DIR": "telegram_local_api_host_dir",
         "STORAGE_SCRATCH_DIR": "storage_scratch_dir",
         "STORAGE_LIBRARY_DIR": "storage_library_dir",
+        "STORAGE_STREAM_CACHE_DIR": "storage_stream_cache_dir",
         "DATABASE_PATH": "database_path",
         "WEB_APP_STATIC_DIR": "web_app_static_dir",
     }
@@ -489,5 +647,14 @@ def load_settings(
         raw_kwargs["provision_download_timeout_seconds"] = float(
             merged_env["PROVISION_DOWNLOAD_TIMEOUT_SECONDS"]
         )
+
+    if "STREAM_CACHE_TTL_SECONDS" in merged_env and merged_env["STREAM_CACHE_TTL_SECONDS"] != "":
+        raw_kwargs["stream_cache_ttl_seconds"] = int(merged_env["STREAM_CACHE_TTL_SECONDS"])
+
+    if "STREAM_CACHE_MAX_MB" in merged_env and merged_env["STREAM_CACHE_MAX_MB"] != "":
+        raw_kwargs["stream_cache_max_mb"] = int(merged_env["STREAM_CACHE_MAX_MB"])
+
+    if "MUSIC_PROVIDERS" in merged_env and merged_env["MUSIC_PROVIDERS"] != "":
+        raw_kwargs["music_providers"] = _parse_music_providers(merged_env["MUSIC_PROVIDERS"])
 
     return AppSettings.model_validate(raw_kwargs)

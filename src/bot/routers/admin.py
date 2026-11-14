@@ -728,7 +728,8 @@ async def _render_providers_screen(
         lines.append("<i>No external music providers registered.</i>")
         lines.append("")
         lines.append(
-            "Configure <code>DEFAULT_MUSIC_PROVIDER_URL</code> in <code>.env</code> "
+            "Configure <code>providers:</code> in <code>config.yaml</code> "
+            "(or <code>DEFAULT_MUSIC_PROVIDER_URL</code> in <code>.env</code>) "
             "or tap <b>➕ Add Music Provider</b> below."
         )
     else:
@@ -744,9 +745,26 @@ async def _render_providers_screen(
                 if srv.capabilities and srv.capabilities.supported_sources
                 else "unknown"
             )
+            role_tags: list[str] = []
+            if srv.supports_streaming:
+                role_tags.append("🎧 Stream")
+            if srv.supports_archiving:
+                min_q = srv.min_archival_quality or "global"
+                role_tags.append(f"💿 Archive (min: {html.escape(min_q)})")
+            if not role_tags:
+                role_tags.append("🚫 Inactive Role")
+            if srv.capabilities is not None:
+                caps_text = (
+                    f"stream={'yes' if srv.capabilities.features.streaming else 'no'}, "
+                    f"provision={'yes' if srv.capabilities.features.provisioning else 'no'}"
+                )
+            else:
+                caps_text = "unprobed"
             lines.append(
                 f"• <b>{html.escape(srv.name)}</b> [{badge}] (prio <code>{srv.priority}</code>)\n"
                 f"  <code>{html.escape(srv.base_url)}</code>\n"
+                f"  <i>Role:</i> {' · '.join(role_tags)} "
+                f"(<i>Capabilities:</i> <code>{caps_text}</code>)\n"
                 f"  <i>Sources:</i> <code>{html.escape(sources)}</code>"
             )
     await safe_edit_text(
@@ -1051,10 +1069,14 @@ async def handle_admin_dashboard_callback(
                 title="➕ Add External Music Provider",
                 context_lines=[
                     "Send the provider details in this format:",
-                    "<code>Name | URL | OptionalToken</code>",
+                    "<code>Name | URL | OptionalToken | OptionalRole</code>",
+                    "<i>Roles:</i> <code>auto</code> (inferred from /capabilities, default), "
+                    "<code>stream</code>, or <code>archive</code>",
                     "",
                     "<i>Examples:</i>",
-                    "<code>Local Provider | http://127.0.0.1:8085</code>",
+                    "<code>Unified Node | http://music-provider:8000</code>",
+                    "<code>FLAC Archiver | http://127.0.0.1:8085 | | archive</code>",
+                    "<code>YouTube Stream | http://127.0.0.1:8086 | | stream</code>",
                     "<code>Studio Node | https://music.example.com | my_secret_token</code>",
                 ],
                 footer_lines=["<i>Send /cancel to abort</i>"],
@@ -1081,6 +1103,9 @@ async def handle_admin_dashboard_callback(
                 api_token_encrypted=srv.api_token_encrypted,
                 priority=srv.priority,
                 is_enabled=not srv.is_enabled,
+                allow_streaming=srv.allow_streaming,
+                allow_archiving=srv.allow_archiving,
+                min_archival_quality=srv.min_archival_quality,
                 capabilities=srv.capabilities,
                 last_health_status=srv.last_health_status,
                 last_health_checked_at=srv.last_health_checked_at,
@@ -2156,7 +2181,7 @@ async def handle_provider_config_input(
     governance_repository: GovernanceRepositoryPort | None = None,
     multi_provider_service: MultiProviderService | None = None,
 ) -> None:
-    """Register a new external music provider server from `Name | URL | OptionalToken` input."""
+    """Register a new external music provider server from `Name | URL | Token | Role` input."""
     if (
         current_user is None
         or not has_permission(current_user, Permission.MANAGE_PROVIDERS)
@@ -2170,14 +2195,19 @@ async def handle_provider_config_input(
     if len(parts) < 2 or not parts[1].startswith(("http://", "https://")):
         await safe_answer(
             message,
-            "⚠️ Invalid format. Send <code>Name | http://host:port | OptionalToken</code> "
-            "(or <code>/cancel</code>).",
+            "⚠️ Invalid format. Send "
+            "<code>Name | http://host:port | OptionalToken | OptionalRole</code> "
+            "(role: <code>stream</code>, <code>archive</code>, or <code>both</code>; "
+            "or send <code>/cancel</code>).",
         )
         return
 
     name = parts[0] or "External Provider"
     base_url = parts[1].rstrip("/")
     token = parts[2] if len(parts) >= 3 and parts[2] else None
+    role_raw = parts[3].lower() if len(parts) >= 4 and parts[3] else "both"
+    allow_streaming = role_raw not in {"archive", "archival", "archiving", "flac"}
+    allow_archiving = role_raw not in {"stream", "streaming", "streaming_only"}
     server = ProviderServerRecord(
         id=f"prov-{uuid.uuid4().hex[:8]}",
         name=name,
@@ -2185,6 +2215,8 @@ async def handle_provider_config_input(
         api_token_encrypted=token,
         priority=20,
         is_enabled=True,
+        allow_streaming=allow_streaming,
+        allow_archiving=allow_archiving,
     )
     ps = multi_provider_service or MultiProviderService(repository=governance_repository)
     updated = await ps.handshake_and_update(server)

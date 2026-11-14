@@ -22,7 +22,7 @@ import {
 import { Card, Subheadline, Caption, Spinner } from '@telegram-apps/telegram-ui';
 import { useAudioPlayer } from '../context/AudioPlayerContext';
 import { apiFetch } from '../lib/auth';
-import { fetchProvidersStatus, submitSongRequest } from '../lib/providerApi';
+import { fetchProvidersStatus, resolveStreamableTrack, submitSongRequest } from '../lib/providerApi';
 import { connectQueueEvents } from '../lib/queueApi';
 import { RadarRelease, RadarFollowItem, TrackItem, ReleaseTrackPreview, RadarScanProgress } from '../types/music';
 
@@ -79,7 +79,11 @@ export const RadarView: React.FC<RadarViewProps> = ({ initialReleaseId }) => {
   const [loadingTracksFor, setLoadingTracksFor] = useState<string | null>(null);
   const [copiedReleaseId, setCopiedReleaseId] = useState<string | null>(null);
   const [platformMenuReleaseId, setPlatformMenuReleaseId] = useState<string | null>(null);
-  const [hasProviders, setHasProviders] = useState<boolean>(false);
+  const [hasStreamingProviders, setHasStreamingProviders] = useState<boolean>(false);
+  const [hasArchivalProviders, setHasArchivalProviders] = useState<boolean>(false);
+  const [streamingKeys, setStreamingKeys] = useState<Record<string, boolean>>({});
+  const [resolvedStreamTracks, setResolvedStreamTracks] = useState<Record<string, TrackItem>>({});
+  const [streamErrors, setStreamErrors] = useState<Record<string, string>>({});
   const [requestStatuses, setRequestStatuses] = useState<Record<string, string>>({});
   const [requestingIds, setRequestingIds] = useState<Record<string, boolean>>({});
   const longPressTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -201,9 +205,63 @@ export const RadarView: React.FC<RadarViewProps> = ({ initialReleaseId }) => {
 
   useEffect(() => {
     fetchProvidersStatus()
-      .then((res) => setHasProviders(Boolean(res.has_providers && res.enabled_count > 0)))
-      .catch(() => setHasProviders(false));
+      .then((res) => {
+        const enabled = Boolean(res.has_providers && res.enabled_count > 0);
+        setHasStreamingProviders(Boolean(enabled && (res.has_streaming_providers ?? false)));
+        setHasArchivalProviders(Boolean(enabled && (res.has_archival_providers ?? true)));
+      })
+      .catch(() => {
+        setHasStreamingProviders(false);
+        setHasArchivalProviders(false);
+      });
   }, []);
+
+  const handleStreamViaProvider = async (params: {
+    key: string;
+    title: string;
+    artist: string;
+    album?: string;
+    trackNumber?: number;
+    durationSeconds?: number;
+    releaseDate?: string | null;
+    coverUrl?: string | null;
+    identifiers?: Record<string, string>;
+  }) => {
+    const cached = resolvedStreamTracks[params.key];
+    if (cached && currentTrack?.id === cached.id) {
+      togglePlay();
+      return;
+    }
+    if (cached) {
+      playTrack(cached, [cached]);
+      return;
+    }
+    if (streamingKeys[params.key]) return;
+    setStreamingKeys((prev) => ({ ...prev, [params.key]: true }));
+    setStreamErrors((prev) => ({ ...prev, [params.key]: '' }));
+    try {
+      const streamTrack = await resolveStreamableTrack({
+        title: params.title,
+        artist: params.artist,
+        album: params.album,
+        trackNumber: params.trackNumber,
+        durationSeconds: params.durationSeconds,
+        year: params.releaseDate ? parseInt(params.releaseDate.slice(0, 4), 10) : null,
+        coverUrl: params.coverUrl || '',
+        identifiers: params.identifiers,
+      });
+      if (!streamTrack) {
+        setStreamErrors((prev) => ({ ...prev, [params.key]: 'Unavailable' }));
+        return;
+      }
+      setResolvedStreamTracks((prev) => ({ ...prev, [params.key]: streamTrack }));
+      playTrack(streamTrack, [streamTrack]);
+    } catch {
+      setStreamErrors((prev) => ({ ...prev, [params.key]: 'Failed' }));
+    } finally {
+      setStreamingKeys((prev) => ({ ...prev, [params.key]: false }));
+    }
+  };
 
   const handleRequestRelease = async (rel: RadarRelease) => {
     if (requestingIds[rel.id]) return;
@@ -909,8 +967,79 @@ export const RadarView: React.FC<RadarViewProps> = ({ initialReleaseId }) => {
                         </button>
                       )}
 
+                      {/* Stream full track directly via streaming provider for unowned singles */}
+                      {hasStreamingProviders &&
+                        rel.track_count === 1 &&
+                        !(rel.in_library && rel.library_track_id) && (
+                          <button
+                            onClick={() =>
+                              handleStreamViaProvider({
+                                key: rel.id,
+                                title: rel.title,
+                                artist: rel.artist_name,
+                                album: rel.title,
+                                releaseDate: rel.release_date,
+                                coverUrl: rel.cover_url,
+                                identifiers: {
+                                  ...(rel.id && rel.provider === 'deezer'
+                                    ? { deezer: String(rel.id) }
+                                    : {}),
+                                  ...(rel.primary_url || rel.external_url
+                                    ? { url: (rel.primary_url || rel.external_url) as string }
+                                    : {}),
+                                  ...(rel.external_links ? rel.external_links : {}),
+                                },
+                              })
+                            }
+                            disabled={Boolean(streamingKeys[rel.id])}
+                            title="Stream full audio via fast streaming provider"
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '4px',
+                              padding: '5px 8px',
+                              borderRadius: '6px',
+                              border: 'none',
+                              backgroundColor:
+                                resolvedStreamTracks[rel.id] &&
+                                currentTrack?.id === resolvedStreamTracks[rel.id].id &&
+                                isPlaying
+                                  ? '#0a84ff'
+                                  : 'rgba(10, 132, 255, 0.16)',
+                              color:
+                                resolvedStreamTracks[rel.id] &&
+                                currentTrack?.id === resolvedStreamTracks[rel.id].id &&
+                                isPlaying
+                                  ? '#fff'
+                                  : '#0a84ff',
+                              cursor: streamingKeys[rel.id] ? 'default' : 'pointer',
+                              fontSize: '12px',
+                              fontWeight: 600,
+                            }}
+                          >
+                            {resolvedStreamTracks[rel.id] &&
+                            currentTrack?.id === resolvedStreamTracks[rel.id].id &&
+                            isPlaying ? (
+                              <Pause size={13} />
+                            ) : (
+                              <Radio size={13} />
+                            )}
+                            <span>
+                              {streamingKeys[rel.id]
+                                ? 'Loading...'
+                                : streamErrors[rel.id]
+                                  ? streamErrors[rel.id]
+                                  : resolvedStreamTracks[rel.id] &&
+                                      currentTrack?.id === resolvedStreamTracks[rel.id].id &&
+                                      isPlaying
+                                    ? 'Pause'
+                                    : 'Stream Full'}
+                            </span>
+                          </button>
+                        )}
+
                       {/* Request / Download via External Music Provider for unowned releases */}
-                      {hasProviders && !(rel.in_library && rel.library_track_id && rel.track_count === 1) && (
+                      {hasArchivalProviders && !(rel.in_library && rel.library_track_id && rel.track_count === 1) && (
                         <button
                           onClick={() => handleRequestRelease(rel)}
                           disabled={Boolean(requestingIds[rel.id])}
@@ -1199,6 +1328,63 @@ export const RadarView: React.FC<RadarViewProps> = ({ initialReleaseId }) => {
                                     <span style={{ fontSize: '10px', fontWeight: 700, padding: '1px 4px', borderRadius: '4px', backgroundColor: 'rgba(48, 209, 88, 0.2)', color: '#30d158' }}>
                                       Full
                                     </span>
+                                  )}
+                                  {!trk.library_track_id && hasStreamingProviders && (
+                                    <button
+                                      onClick={() =>
+                                        handleStreamViaProvider({
+                                          key: `${rel.id}:${trk.track_id}`,
+                                          title: trk.title,
+                                          artist: rel.artist_name,
+                                          album: rel.title,
+                                          trackNumber: trk.track_position,
+                                          durationSeconds: trk.duration_seconds,
+                                          releaseDate: rel.release_date,
+                                          coverUrl: rel.cover_url,
+                                          identifiers:
+                                            trk.track_id && rel.provider === 'deezer'
+                                              ? { deezer: String(trk.track_id) }
+                                              : undefined,
+                                        })
+                                      }
+                                      disabled={Boolean(streamingKeys[`${rel.id}:${trk.track_id}`])}
+                                      title="Stream full track via streaming provider"
+                                      style={{
+                                        border: 'none',
+                                        borderRadius: '4px',
+                                        padding: '2px 6px',
+                                        fontSize: '10px',
+                                        fontWeight: 600,
+                                        backgroundColor:
+                                          resolvedStreamTracks[`${rel.id}:${trk.track_id}`] &&
+                                          currentTrack?.id ===
+                                            resolvedStreamTracks[`${rel.id}:${trk.track_id}`].id &&
+                                          isPlaying
+                                            ? '#0a84ff'
+                                            : 'rgba(10, 132, 255, 0.16)',
+                                        color:
+                                          resolvedStreamTracks[`${rel.id}:${trk.track_id}`] &&
+                                          currentTrack?.id ===
+                                            resolvedStreamTracks[`${rel.id}:${trk.track_id}`].id &&
+                                          isPlaying
+                                            ? '#fff'
+                                            : '#0a84ff',
+                                        cursor: streamingKeys[`${rel.id}:${trk.track_id}`]
+                                          ? 'default'
+                                          : 'pointer',
+                                      }}
+                                    >
+                                      {streamingKeys[`${rel.id}:${trk.track_id}`]
+                                        ? '...'
+                                        : streamErrors[`${rel.id}:${trk.track_id}`]
+                                          ? streamErrors[`${rel.id}:${trk.track_id}`]
+                                          : resolvedStreamTracks[`${rel.id}:${trk.track_id}`] &&
+                                              currentTrack?.id ===
+                                                resolvedStreamTracks[`${rel.id}:${trk.track_id}`].id &&
+                                              isPlaying
+                                            ? 'Pause'
+                                            : 'Stream Full'}
+                                    </button>
                                   )}
                                   <span style={{ fontSize: '11px', color: '#8e8e93' }}>
                                     {trk.library_track_id ? 'Library' : '30s'}

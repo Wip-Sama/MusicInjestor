@@ -6,8 +6,8 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
-from urllib.parse import urljoin, urlparse
+from typing import Any, Literal
+from urllib.parse import urlencode, urljoin, urlparse
 
 import httpx
 
@@ -41,6 +41,11 @@ from src.core.ports import (
     AdminLogNotifierPort,
     GovernanceRepositoryPort,
     MusicProviderPort,
+)
+from src.core.quality import (
+    audio_quality_meets_level,
+    inspect_audio_quality,
+    meets_archival_quality,
 )
 from src.core.rbac import require_permission
 
@@ -82,10 +87,43 @@ def _parse_provider_features(data: dict[str, Any]) -> ProviderFeatures:
     return ProviderFeatures(
         streaming=bool(feat.get("streaming", False)),
         stream_formats=stream_fmts,
+        provisioning=bool(feat.get("provisioning", True)),
         async_provisioning=bool(feat.get("async_provisioning", True)),
         webhooks=bool(feat.get("webhooks", False)),
         batch_provisioning=bool(feat.get("batch_provisioning", False)),
     )
+
+
+def available_quality_meets_level(quality: AvailableAudioQuality, min_level: str) -> bool:
+    """Return True when a provider quality tier satisfies `min_level` for permanent archival."""
+    return meets_archival_quality(
+        is_lossless=quality.is_lossless,
+        bit_depth=quality.bit_depth,
+        sample_rate_hz=quality.sample_rate_hz,
+        bitrate_kbps=quality.bitrate_kbps,
+        min_level=min_level,
+    )
+
+
+def _server_can_stream(server: ProviderServerRecord) -> bool:
+    """Return True if a provider server is eligible for live streaming queries."""
+    if not server.is_enabled or not server.allow_streaming:
+        return False
+    if server.capabilities is not None:
+        return bool(server.capabilities.features.streaming)
+    return True
+
+
+def _server_can_archive(server: ProviderServerRecord, global_min_level: str) -> bool:
+    """Return True if a provider server is eligible for permanent archival downloads."""
+    if not server.is_enabled or not server.allow_archiving:
+        return False
+    effective_min = (server.min_archival_quality or global_min_level).strip().lower()
+    if effective_min == "none":
+        return False
+    if server.capabilities is not None:
+        return bool(server.capabilities.features.provisioning)
+    return True
 
 
 def _parse_quality_item(item: dict[str, Any]) -> AvailableAudioQuality:
@@ -244,6 +282,7 @@ class HttpMusicProviderClient(MusicProviderPort):
 
         qualities_raw = data.get("available_qualities") or ()
         qualities = tuple(_parse_quality_item(q) for q in qualities_raw if isinstance(q, dict))
+        cover_url = str(meta_dict.get("cover_url") or data.get("cover_url") or "").strip() or None
 
         return TrackResolutionResult(
             matched=True,
@@ -252,6 +291,7 @@ class HttpMusicProviderClient(MusicProviderPort):
             metadata=track_meta,
             available_qualities=qualities,
             streaming_supported=bool(data.get("streaming_supported", False)),
+            cover_url=cover_url,
         )
 
     async def resolve_album(
@@ -447,10 +487,23 @@ class HttpMusicProviderClient(MusicProviderPort):
             logger.warning("Failed to cancel job %s on %s: %s", job_id, url, exc)
             return False
 
-    def get_stream_url(self, provider_track_id: str, quality: str | None = None) -> str:
-        """Build streaming audio endpoint URL for a track."""
-        suffix = f"?quality={quality}" if quality else ""
-        return f"{self._base_url}/api/v1/stream/{provider_track_id}{suffix}"
+    def get_stream_url(
+        self,
+        provider_track_id: str,
+        quality: str | None = None,
+        metadata_hints: Mapping[str, str] | None = None,
+    ) -> str:
+        """Build streaming audio endpoint URL for a track with optional metadata query hints."""
+        params: dict[str, str] = {}
+        if quality:
+            params["quality"] = quality
+        if metadata_hints:
+            for key in ("title", "artist", "album"):
+                val = str(metadata_hints.get(key) or "").strip()
+                if val:
+                    params[key] = val
+        query_str = f"?{urlencode(params)}" if params else ""
+        return f"{self._base_url}/api/v1/stream/{provider_track_id}{query_str}"
 
 
 ArtifactReadyCallback = Callable[
@@ -472,6 +525,7 @@ class MultiProviderService:
         staging_dir: Path | None = None,
         auto_provision_uploader_requests: bool = True,
         download_timeout_seconds: float = DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
+        min_archival_quality: str = "lossless",
         on_artifact_ready: ArtifactReadyCallback | None = None,
         notify_requester: RequesterNotifyCallback | None = None,
     ) -> None:
@@ -484,6 +538,7 @@ class MultiProviderService:
         self._staging_dir = staging_dir
         self._auto_provision_uploader_requests = auto_provision_uploader_requests
         self._download_timeout_seconds = download_timeout_seconds
+        self._min_archival_quality = (min_archival_quality or "lossless").strip().lower()
         self._on_artifact_ready = on_artifact_ready
         self._notify_requester = notify_requester
         self._background_tasks: set[asyncio.Task[None]] = set()
@@ -527,6 +582,9 @@ class MultiProviderService:
             last_health_status=health.status,
             last_health_checked_at=datetime.now(UTC),
             created_at=server.created_at,
+            allow_streaming=server.allow_streaming,
+            allow_archiving=server.allow_archiving,
+            min_archival_quality=server.min_archival_quality,
         )
         await self._repository.upsert_provider_server(updated)
         return updated
@@ -535,19 +593,31 @@ class MultiProviderService:
         self,
         identifiers: dict[str, str],
         fallback: Mapping[str, object] | None = None,
+        *,
+        purpose: Literal["any", "stream", "archive"] = "any",
     ) -> tuple[ProviderServerRecord, TrackResolutionResult, AvailableAudioQuality | None] | None:
-        """Resolve a track across all active providers concurrently, ranking by audio quality."""
+        """Resolve a track across eligible providers concurrently for streaming or archival."""
         servers = await self._repository.list_provider_servers(enabled_only=True)
         if not servers:
             logger.info("No enabled provider servers registered.")
             return None
 
+        if purpose == "stream":
+            eligible_servers = [s for s in servers if _server_can_stream(s)]
+        elif purpose == "archive":
+            eligible_servers = [s for s in servers if _server_can_archive(s, self._min_archival_quality)]
+        else:
+            eligible_servers = servers
+
+        if not eligible_servers:
+            logger.info("No enabled provider servers match purpose=%s.", purpose)
+            return None
+
         # Filter providers whose capabilities match any available identifier keys (if known)
         candidate_servers: list[ProviderServerRecord] = []
-        for s in servers:
+        for s in eligible_servers:
             if s.capabilities and s.capabilities.supported_sources:
                 supported = set(s.capabilities.supported_sources)
-                # Check if any identifier or generic match is supported
                 has_common = any(k.removesuffix("_id") in supported for k in identifiers)
                 if has_common or "musicbrainz" in supported or "isrc" in supported:
                     candidate_servers.append(s)
@@ -555,7 +625,7 @@ class MultiProviderService:
                 candidate_servers.append(s)
 
         if not candidate_servers:
-            candidate_servers = servers
+            candidate_servers = eligible_servers
 
         async def _query_server(
             srv: ProviderServerRecord,
@@ -564,8 +634,15 @@ class MultiProviderService:
                 client = self.get_provider_client(srv)
                 fallback_dict = dict(fallback) if fallback is not None else None
                 res = await client.resolve_track(identifiers, fallback_dict)
-                if res.matched and res.provider_track_id:
-                    return srv, res
+                if not (res.matched and res.provider_track_id):
+                    return None
+                if purpose == "stream":
+                    srv_streams = bool(srv.capabilities and srv.capabilities.features.streaming) or bool(
+                        res.streaming_supported
+                    )
+                    if not srv_streams:
+                        return None
+                return srv, res
             except Exception as exc:
                 logger.debug("Provider %s failed to resolve track: %s", srv.name, exc)
             return None
@@ -576,7 +653,6 @@ class MultiProviderService:
         if not valid:
             return None
 
-        # Rank valid providers by highest available audio quality
         scored_candidates: list[
             tuple[
                 ProviderServerRecord,
@@ -586,16 +662,37 @@ class MultiProviderService:
             ]
         ] = []
         for srv, res in valid:
+            qualities = list(res.available_qualities)
+            if purpose == "archive":
+                effective_min = (srv.min_archival_quality or self._min_archival_quality).strip().lower()
+                if qualities:
+                    qualifying = [q for q in qualities if available_quality_meets_level(q, effective_min)]
+                    if not qualifying:
+                        logger.info(
+                            "Excluding archival candidate %s: available qualities do not meet min level '%s'",
+                            srv.name,
+                            effective_min,
+                        )
+                        continue
+                    qualities = qualifying
+
             best_quality: AvailableAudioQuality | None = None
             best_score = (0, 0, 0, 0)
-            if res.available_qualities:
-                sorted_qualities = sorted(res.available_qualities, key=rank_quality, reverse=True)
+            if qualities:
+                sorted_qualities = sorted(qualities, key=rank_quality, reverse=True)
                 best_quality = sorted_qualities[0]
                 best_score = rank_quality(best_quality)
             scored_candidates.append((srv, res, best_quality, best_score))
 
-        # Sort: highest quality score first, then server priority ascending (lower number = higher priority)
-        scored_candidates.sort(key=lambda item: (item[3], -item[0].priority), reverse=True)
+        if not scored_candidates:
+            return None
+
+        if purpose == "stream":
+            # Prefer server priority ascending (lower priority number first = faster streamer), then quality
+            scored_candidates.sort(key=lambda item: (-item[0].priority, item[3]), reverse=True)
+        else:
+            # Prefer highest archival audio quality first, then server priority ascending
+            scored_candidates.sort(key=lambda item: (item[3], -item[0].priority), reverse=True)
         best_srv, best_res, best_q, _ = scored_candidates[0]
         return best_srv, best_res, best_q
 
@@ -757,9 +854,25 @@ class MultiProviderService:
             resolved = await self.resolve_track_cascading(
                 identifiers=record.identifiers,
                 fallback=fallback,
+                purpose="archive",
             )
             if resolved is None:
-                msg = "No configured music provider matched this request."
+                enabled_servers = await self._repository.list_provider_servers(enabled_only=True)
+                archival_servers = [
+                    s for s in enabled_servers if _server_can_archive(s, self._min_archival_quality)
+                ]
+                if enabled_servers and not archival_servers:
+                    msg = (
+                        "Only streaming-only providers are enabled; archival download into permanent "
+                        "library is disabled."
+                    )
+                elif archival_servers:
+                    msg = (
+                        f"No configured music provider matched at required archival quality "
+                        f"('{self._min_archival_quality}')."
+                    )
+                else:
+                    msg = "No configured music provider matched this request."
                 failed = await self._repository.update_song_request_job_and_track(
                     request_id,
                     status=SongRequestStatus.FAILED,
@@ -831,6 +944,15 @@ class MultiProviderService:
                 timeout_seconds=self._download_timeout_seconds,
                 headers=auth_headers,
             )
+
+            effective_min = (server.min_archival_quality or self._min_archival_quality).strip().lower()
+            actual_quality = inspect_audio_quality(downloaded)
+            if not audio_quality_meets_level(actual_quality, effective_min):
+                downloaded.unlink(missing_ok=True)
+                raise ProvisioningFailedError(
+                    f"Downloaded audio '{actual_quality.summary}' does not meet archival quality "
+                    f"requirement '{effective_min}' for permanent storage."
+                )
 
             job_id: str | None = None
             if self._on_artifact_ready is not None:

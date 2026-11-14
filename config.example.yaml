@@ -28,6 +28,8 @@ storage:
   # Change `HOST_MUSIC_DIR` in `.env` or `docker-compose.yml` to point to your external music path.
   library_dir: "/mnt/music/library"
   scratch_dir: "/app/storage/scratch"
+  # Ephemeral disk cache for transient streaming providers (never added to permanent library)
+  stream_cache_dir: "/app/storage/cache/streams"
   database_path: "/app/storage/library.db"
   # File creation umask applied inside the container (0022 -> 755 dirs / 644 files; 0002 -> group-writable)
   umask: "0022"
@@ -91,4 +93,29 @@ webapp:
   # Host and port for unified HTTP API and static file listener
   listen_host: "0.0.0.0"
   listen_port: 8080
+
+provider:
+  # Global minimum audio quality required to archive tracks permanently into `storage.library_dir`
+  # Allowed values: "hires", "lossless" (default), "lossy_high", "any"
+  min_archival_quality: "lossless"
+  # Short-lived stream cache policy for fast streaming providers (`storage.stream_cache_dir`)
+  stream_cache_ttl_seconds: 3600
+  stream_cache_max_mb: 256
+
+# Optional list of External Music Provider Microservices
+# Lower priority number wins within each capability (`streaming` vs `archival`).
+# Omit `role` to auto-discover capabilities directly from `/api/v1/capabilities`.
+providers:
+  - name: "Composite Music Provider"
+    url: "http://music-provider:8000"
+    # Unified composite mode supports BOTH fast YouTube streaming and lossless FLAC archival:
+    min_archival_quality: "lossless"
+    priority: 10
+    enabled: true
+  # Optional split-container override (start with `docker compose --profile split-providers up -d`):
+  # - name: "YouTube Stream"
+  #   url: "http://music-provider-stream:8000"
+  #   priority: 5
+  #   enabled: true
+
 

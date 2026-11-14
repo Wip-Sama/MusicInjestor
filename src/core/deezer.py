@@ -390,3 +390,97 @@ class DeezerReleaseProvider(ReleaseRadarProviderPort):
             logger.warning("Failed to fetch Deezer track preview for %s: %s", clean_id, exc)
 
         return None
+
+    async def search_track_enrichment(
+        self,
+        title: str,
+        artist: str,
+        album: str = "",
+    ) -> dict[str, Any] | None:
+        """Look up track album, high-res cover art, and canonical tags from Deezer."""
+        clean_title = title.strip()
+        clean_artist = artist.strip()
+        if not clean_title and not clean_artist:
+            return None
+
+        queries: list[str] = []
+        if clean_title and clean_artist:
+            queries.append(f'artist:"{clean_artist}" track:"{clean_title}"')
+            queries.append(f"{clean_artist} {clean_title}")
+        else:
+            queries.append(clean_title or clean_artist)
+
+        try:
+            client = await self._get_client()
+            items: list[dict[str, Any]] = []
+            for q in queries:
+                url = f"{self._base_url}/search/track?q={quote_plus(q)}&limit=5"
+                resp = await client.get(url)
+                if resp.status_code != 200:
+                    continue
+                payload = resp.json()
+                raw_items = payload.get("data") or []
+                if isinstance(raw_items, list) and raw_items:
+                    items = [x for x in raw_items if isinstance(x, dict)]
+                    if items:
+                        break
+
+            if not items:
+                return None
+
+            target_title = clean_title.lower()
+            target_artist = clean_artist.lower()
+            target_album = album.strip().lower()
+
+            def _score(item: dict[str, Any]) -> tuple[int, int, int]:
+                it_title = str(item.get("title") or "").strip().lower()
+                it_artist = str((item.get("artist") or {}).get("name") or "").strip().lower()
+                it_album = str((item.get("album") or {}).get("title") or "").strip().lower()
+                exact_title = (
+                    2
+                    if (target_title and it_title == target_title)
+                    else (1 if (target_title and target_title in it_title) else 0)
+                )
+                exact_artist = (
+                    2
+                    if (target_artist and it_artist == target_artist)
+                    else (
+                        1
+                        if (target_artist and (target_artist in it_artist or it_artist in target_artist))
+                        else 0
+                    )
+                )
+                exact_album = 1 if (target_album and it_album == target_album) else 0
+                return (exact_title + exact_artist, exact_album, int(bool(it_album)))
+
+            best = max(items, key=_score)
+            raw_artist = best.get("artist")
+            artist_obj: dict[str, Any] = raw_artist if isinstance(raw_artist, dict) else {}
+            raw_album = best.get("album")
+            album_obj: dict[str, Any] = raw_album if isinstance(raw_album, dict) else {}
+            cover_url = (
+                str(
+                    album_obj.get("cover_xl")
+                    or album_obj.get("cover_big")
+                    or album_obj.get("cover_medium")
+                    or ""
+                ).strip()
+                or None
+            )
+            dur_val = best.get("duration")
+            pos_val = best.get("track_position")
+            return {
+                "deezer_id": str(best.get("id") or "") or None,
+                "title": str(best.get("title") or "").strip() or None,
+                "artist": str(artist_obj.get("name") or "").strip() or None,
+                "album": str(album_obj.get("title") or "").strip() or None,
+                "cover_url": cover_url,
+                "duration_seconds": int(dur_val) if isinstance(dur_val, int) and dur_val > 0 else None,
+                "track_number": int(pos_val) if isinstance(pos_val, int) and pos_val > 0 else None,
+                "external_url": str(best.get("link") or "").strip() or None,
+            }
+        except Exception as exc:
+            logger.debug(
+                "Deezer track enrichment lookup failed for '%s - %s': %s", clean_artist, clean_title, exc
+            )
+            return None

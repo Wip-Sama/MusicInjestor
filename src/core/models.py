@@ -633,6 +633,7 @@ class ProviderFeatures:
 
     streaming: bool = False
     stream_formats: tuple[str, ...] = ("audio/mpeg",)
+    provisioning: bool = True
     async_provisioning: bool = True
     webhooks: bool = False
     batch_provisioning: bool = False
@@ -696,6 +697,7 @@ class TrackResolutionResult:
     metadata: TrackMetadata | None = None
     available_qualities: tuple[AvailableAudioQuality, ...] = ()
     streaming_supported: bool = False
+    cover_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -771,3 +773,22 @@ class ProviderServerRecord:
     last_health_status: str = "unknown"
     last_health_checked_at: datetime | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    allow_streaming: bool = True
+    allow_archiving: bool = True
+    min_archival_quality: str | None = None
+
+    @property
+    def supports_streaming(self) -> bool:
+        """Return True when enabled, allowed by policy, and provider advertises streaming."""
+        if not self.is_enabled or not self.allow_streaming:
+            return False
+        return bool(self.capabilities and self.capabilities.features.streaming)
+
+    @property
+    def supports_archiving(self) -> bool:
+        """Return True when enabled, allowed by policy, and provider advertises provisioning."""
+        if not self.is_enabled or not self.allow_archiving:
+            return False
+        if (self.min_archival_quality or "").strip().lower() == "none":
+            return False
+        return self.capabilities.features.provisioning if self.capabilities else True

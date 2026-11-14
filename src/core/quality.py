@@ -12,6 +12,42 @@ LOSSLESS_EXTENSIONS: frozenset[str] = frozenset(
     {".flac", ".wav", ".alac", ".aiff", ".aif", ".wv", ".ape", ".dsf", ".dff"}
 )
 
+ARCHIVAL_QUALITY_LEVELS: frozenset[str] = frozenset({"none", "any", "lossy_high", "lossless", "hires"})
+
+
+def meets_archival_quality(
+    *,
+    is_lossless: bool,
+    bit_depth: int | None = None,
+    sample_rate_hz: int = 44100,
+    bitrate_kbps: int = 0,
+    min_level: str = "lossless",
+) -> bool:
+    """Return True if audio attributes satisfy the configured minimum archival quality threshold."""
+    normalized = min_level.strip().lower() or "lossless"
+    if normalized == "none":
+        return False
+    if normalized == "any":
+        return True
+    if normalized == "lossy_high":
+        return bool(is_lossless or bitrate_kbps >= 256)
+    if normalized == "hires":
+        depth = bit_depth if bit_depth is not None else 16
+        return bool(is_lossless and (depth >= 24 or sample_rate_hz > 48000))
+    # Default ("lossless")
+    return bool(is_lossless)
+
+
+def audio_quality_meets_level(quality: AudioQuality, min_level: str = "lossless") -> bool:
+    """Evaluate whether a probed `AudioQuality` satisfies `min_level` for permanent archival."""
+    return meets_archival_quality(
+        is_lossless=quality.is_lossless,
+        bit_depth=quality.bits_per_sample,
+        sample_rate_hz=quality.sample_rate,
+        bitrate_kbps=quality.bitrate_kbps,
+        min_level=min_level,
+    )
+
 
 @dataclass(frozen=True, slots=True)
 class AudioQuality:

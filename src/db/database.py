@@ -10,6 +10,7 @@ from src.db.models import (
     INDEX_DDL_STATEMENTS,
     INGESTION_JOBS_MIGRATION_COLUMNS,
     LIBRARY_TRACKS_MIGRATION_COLUMNS,
+    PROVIDER_SERVERS_MIGRATION_COLUMNS,
     SONG_REQUESTS_MIGRATION_COLUMNS,
     TABLE_DDL_STATEMENTS,
     USER_SETTINGS_MIGRATION_COLUMNS,
@@ -19,36 +20,38 @@ from src.db.models import (
 logger = logging.getLogger(__name__)
 
 
-async def _migrate_ingestion_jobs_table(conn: aiosqlite.Connection) -> None:
-    """Add any missing M3.5 governance/queue columns to an existing `ingestion_jobs` table."""
-    cursor = await conn.execute("PRAGMA table_info(ingestion_jobs);")
+async def _migrate_table_columns(
+    conn: aiosqlite.Connection,
+    table_name: str,
+    columns: tuple[tuple[str, str], ...],
+) -> list[str]:
+    """Add any missing columns declared in `columns` to `table_name` and return added names."""
+    cursor = await conn.execute(f"PRAGMA table_info({table_name});")
     rows = await cursor.fetchall()
     existing_columns = {str(row[1]) for row in rows}
 
     added_columns: list[str] = []
-    for col_name, col_ddl in INGESTION_JOBS_MIGRATION_COLUMNS:
+    for col_name, col_ddl in columns:
         if col_name not in existing_columns:
-            await conn.execute(f"ALTER TABLE ingestion_jobs ADD COLUMN {col_name} {col_ddl};")
+            await conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_ddl};")
             added_columns.append(col_name)
 
     if added_columns:
+        logger.info("Migrated %s table; added columns: %s", table_name, ", ".join(added_columns))
+    return added_columns
+
+
+async def _migrate_ingestion_jobs_table(conn: aiosqlite.Connection) -> None:
+    """Add any missing M3.5 governance/queue columns to an existing `ingestion_jobs` table."""
+    added = await _migrate_table_columns(conn, "ingestion_jobs", INGESTION_JOBS_MIGRATION_COLUMNS)
+    if added:
         await conn.execute("UPDATE ingestion_jobs SET id = job_id WHERE id IS NULL;")
         await conn.execute("UPDATE ingestion_jobs SET status = state WHERE status = 'PENDING';")
-        logger.info("Migrated legacy ingestion_jobs table; added columns: %s", ", ".join(added_columns))
 
 
 async def _migrate_library_tracks_table(conn: aiosqlite.Connection) -> None:
     """Add missing provenance/modification/cache columns to `library_tracks` and backfill `uploaded_by`."""
-    cursor = await conn.execute("PRAGMA table_info(library_tracks);")
-    rows = await cursor.fetchall()
-    existing_columns = {str(row[1]) for row in rows}
-
-    added_columns: list[str] = []
-    for col_name, col_ddl in LIBRARY_TRACKS_MIGRATION_COLUMNS:
-        if col_name not in existing_columns:
-            await conn.execute(f"ALTER TABLE library_tracks ADD COLUMN {col_name} {col_ddl};")
-            added_columns.append(col_name)
-
+    await _migrate_table_columns(conn, "library_tracks", LIBRARY_TRACKS_MIGRATION_COLUMNS)
     await conn.execute(
         """
         UPDATE library_tracks
@@ -62,72 +65,6 @@ async def _migrate_library_tracks_table(conn: aiosqlite.Connection) -> None:
         WHERE uploaded_by = 0
         """
     )
-    if added_columns:
-        logger.info("Migrated library_tracks table; added columns: %s", ", ".join(added_columns))
-
-
-async def _migrate_users_table(conn: aiosqlite.Connection) -> None:
-    """Add any missing governance/OIDC columns to an existing `users` table."""
-    cursor = await conn.execute("PRAGMA table_info(users);")
-    rows = await cursor.fetchall()
-    existing_columns = {str(row[1]) for row in rows}
-
-    added_columns: list[str] = []
-    for col_name, col_ddl in USERS_MIGRATION_COLUMNS:
-        if col_name not in existing_columns:
-            await conn.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_ddl};")
-            added_columns.append(col_name)
-
-    if added_columns:
-        logger.info("Migrated users table; added columns: %s", ", ".join(added_columns))
-
-
-async def _migrate_user_settings_table(conn: aiosqlite.Connection) -> None:
-    """Add any missing columns to an existing `user_settings` table."""
-    cursor = await conn.execute("PRAGMA table_info(user_settings);")
-    rows = await cursor.fetchall()
-    existing_columns = {str(row[1]) for row in rows}
-
-    added_columns: list[str] = []
-    for col_name, col_ddl in USER_SETTINGS_MIGRATION_COLUMNS:
-        if col_name not in existing_columns:
-            await conn.execute(f"ALTER TABLE user_settings ADD COLUMN {col_name} {col_ddl};")
-            added_columns.append(col_name)
-
-    if added_columns:
-        logger.info("Migrated user_settings table; added columns: %s", ", ".join(added_columns))
-
-
-async def _migrate_discovered_releases_table(conn: aiosqlite.Connection) -> None:
-    """Add any missing columns to an existing `discovered_releases` table."""
-    cursor = await conn.execute("PRAGMA table_info(discovered_releases);")
-    rows = await cursor.fetchall()
-    existing_columns = {str(row[1]) for row in rows}
-
-    added_columns: list[str] = []
-    for col_name, col_ddl in DISCOVERED_RELEASES_MIGRATION_COLUMNS:
-        if col_name not in existing_columns:
-            await conn.execute(f"ALTER TABLE discovered_releases ADD COLUMN {col_name} {col_ddl};")
-            added_columns.append(col_name)
-
-    if added_columns:
-        logger.info("Migrated discovered_releases table; added columns: %s", ", ".join(added_columns))
-
-
-async def _migrate_song_requests_table(conn: aiosqlite.Connection) -> None:
-    """Add any missing columns to an existing `song_requests` table."""
-    cursor = await conn.execute("PRAGMA table_info(song_requests);")
-    rows = await cursor.fetchall()
-    existing_columns = {str(row[1]) for row in rows}
-
-    added_columns: list[str] = []
-    for col_name, col_ddl in SONG_REQUESTS_MIGRATION_COLUMNS:
-        if col_name not in existing_columns:
-            await conn.execute(f"ALTER TABLE song_requests ADD COLUMN {col_name} {col_ddl};")
-            added_columns.append(col_name)
-
-    if added_columns:
-        logger.info("Migrated song_requests table; added columns: %s", ", ".join(added_columns))
 
 
 class SqliteDatabaseManager:
@@ -150,10 +87,11 @@ class SqliteDatabaseManager:
             await conn.execute("PRAGMA foreign_keys=ON;")
             for statement in TABLE_DDL_STATEMENTS:
                 await conn.execute(statement)
-            await _migrate_users_table(conn)
-            await _migrate_user_settings_table(conn)
-            await _migrate_discovered_releases_table(conn)
-            await _migrate_song_requests_table(conn)
+            await _migrate_table_columns(conn, "users", USERS_MIGRATION_COLUMNS)
+            await _migrate_table_columns(conn, "user_settings", USER_SETTINGS_MIGRATION_COLUMNS)
+            await _migrate_table_columns(conn, "discovered_releases", DISCOVERED_RELEASES_MIGRATION_COLUMNS)
+            await _migrate_table_columns(conn, "song_requests", SONG_REQUESTS_MIGRATION_COLUMNS)
+            await _migrate_table_columns(conn, "provider_servers", PROVIDER_SERVERS_MIGRATION_COLUMNS)
             await _migrate_ingestion_jobs_table(conn)
             await _migrate_library_tracks_table(conn)
             for statement in INDEX_DDL_STATEMENTS:

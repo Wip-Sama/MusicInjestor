@@ -254,3 +254,78 @@ def test_load_settings_provider_and_radar_env_vars(tmp_path: Path) -> None:
     assert loaded.provision_download_timeout_seconds == 120.0
     assert loaded.radar_enabled is False
     assert loaded.radar_sync_interval_seconds == 1800
+
+
+def test_load_settings_multi_provider_yaml_and_json_env(tmp_path: Path) -> None:
+    """Verify multi-provider YAML list, MUSIC_PROVIDERS JSON env, archival level, and stream cache config."""
+    yaml_file = tmp_path / "config.yaml"
+    yaml_file.write_text(
+        "\n".join(
+            [
+                "storage:",
+                f"  scratch_dir: {(tmp_path / 'scratch').as_posix()}",
+                f"  library_dir: {(tmp_path / 'library').as_posix()}",
+                f"  stream_cache_dir: {(tmp_path / 'cache' / 'streams').as_posix()}",
+                f"  database_path: {(tmp_path / 'lib.db').as_posix()}",
+                "provider:",
+                "  min_archival_quality: hires",
+                "  stream_cache_ttl_seconds: 1200",
+                "  stream_cache_max_mb: 512",
+                "providers:",
+                "  - name: YouTube Stream",
+                "    url: http://127.0.0.1:8086",
+                "    role: streaming",
+                "    priority: 5",
+                "  - name: SpotiFLAC Archiver",
+                "    url: http://127.0.0.1:8085",
+                "    role: archival",
+                "    min_archival_quality: lossless",
+                "    priority: 10",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    loaded = load_settings(
+        dotenv_path=tmp_path / "missing.env",
+        environ={},
+        yaml_path=yaml_file,
+    )
+    assert loaded.min_archival_quality == "hires"
+    assert loaded.stream_cache_ttl_seconds == 1200
+    assert loaded.stream_cache_max_mb == 512
+    assert loaded.storage_stream_cache_dir == tmp_path / "cache" / "streams"
+    assert len(loaded.music_providers) == 2
+
+    yt_entry, flac_entry = loaded.music_providers
+    assert yt_entry.name == "YouTube Stream"
+    assert yt_entry.allow_streaming is True
+    assert yt_entry.allow_archiving is False
+    assert yt_entry.priority == 5
+    assert flac_entry.allow_streaming is False
+    assert flac_entry.allow_archiving is True
+    assert flac_entry.min_archival_quality == "lossless"
+
+    loaded.ensure_directories()
+    assert loaded.storage_stream_cache_dir.is_dir()
+
+    # Env JSON override + legacy default_music_provider_url fallback merge
+    overridden = load_settings(
+        dotenv_path=tmp_path / "missing.env",
+        environ={
+            "MUSIC_PROVIDERS": (
+                '[{"name":"Stream Fast","url":"http://stream:8000","role":"streaming","priority":1}]'
+            ),
+            "DEFAULT_MUSIC_PROVIDER_URL": "http://archiver:8000/",
+            "DEFAULT_MUSIC_PROVIDER_NAME": "Legacy FLAC",
+        },
+        yaml_path=yaml_file,
+    )
+    eff = overridden.effective_music_providers
+    assert len(eff) == 2
+    assert eff[0].name == "Stream Fast"
+    assert eff[0].allow_streaming is True
+    assert eff[0].allow_archiving is False
+    assert eff[1].name == "Legacy FLAC"
+    assert eff[1].base_url == "http://archiver:8000"

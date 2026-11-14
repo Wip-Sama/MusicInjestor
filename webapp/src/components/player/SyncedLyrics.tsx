@@ -3,10 +3,18 @@ import { ChevronDown, Mic2 } from 'lucide-react';
 import { useAudioPlayer } from '../../context/AudioPlayerContext';
 import { apiFetch } from '../../lib/auth';
 import { findActiveLrcIndex, parseLrc } from '../../lib/lrc';
-import { LyricsResponse, ParsedLrcLine } from '../../types/music';
+import { fetchStreamEnrichment } from '../../lib/providerApi';
+import { isStreamedTrack, LyricsResponse, ParsedLrcLine } from '../../types/music';
 
 export const SyncedLyrics: React.FC = () => {
-  const { currentTrack, currentTime, seekTo, isLyricsOpen, setIsLyricsOpen } = useAudioPlayer();
+  const {
+    currentTrack,
+    currentTime,
+    seekTo,
+    isLyricsOpen,
+    setIsLyricsOpen,
+    getCachedStreamLyrics,
+  } = useAudioPlayer();
   const [lyricsData, setLyricsData] = useState<LyricsResponse | null>(null);
   const [parsedLines, setParsedLines] = useState<ParsedLrcLine[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
@@ -15,24 +23,73 @@ export const SyncedLyrics: React.FC = () => {
 
   useEffect(() => {
     if (!currentTrack || !isLyricsOpen) return;
+    let cancelled = false;
+
+    const applyLyrics = (data: LyricsResponse) => {
+      if (cancelled) return;
+      setLyricsData(data);
+      if (data.synced_lyrics) {
+        setParsedLines(parseLrc(data.synced_lyrics));
+      } else {
+        setParsedLines([]);
+      }
+      setLoading(false);
+    };
+
+    if (isStreamedTrack(currentTrack)) {
+      const cached = getCachedStreamLyrics(currentTrack.id);
+      if (cached) {
+        applyLyrics(cached);
+        return () => {
+          cancelled = true;
+        };
+      }
+      setLoading(true);
+      fetchStreamEnrichment({
+        title: currentTrack.title,
+        artist: currentTrack.artist,
+        album: currentTrack.album,
+        durationSeconds: currentTrack.duration_seconds,
+      })
+        .then((enriched) => {
+          applyLyrics(
+            enriched
+              ? {
+                  track_id: currentTrack.id,
+                  has_synced: enriched.has_synced,
+                  synced_lyrics: enriched.synced_lyrics,
+                  plain_lyrics: enriched.plain_lyrics,
+                }
+              : {
+                  track_id: currentTrack.id,
+                  has_synced: false,
+                  synced_lyrics: null,
+                  plain_lyrics: null,
+                }
+          );
+        })
+        .catch((err) => {
+          console.error('Failed to load streamed track lyrics:', err);
+          if (!cancelled) setLoading(false);
+        });
+      return () => {
+        cancelled = true;
+      };
+    }
 
     setLoading(true);
     apiFetch(`/api/v1/app/tracks/${currentTrack.id}/lyrics`)
-      .then((res) => res.json())
-      .then((data: LyricsResponse) => {
-        setLyricsData(data);
-        if (data.synced_lyrics) {
-          setParsedLines(parseLrc(data.synced_lyrics));
-        } else {
-          setParsedLines([]);
-        }
-        setLoading(false);
-      })
+      .then((res) => (res.ok ? res.json() : { has_synced: false, synced_lyrics: null, plain_lyrics: null }))
+      .then((data: LyricsResponse) => applyLyrics(data))
       .catch((err) => {
         console.error('Failed to load lyrics:', err);
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       });
-  }, [currentTrack?.id, isLyricsOpen]);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [currentTrack?.id, currentTrack?.title, currentTrack?.artist, isLyricsOpen, getCachedStreamLyrics]);
 
   const activeIndex = parsedLines.length > 0 ? findActiveLrcIndex(parsedLines, currentTime) : -1;
 

@@ -2250,8 +2250,9 @@ class SqliteCatalogRepository:
                 INSERT INTO provider_servers (
                     id, name, base_url, api_token_encrypted, priority,
                     is_enabled, capabilities_json, last_health_status,
-                    last_health_checked_at, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    last_health_checked_at, created_at,
+                    allow_streaming, allow_archiving, min_archival_quality
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
                     base_url = excluded.base_url,
@@ -2260,7 +2261,10 @@ class SqliteCatalogRepository:
                     is_enabled = excluded.is_enabled,
                     capabilities_json = excluded.capabilities_json,
                     last_health_status = excluded.last_health_status,
-                    last_health_checked_at = excluded.last_health_checked_at
+                    last_health_checked_at = excluded.last_health_checked_at,
+                    allow_streaming = excluded.allow_streaming,
+                    allow_archiving = excluded.allow_archiving,
+                    min_archival_quality = excluded.min_archival_quality
                 """,
                 (
                     server.id,
@@ -2273,6 +2277,9 @@ class SqliteCatalogRepository:
                     server.last_health_status,
                     server.last_health_checked_at.isoformat() if server.last_health_checked_at else None,
                     server.created_at.isoformat(),
+                    1 if server.allow_streaming else 0,
+                    1 if server.allow_archiving else 0,
+                    server.min_archival_quality,
                 ),
             )
             await conn.commit()
@@ -2286,7 +2293,8 @@ class SqliteCatalogRepository:
                 """
             SELECT id, name, base_url, api_token_encrypted, priority,
                    is_enabled, capabilities_json, last_health_status,
-                   last_health_checked_at, created_at
+                   last_health_checked_at, created_at,
+                   allow_streaming, allow_archiving, min_archival_quality
             FROM provider_servers
             WHERE id = ?
             """,
@@ -2303,7 +2311,8 @@ class SqliteCatalogRepository:
         query = (
             "SELECT id, name, base_url, api_token_encrypted, priority, "
             "is_enabled, capabilities_json, last_health_status, "
-            "last_health_checked_at, created_at "
+            "last_health_checked_at, created_at, "
+            "allow_streaming, allow_archiving, min_archival_quality "
             "FROM provider_servers "
         )
         if enabled_only:
@@ -2645,6 +2654,9 @@ def _row_to_provider_server(row: Sequence[object]) -> ProviderServerRecord:
         last_health_status=str(row[7]) if row[7] is not None else "unknown",
         last_health_checked_at=_parse_iso_datetime(row[8]),
         created_at=_parse_iso_datetime(row[9]) or datetime.now(UTC),
+        allow_streaming=bool(int(str(row[10]))) if len(row) > 10 and row[10] is not None else True,
+        allow_archiving=bool(int(str(row[11]))) if len(row) > 11 and row[11] is not None else True,
+        min_archival_quality=str(row[12]) if len(row) > 12 and row[12] is not None else None,
     )
 
 

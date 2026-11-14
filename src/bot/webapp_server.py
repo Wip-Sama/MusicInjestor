@@ -12,7 +12,7 @@ import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import unquote, urlencode
 
 import httpx
@@ -31,6 +31,7 @@ from src.core.bulk_research import (
     BulkResearchService,
     get_active_bulk_research,
 )
+from src.core.deezer import DeezerReleaseProvider
 from src.core.exceptions import OidcAuthenticationError, PermissionDeniedError
 from src.core.extractor import SUPPORTED_ARCHIVE_EXTENSIONS, SUPPORTED_AUDIO_EXTENSIONS
 from src.core.lyrics import LrclibLyricsClient
@@ -73,6 +74,7 @@ from src.core.rbac import (
     require_permission,
 )
 from src.core.search import AlbumSearchService
+from src.core.stream_cache import EphemeralStreamCache
 from src.core.transcoder import (
     async_transcode_audio,
     default_transcode_cache,
@@ -548,6 +550,7 @@ def build_webapp_api(
     bot: Bot | None = None,
     bot_username: str | None = None,
     provider_service: MultiProviderService | None = None,
+    stream_cache: EphemeralStreamCache | None = None,
 ) -> web.Application:
     """Construct an `aiohttp.web.Application` exposing TMA API, OIDC callbacks, and static assets."""
 
@@ -4010,10 +4013,40 @@ def build_webapp_api(
         srv = await catalog_repository.get_provider_server(provider_id)
         if srv is None or not srv.is_enabled:
             raise web.HTTPNotFound(text="Provider not found or disabled.")
+        if not srv.supports_streaming:
+            raise web.HTTPNotImplemented(text="Streaming is disabled or unsupported by this provider.")
+
+        quality_param = request.query.get("quality")
+        if stream_cache is not None:
+            cached = await stream_cache.get_cached_entry(provider_id, provider_track_id, quality_param)
+            if cached is not None:
+                cached_path, cached_ct = cached
+                cached_resp = web.FileResponse(
+                    cached_path,
+                    headers={
+                        "Accept-Ranges": "bytes",
+                        "Cache-Control": "private, max-age=3600",
+                        "X-Stream-Cache": "HIT",
+                    },
+                )
+                cached_resp.content_type = cached_ct.split(";")[0].strip() or "audio/mpeg"
+                return cached_resp
 
         ps = active_provider_service or MultiProviderService(repository=catalog_repository)
         client = ps.get_provider_client(srv)
-        stream_url = client.get_stream_url(provider_track_id, quality=request.query.get("quality"))
+        metadata_hints = {
+            key: val
+            for key in ("title", "artist", "album")
+            if (val := str(request.query.get(key) or "").strip())
+        }
+        if isinstance(client, HttpMusicProviderClient):
+            stream_url = client.get_stream_url(
+                provider_track_id,
+                quality=quality_param,
+                metadata_hints=metadata_hints or None,
+            )
+        else:
+            stream_url = client.get_stream_url(provider_track_id, quality=quality_param)
 
         req_headers: dict[str, str] = {}
         if isinstance(client, HttpMusicProviderClient):
@@ -4024,14 +4057,16 @@ def build_webapp_api(
             req_headers["Range"] = request.headers["Range"]
 
         async with (
-            httpx.AsyncClient(timeout=30.0) as http_c,
+            httpx.AsyncClient(timeout=60.0, follow_redirects=True) as http_c,
             http_c.stream("GET", stream_url, headers=req_headers) as upstream_resp,
         ):
+            content_type = upstream_resp.headers.get("Content-Type", "audio/mpeg")
             response = web.StreamResponse(
                 status=upstream_resp.status_code,
                 headers={
-                    "Content-Type": upstream_resp.headers.get("Content-Type", "audio/mpeg"),
+                    "Content-Type": content_type,
                     "Accept-Ranges": "bytes",
+                    "X-Stream-Cache": "MISS",
                 },
             )
             if "Content-Range" in upstream_resp.headers:
@@ -4040,8 +4075,34 @@ def build_webapp_api(
                 response.headers["Content-Length"] = upstream_resp.headers["Content-Length"]
 
             await response.prepare(request)
-            async for chunk in upstream_resp.aiter_bytes():
-                await response.write(chunk)
+
+            part_path = (
+                stream_cache.temp_part_path(provider_id, provider_track_id, quality_param)
+                if stream_cache is not None and upstream_resp.status_code == 200
+                else None
+            )
+            part_file = part_path.open("wb") if part_path is not None else None
+            stream_completed = False
+            try:
+                async for chunk in upstream_resp.aiter_bytes():
+                    if part_file is not None:
+                        part_file.write(chunk)
+                    await response.write(chunk)
+                stream_completed = True
+            finally:
+                if part_file is not None:
+                    part_file.close()
+                if part_path is not None:
+                    if stream_completed and stream_cache is not None:
+                        await stream_cache.commit_stream_file(
+                            part_path,
+                            provider_id,
+                            provider_track_id,
+                            quality=quality_param,
+                            content_type=content_type,
+                        )
+                    else:
+                        part_path.unlink(missing_ok=True)
             return response
 
     app.router.add_get(
@@ -4224,6 +4285,11 @@ def build_webapp_api(
                 "base_url": s.base_url,
                 "priority": s.priority,
                 "is_enabled": s.is_enabled,
+                "allow_streaming": s.allow_streaming,
+                "allow_archiving": s.allow_archiving,
+                "min_archival_quality": s.min_archival_quality,
+                "supports_streaming": s.supports_streaming,
+                "supports_archiving": s.supports_archiving,
                 "last_health_status": s.last_health_status,
                 "last_health_checked_at": (
                     s.last_health_checked_at.isoformat() if s.last_health_checked_at else None
@@ -4233,6 +4299,7 @@ def build_webapp_api(
                     "version": s.capabilities.version,
                     "supported_sources": list(s.capabilities.supported_sources),
                     "streaming": s.capabilities.features.streaming,
+                    "provisioning": s.capabilities.features.provisioning,
                 }
                 if s.capabilities
                 else None,
@@ -4265,6 +4332,21 @@ def build_webapp_api(
         if not base_url:
             return web.json_response({"error": "base_url is required."}, status=400)
 
+        role = str(body.get("role") or "").strip().lower()
+        default_stream = True
+        default_archive = True
+        if role in {"stream", "streaming", "streaming_only"}:
+            default_stream = True
+            default_archive = False
+        elif role in {"archive", "archival", "archiving", "flac"}:
+            default_stream = False
+            default_archive = True
+
+        allow_streaming = bool(body["allow_streaming"]) if "allow_streaming" in body else default_stream
+        allow_archiving = bool(body["allow_archiving"]) if "allow_archiving" in body else default_archive
+        min_quality_raw = str(body.get("min_archival_quality") or "").strip().lower()
+        min_archival_quality = min_quality_raw or None
+
         record = ProviderServerRecord(
             id=srv_id,
             name=name,
@@ -4272,11 +4354,30 @@ def build_webapp_api(
             api_token_encrypted=str(body.get("api_token") or "").strip() or None,
             priority=int(body.get("priority") or 10),
             is_enabled=bool(body.get("is_enabled", True)),
+            allow_streaming=allow_streaming,
+            allow_archiving=allow_archiving,
+            min_archival_quality=min_archival_quality,
         )
 
         ps = active_provider_service or MultiProviderService(repository=catalog_repository)
         updated = await ps.handshake_and_update(record)
-        return web.json_response({"success": True, "id": updated.id, "health": updated.last_health_status})
+        return web.json_response(
+            {
+                "success": True,
+                "id": updated.id,
+                "health": updated.last_health_status,
+                "supports_streaming": updated.supports_streaming,
+                "supports_archiving": updated.supports_archiving,
+                "capabilities": {
+                    "provider_name": updated.capabilities.provider_name,
+                    "supported_sources": list(updated.capabilities.supported_sources),
+                    "streaming": updated.capabilities.features.streaming,
+                    "provisioning": updated.capabilities.features.provisioning,
+                }
+                if updated.capabilities
+                else None,
+            }
+        )
 
     app.router.add_post("/api/v1/app/admin/providers", handle_post_admin_provider)
 
@@ -4305,6 +4406,8 @@ def build_webapp_api(
                 "capabilities": {
                     "provider_name": updated.capabilities.provider_name,
                     "supported_sources": list(updated.capabilities.supported_sources),
+                    "streaming": updated.capabilities.features.streaming,
+                    "provisioning": updated.capabilities.features.provisioning,
                 }
                 if updated.capabilities
                 else None,
@@ -4353,6 +4456,9 @@ def build_webapp_api(
             api_token_encrypted=srv.api_token_encrypted,
             priority=srv.priority,
             is_enabled=not srv.is_enabled,
+            allow_streaming=srv.allow_streaming,
+            allow_archiving=srv.allow_archiving,
+            min_archival_quality=srv.min_archival_quality,
             capabilities=srv.capabilities,
             last_health_status=srv.last_health_status,
             last_health_checked_at=srv.last_health_checked_at,
@@ -4370,7 +4476,15 @@ def build_webapp_api(
             governance_service=governance_service,
         )
         if catalog_repository is None:
-            return web.json_response({"has_providers": False, "enabled_count": 0, "providers": []})
+            return web.json_response(
+                {
+                    "has_providers": False,
+                    "has_streaming_providers": False,
+                    "has_archival_providers": False,
+                    "enabled_count": 0,
+                    "providers": [],
+                }
+            )
 
         servers = await catalog_repository.list_provider_servers(enabled_only=True)
         providers_info = [
@@ -4379,13 +4493,21 @@ def build_webapp_api(
                 "name": s.name,
                 "health": s.last_health_status or "unknown",
                 "supported_sources": list(s.capabilities.supported_sources) if s.capabilities else [],
-                "streaming": s.capabilities.features.streaming if s.capabilities else False,
+                "streaming": s.supports_streaming,
+                "provisioning": s.supports_archiving,
+                "allow_streaming": s.allow_streaming,
+                "allow_archiving": s.allow_archiving,
+                "min_archival_quality": s.min_archival_quality,
             }
             for s in servers
         ]
+        streaming_count = sum(1 for s in servers if s.supports_streaming)
+        archival_count = sum(1 for s in servers if s.supports_archiving)
         return web.json_response(
             {
                 "has_providers": len(servers) > 0,
+                "has_streaming_providers": streaming_count > 0,
+                "has_archival_providers": archival_count > 0,
                 "enabled_count": len(servers),
                 "providers": providers_info,
             }
@@ -4412,6 +4534,17 @@ def build_webapp_api(
         if not isinstance(body, dict):
             return web.json_response({"error": "JSON object expected."}, status=400)
 
+        purpose_raw = str(body.get("purpose") or "stream").strip().lower()
+        purpose: Literal["any", "stream", "archive"]
+        if purpose_raw == "stream":
+            purpose = "stream"
+        elif purpose_raw == "archive":
+            purpose = "archive"
+        elif purpose_raw == "any":
+            purpose = "any"
+        else:
+            return web.json_response({"error": "purpose must be 'stream', 'archive', or 'any'."}, status=400)
+
         identifiers = dict(body.get("identifiers") or {})
         fallback = {
             "title": str(body.get("title") or body.get("track_title") or "").strip(),
@@ -4419,13 +4552,27 @@ def build_webapp_api(
             "album": str(body.get("album") or body.get("album_name") or "").strip(),
         }
         ps = active_provider_service or MultiProviderService(repository=catalog_repository)
-        resolved = await ps.resolve_track_cascading(identifiers=identifiers, fallback=fallback)
+        resolved = await ps.resolve_track_cascading(
+            identifiers=identifiers, fallback=fallback, purpose=purpose
+        )
         if resolved is None:
             return web.json_response({"matched": False, "qualities": []})
 
         srv, res, best_q = resolved
-        stream_supported = (
+        stream_supported = srv.allow_streaming and (
             bool(srv.capabilities and srv.capabilities.features.streaming) or res.streaming_supported
+        )
+        resolved_meta = res.metadata
+        meta_payload = (
+            {
+                "title": resolved_meta.title,
+                "artist": resolved_meta.artist,
+                "album": resolved_meta.album,
+                "duration_seconds": resolved_meta.duration_seconds,
+                "isrc": resolved_meta.isrc,
+            }
+            if resolved_meta is not None
+            else None
         )
         return web.json_response(
             {
@@ -4435,6 +4582,8 @@ def build_webapp_api(
                 "provider_track_id": res.provider_track_id,
                 "matched_source": res.matched_source,
                 "best_quality": best_q.quality_id if best_q else None,
+                "cover_url": res.cover_url,
+                "metadata": meta_payload,
                 "stream_url": (
                     f"/api/v1/app/stream/provider/{srv.id}/{res.provider_track_id}"
                     if stream_supported
@@ -4455,6 +4604,124 @@ def build_webapp_api(
         )
 
     app.router.add_post("/api/v1/app/providers/resolve", handle_resolve_provider_track)
+
+    stream_enrichment_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    async def handle_get_stream_enrichment(request: web.Request) -> web.Response:
+        user, _ = await authenticate_tma_request(
+            request=request,
+            bot_token=bot_token,
+            governance_service=governance_service,
+        )
+        require_permission(user, Permission.VIEW_CATALOG)
+
+        title = request.query.get("title", "").strip()
+        artist = request.query.get("artist", "").strip()
+        album = request.query.get("album", "").strip()
+        if not title and not artist:
+            return web.json_response({"error": "title or artist query parameter is required"}, status=400)
+
+        duration_raw = request.query.get("duration", "").strip()
+        duration_sec: int | None = None
+        if duration_raw.isdigit() and int(duration_raw) > 0:
+            duration_sec = int(duration_raw)
+
+        cache_key = (artist.lower(), title.lower(), album.lower())
+        cached = stream_enrichment_cache.get(cache_key)
+        if cached is not None:
+            return web.json_response(cached)
+
+        existing_deezer = getattr(radar_service, "_provider", None) if radar_service is not None else None
+        if existing_deezer is None or not hasattr(existing_deezer, "search_track_enrichment"):
+            existing_deezer = (
+                getattr(album_search_service, "_deezer_provider", None)
+                if album_search_service is not None
+                else None
+            )
+
+        temp_deezer: DeezerReleaseProvider | None = None
+        deezer_provider = existing_deezer
+        if deezer_provider is None or not hasattr(deezer_provider, "search_track_enrichment"):
+            temp_deezer = DeezerReleaseProvider()
+            deezer_provider = temp_deezer
+
+        active_lyrics = lyrics_client or LrclibLyricsClient()
+
+        async def _lookup_deezer() -> dict[str, Any] | None:
+            return await deezer_provider.search_track_enrichment(
+                title=title,
+                artist=artist,
+                album=album,
+            )
+
+        async def _lookup_lyrics(meta: TrackMetadata) -> LyricsData | None:
+            if not meta.title or not meta.artist:
+                return None
+            return await active_lyrics.fetch_lyrics(meta)
+
+        deezer_info: dict[str, Any] | None = None
+        lyrics_res: LyricsData | None = None
+        try:
+            initial_meta = TrackMetadata(
+                title=title,
+                artist=artist,
+                album=album,
+                duration_seconds=duration_sec,
+            )
+            deezer_task = asyncio.wait_for(_lookup_deezer(), timeout=4.5)
+            lyrics_task = asyncio.wait_for(_lookup_lyrics(initial_meta), timeout=4.5)
+            d_raw, l_raw = await asyncio.gather(deezer_task, lyrics_task, return_exceptions=True)
+
+            if isinstance(d_raw, dict):
+                deezer_info = d_raw
+            if isinstance(l_raw, LyricsData):
+                lyrics_res = l_raw
+
+            # Retry LRCLIB once with Deezer's canonical title/album/duration if initial lookup missed
+            if lyrics_res is None and deezer_info is not None:
+                enriched_title = str(deezer_info.get("title") or title).strip()
+                enriched_artist = str(deezer_info.get("artist") or artist).strip()
+                enriched_album = str(deezer_info.get("album") or album).strip()
+                enriched_dur = deezer_info.get("duration_seconds") or duration_sec
+                if (
+                    enriched_title != title
+                    or enriched_artist != artist
+                    or (enriched_album and enriched_album != album)
+                ):
+                    with contextlib.suppress(Exception):
+                        retry_meta = TrackMetadata(
+                            title=enriched_title,
+                            artist=enriched_artist,
+                            album=enriched_album,
+                            duration_seconds=enriched_dur if isinstance(enriched_dur, int) else None,
+                        )
+                        lyrics_res = await asyncio.wait_for(_lookup_lyrics(retry_meta), timeout=3.0)
+        finally:
+            if temp_deezer is not None:
+                with contextlib.suppress(Exception):
+                    await temp_deezer.close()
+
+        payload: dict[str, Any] = {
+            "found": bool(deezer_info or lyrics_res),
+            "title": (deezer_info or {}).get("title") or title or None,
+            "artist": (deezer_info or {}).get("artist") or artist or None,
+            "album": (deezer_info or {}).get("album") or album or None,
+            "cover_url": (deezer_info or {}).get("cover_url"),
+            "duration_seconds": (deezer_info or {}).get("duration_seconds") or duration_sec,
+            "track_number": (deezer_info or {}).get("track_number"),
+            "deezer_id": (deezer_info or {}).get("deezer_id"),
+            "external_url": (deezer_info or {}).get("external_url"),
+            "has_synced": bool(lyrics_res and lyrics_res.has_synced),
+            "synced_lyrics": lyrics_res.synced_lyrics if lyrics_res else None,
+            "plain_lyrics": lyrics_res.plain_lyrics if lyrics_res else None,
+        }
+        if len(stream_enrichment_cache) >= 256:
+            oldest_key = next(iter(stream_enrichment_cache))
+            stream_enrichment_cache.pop(oldest_key, None)
+        stream_enrichment_cache[cache_key] = payload
+        return web.json_response(payload)
+
+    app.router.add_get("/api/v1/app/streams/enrichment", handle_get_stream_enrichment)
 
     # 3.1 Release Radar & Artist Monitoring Endpoints
 
@@ -5327,6 +5594,7 @@ class BotWebServer:
         bot: Bot | None = None,
         bot_username: str | None = None,
         provider_service: MultiProviderService | None = None,
+        stream_cache: EphemeralStreamCache | None = None,
     ) -> None:
 
         self._bot_token = bot_token
@@ -5389,6 +5657,7 @@ class BotWebServer:
             bot=bot,
             bot_username=bot_username,
             provider_service=provider_service,
+            stream_cache=stream_cache,
         )
 
         self._runner: web.AppRunner | None = None

@@ -197,7 +197,10 @@ CREATE TABLE IF NOT EXISTS provider_servers (
     capabilities_json TEXT NOT NULL DEFAULT '{}',
     last_health_status TEXT NOT NULL DEFAULT 'unknown',
     last_health_checked_at TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    allow_streaming INTEGER NOT NULL DEFAULT 1,
+    allow_archiving INTEGER NOT NULL DEFAULT 1,
+    min_archival_quality TEXT
 );
 """
 
@@ -347,4 +350,10 @@ DISCOVERED_RELEASES_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (("library_
 
 SONG_REQUESTS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
     ("error_message", "TEXT NOT NULL DEFAULT ''"),
+)
+
+PROVIDER_SERVERS_MIGRATION_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("allow_streaming", "INTEGER NOT NULL DEFAULT 1"),
+    ("allow_archiving", "INTEGER NOT NULL DEFAULT 1"),
+    ("min_archival_quality", "TEXT"),
 )

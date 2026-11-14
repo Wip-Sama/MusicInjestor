@@ -1,7 +1,8 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { hapticFeedback } from '@telegram-apps/sdk-react';
 import { getRawInitData, apiFetch, fetchCurrentProfile } from '../lib/auth';
-import { TrackItem } from '../types/music';
+import { fetchProvidersStatus, fetchStreamEnrichment } from '../lib/providerApi';
+import { isStreamedTrack, LyricsResponse, TrackItem } from '../types/music';
 
 export type RepeatMode = 'off' | 'all' | 'one';
 
@@ -53,6 +54,8 @@ interface AudioPlayerContextType {
   setVolume: (v: number) => void;
   isMuted: boolean;
   toggleMute: () => void;
+  hasArchivalProviders: boolean;
+  getCachedStreamLyrics: (trackId: string) => LyricsResponse | null;
   updateUserSettings: (settings: {
     stream_format?: string;
     stream_bitrate?: number;
@@ -90,6 +93,9 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
   const [streamingPlatformOrder, setStreamingPlatformOrder] = useState<string>('deezer,tidal,qobuz,spotify,apple_music');
   const [searchScope, setSearchScope] = useState<'global' | 'library'>('global');
   const [notificationsEnabled, setNotificationsEnabled] = useState<boolean>(true);
+  const [hasArchivalProviders, setHasArchivalProviders] = useState<boolean>(false);
+  const streamLyricsCacheRef = useRef<Map<string, LyricsResponse>>(new Map());
+  const inFlightEnrichRef = useRef<Set<string>>(new Set());
   const [volume, setVolumeState] = useState<number>(() => {
     try {
       const saved = localStorage.getItem('tg_music_player_volume');
@@ -266,10 +272,20 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
       .catch((err) => {
         console.warn('Could not load user streaming preferences:', err);
       });
+
+    fetchProvidersStatus()
+      .then((status) => {
+        setHasArchivalProviders(Boolean(status.has_archival_providers ?? status.has_providers));
+      })
+      .catch(() => setHasArchivalProviders(false));
+  }, []);
+
+  const getCachedStreamLyrics = useCallback((trackId: string): LyricsResponse | null => {
+    return streamLyricsCacheRef.current.get(trackId) ?? null;
   }, []);
 
   const buildAudioUrl = (track: TrackItem, format: string, bitrate: number) => {
-    // If the audio URL is already an external absolute stream (e.g. Deezer CDN preview), do not append local auth parameters
+    // External absolute streams (e.g. Deezer CDN previews) require no local proxy params
     if (track.audio_url.startsWith('http://') || track.audio_url.startsWith('https://')) {
       return track.audio_url;
     }
@@ -277,8 +293,11 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
     const sep = track.audio_url.includes('?') ? '&' : '?';
     const params = new URLSearchParams();
     if (rawInit) params.set('tgWebAppData', rawInit);
-    if (format && format !== 'auto') params.set('format', format);
-    if (bitrate && format !== 'original') params.set('bitrate', bitrate.toString());
+    // Provider streams do not accept library transcode format/bitrate parameters
+    if (!isStreamedTrack(track)) {
+      if (format && format !== 'auto') params.set('format', format);
+      if (bitrate && format !== 'original') params.set('bitrate', bitrate.toString());
+    }
     const queryStr = params.toString();
     return queryStr ? `${track.audio_url}${sep}${queryStr}` : track.audio_url;
   };
@@ -360,14 +379,16 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
     navigator.mediaSession.metadata = new MediaMetadata({
       title: currentTrack.title,
       artist: currentTrack.artist,
-      album: currentTrack.album,
-      artwork: [
-        {
-          src: currentTrack.cover_url,
-          sizes: '512x512',
-          type: 'image/jpeg',
-        },
-      ],
+      album: currentTrack.album || '',
+      artwork: currentTrack.cover_url
+        ? [
+            {
+              src: currentTrack.cover_url,
+              sizes: '512x512',
+              type: 'image/jpeg',
+            },
+          ]
+        : [],
     });
 
     navigator.mediaSession.setActionHandler('play', () => {
@@ -388,6 +409,66 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
       }
     });
   }, [currentTrack]);
+
+  const enrichStreamedTrack = useCallback((track: TrackItem) => {
+    if (!isStreamedTrack(track)) return;
+    if (inFlightEnrichRef.current.has(track.id)) return;
+
+    const needsCover = !track.cover_url || /ytimg\.com|ggpht\.com/i.test(track.cover_url);
+    const needsAlbum = !track.album || track.album === track.title;
+    const needsLyrics = !streamLyricsCacheRef.current.has(track.id);
+    if (!needsCover && !needsAlbum && !needsLyrics) return;
+
+    inFlightEnrichRef.current.add(track.id);
+    fetchStreamEnrichment({
+      title: track.title,
+      artist: track.artist,
+      album: track.album,
+      durationSeconds: track.duration_seconds,
+    })
+      .then((enriched) => {
+        if (!enriched) return;
+        streamLyricsCacheRef.current.set(track.id, {
+          track_id: track.id,
+          has_synced: enriched.has_synced,
+          synced_lyrics: enriched.synced_lyrics,
+          plain_lyrics: enriched.plain_lyrics,
+        });
+
+        const mergeTrack = (prev: TrackItem): TrackItem => {
+          const prevNeedsCover = !prev.cover_url || /ytimg\.com|ggpht\.com/i.test(prev.cover_url);
+          const nextCover = enriched.cover_url && prevNeedsCover ? enriched.cover_url : prev.cover_url;
+          const nextAlbum =
+            enriched.album && (!prev.album || prev.album === prev.title) ? enriched.album : prev.album;
+          const mergedIdentifiers = {
+            ...(prev.identifiers || {}),
+            ...(enriched.deezer_id && !prev.identifiers?.deezer_id
+              ? { deezer_id: enriched.deezer_id }
+              : {}),
+          };
+          return {
+            ...prev,
+            album: nextAlbum,
+            cover_url: nextCover,
+            track_number: prev.track_number ?? enriched.track_number ?? null,
+            duration_seconds: prev.duration_seconds || enriched.duration_seconds || 0,
+            has_synced_lyrics: prev.has_synced_lyrics || enriched.has_synced,
+            identifiers: Object.keys(mergedIdentifiers).length > 0 ? mergedIdentifiers : prev.identifiers,
+          };
+        };
+
+        setCurrentTrack((prev) => (prev && prev.id === track.id ? mergeTrack(prev) : prev));
+        setQueue((prevQueue) =>
+          prevQueue.map((item) => (item.id === track.id ? mergeTrack(item) : item))
+        );
+      })
+      .catch((err) => {
+        console.debug('Stream metadata enrichment skipped:', err);
+      })
+      .finally(() => {
+        inFlightEnrichRef.current.delete(track.id);
+      });
+  }, []);
 
   const playTrack = (track: TrackItem, queueContext?: TrackItem[]) => {
     triggerHaptic();
@@ -410,6 +491,7 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
       console.warn('Audio playback failed or was prevented by browser policy:', err);
       setIsPlaying(false);
     });
+    enrichStreamedTrack(track);
   };
 
   const switchStreamQuality = (format: string, bitrate: number) => {
@@ -428,7 +510,7 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
     }).catch((err) => console.warn('Failed to persist stream quality:', err));
 
     const audio = audioRef.current;
-    if (audio && currentTrack) {
+    if (audio && currentTrack && !isStreamedTrack(currentTrack)) {
       const curTime = audio.currentTime;
       const wasPlaying = !audio.paused;
       const newUrl = buildAudioUrl(currentTrack, format, bitrate);
@@ -620,9 +702,10 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
       setQueueIndex(nextIdx);
       setCurrentTrack(nextSong);
       if (audioRef.current) {
-        audioRef.current.src = nextSong.audio_url;
+        audioRef.current.src = buildAudioUrl(nextSong, streamFormat, streamBitrate);
         audioRef.current.play().catch(console.error);
       }
+      enrichStreamedTrack(nextSong);
     }
   };
 
@@ -653,8 +736,9 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
     if (prevSong) {
       setQueueIndex(prevIdx);
       setCurrentTrack(prevSong);
-      audio.src = prevSong.audio_url;
+      audio.src = buildAudioUrl(prevSong, streamFormat, streamBitrate);
       audio.play().catch(console.error);
+      enrichStreamedTrack(prevSong);
     }
   };
 
@@ -673,9 +757,7 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
   };
 
   const updateTrackData = (updated: TrackItem) => {
-    if (currentTrack?.id === updated.id) {
-      setCurrentTrack(updated);
-    }
+    setCurrentTrack((prev) => (prev?.id === updated.id ? updated : prev));
     setQueue((prevQueue) =>
       prevQueue.map((item) => (item.id === updated.id ? updated : item))
     );
@@ -727,6 +809,8 @@ export const AudioPlayerProvider: React.FC<{ children: React.ReactNode }> = ({ c
         setVolume,
         isMuted,
         toggleMute,
+        hasArchivalProviders,
+        getCachedStreamLyrics,
         updateUserSettings,
         botUsername,
         openInTelegramBot,

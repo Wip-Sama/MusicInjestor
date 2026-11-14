@@ -148,3 +148,73 @@ async def test_sqlite_song_requests_lifecycle_persistence(tmp_path: Path) -> Non
     assert updated is not None
     assert updated.job_id == "job_abc123"
     assert updated.status == SongRequestStatus.PROVISIONING
+
+
+@pytest.mark.anyio
+async def test_sqlite_provider_role_and_archival_quality_roundtrip(tmp_path: Path) -> None:
+    """Verify streaming/archival role flags, provisioning capability, and min_archival_quality persist."""
+    db_file = tmp_path / "test_provider_roles.db"
+    db_manager = SqliteDatabaseManager(database_path=db_file)
+    await db_manager.initialize()
+    repo = SqliteCatalogRepository(db_manager=db_manager)
+
+    stream_srv = ProviderServerRecord(
+        id="yt-stream-1",
+        name="YouTube Fast Streamer",
+        base_url="http://127.0.0.1:8086",
+        priority=5,
+        is_enabled=True,
+        allow_streaming=True,
+        allow_archiving=False,
+        min_archival_quality=None,
+        capabilities=ProviderCapabilities(
+            provider_name="youtube-stream",
+            version="1.0.0",
+            supported_sources=("youtube",),
+            audio_profiles=ProviderAudioProfiles(supported_codecs=("opus", "aac")),
+            features=ProviderFeatures(streaming=True, provisioning=False),
+        ),
+    )
+    flac_srv = ProviderServerRecord(
+        id="flac-archive-1",
+        name="SpotiFLAC Archiver",
+        base_url="http://127.0.0.1:8085",
+        priority=10,
+        is_enabled=True,
+        allow_streaming=False,
+        allow_archiving=True,
+        min_archival_quality="lossless",
+        capabilities=ProviderCapabilities(
+            provider_name="spotiflac",
+            version="1.0.0",
+            supported_sources=("spotify", "isrc", "deezer"),
+            audio_profiles=ProviderAudioProfiles(supported_codecs=("flac",)),
+            features=ProviderFeatures(streaming=False, provisioning=True),
+        ),
+    )
+    await repo.upsert_provider_server(stream_srv)
+    await repo.upsert_provider_server(flac_srv)
+
+    loaded_stream = await repo.get_provider_server("yt-stream-1")
+    loaded_flac = await repo.get_provider_server("flac-archive-1")
+    assert loaded_stream is not None
+    assert loaded_stream.allow_streaming is True
+    assert loaded_stream.allow_archiving is False
+    assert loaded_stream.supports_streaming is True
+    assert loaded_stream.supports_archiving is False
+    assert loaded_stream.capabilities is not None
+    assert loaded_stream.capabilities.features.streaming is True
+    assert loaded_stream.capabilities.features.provisioning is False
+
+    assert loaded_flac is not None
+    assert loaded_flac.allow_streaming is False
+    assert loaded_flac.allow_archiving is True
+    assert loaded_flac.min_archival_quality == "lossless"
+    assert loaded_flac.supports_streaming is False
+    assert loaded_flac.supports_archiving is True
+    assert loaded_flac.capabilities is not None
+    assert loaded_flac.capabilities.features.streaming is False
+    assert loaded_flac.capabilities.features.provisioning is True
+
+    listed = await repo.list_provider_servers(enabled_only=True)
+    assert [s.id for s in listed] == ["yt-stream-1", "flac-archive-1"]

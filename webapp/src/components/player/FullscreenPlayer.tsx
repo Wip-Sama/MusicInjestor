@@ -1,6 +1,8 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   ChevronDown,
+  Disc,
+  Download,
   Play,
   Pause,
   SkipBack,
@@ -21,11 +23,16 @@ import {
 } from 'lucide-react';
 import { useAudioPlayer } from '../../context/AudioPlayerContext';
 import { formatTime } from '../../lib/lrc';
+import { submitSongRequest } from '../../lib/providerApi';
+import { isPreviewTrack, isStreamedTrack } from '../../types/music';
 import { SongStudioModal } from '../studio/SongStudioModal';
 
 export const FullscreenPlayer: React.FC = () => {
   const [isStudioOpen, setIsStudioOpen] = useState<boolean>(false);
   const [isQualityPickerOpen, setIsQualityPickerOpen] = useState<boolean>(false);
+  const [coverLoadFailed, setCoverLoadFailed] = useState<boolean>(false);
+  const [requestState, setRequestState] = useState<'idle' | 'sending' | 'queued' | 'pending' | 'error'>('idle');
+  const [requestFeedback, setRequestFeedback] = useState<string | null>(null);
   const {
     currentTrack,
     isPlaying,
@@ -56,9 +63,47 @@ export const FullscreenPlayer: React.FC = () => {
     sendTrackToChat,
     openInTelegramBot,
     openArtistPage,
+    hasArchivalProviders,
   } = useAudioPlayer();
   const [isSendingToChat, setIsSendingToChat] = useState<boolean>(false);
   const [chatStatusText, setChatStatusText] = useState<string | null>(null);
+
+  useEffect(() => {
+    setCoverLoadFailed(false);
+  }, [currentTrack?.id, currentTrack?.cover_url]);
+
+  useEffect(() => {
+    setRequestState('idle');
+    setRequestFeedback(null);
+  }, [currentTrack?.id]);
+
+  const isStreamed = isStreamedTrack(currentTrack);
+  const isPreview = isPreviewTrack(currentTrack);
+
+  const handleRequestStreamedSong = async () => {
+    if (!currentTrack || requestState === 'sending') return;
+    setRequestState('sending');
+    setRequestFeedback(null);
+    try {
+      const res = await submitSongRequest({
+        request_type: 'TRACK',
+        track_title: currentTrack.title,
+        artist_name: currentTrack.artist,
+        album_name: currentTrack.album || undefined,
+        identifiers: currentTrack.identifiers,
+      });
+      if (res.is_auto_approved || res.status === 'APPROVED' || res.status === 'PROVISIONING') {
+        setRequestState('queued');
+        setRequestFeedback('Added to archival download queue');
+      } else {
+        setRequestState('pending');
+        setRequestFeedback('Submitted for moderator approval');
+      }
+    } catch (err) {
+      setRequestState('error');
+      setRequestFeedback(err instanceof Error ? err.message : 'Request failed');
+    }
+  };
 
   const handleSendToChat = async () => {
     if (!currentTrack || isSendingToChat) return;
@@ -132,7 +177,7 @@ export const FullscreenPlayer: React.FC = () => {
             textOverflow: 'ellipsis',
           }}
         >
-          {currentTrack.album}
+          {currentTrack.album || (isPreview ? '30s Preview' : isStreamed ? 'Stream' : '')}
         </div>
 
         <button
@@ -168,21 +213,25 @@ export const FullscreenPlayer: React.FC = () => {
             overflow: 'hidden',
             boxShadow: '0 16px 40px rgba(0, 0, 0, 0.5)',
             backgroundColor: 'var(--tg-theme-secondary-bg-color, #2c2c2e)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
           }}
         >
-          <img
-            src={currentTrack.cover_url}
-            alt={currentTrack.album}
-            style={{
-              width: '100%',
-              height: '100%',
-              objectFit: 'cover',
-            }}
-            onError={(e) => {
-              (e.currentTarget as HTMLImageElement).src =
-                'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="300" height="300" fill="%233a3a3c"><rect width="300" height="300"/></svg>';
-            }}
-          />
+          {currentTrack.cover_url && !coverLoadFailed ? (
+            <img
+              src={currentTrack.cover_url}
+              alt={currentTrack.album || currentTrack.title}
+              style={{
+                width: '100%',
+                height: '100%',
+                objectFit: 'cover',
+              }}
+              onError={() => setCoverLoadFailed(true)}
+            />
+          ) : (
+            <Disc size={72} color="#636366" />
+          )}
         </div>
       </div>
 
@@ -276,36 +325,56 @@ export const FullscreenPlayer: React.FC = () => {
             </div>
           </div>
 
-          {/* Format Badge with Quick Quality Picker Trigger */}
-          <button
-            onClick={() => setIsQualityPickerOpen(true)}
-            style={{
-              fontSize: '11px',
-              fontWeight: 700,
-              textTransform: 'uppercase',
-              backgroundColor: 'rgba(255, 255, 255, 0.1)',
-              color: 'var(--tg-theme-button-color, #0a84ff)',
-              padding: '4px 8px',
-              borderRadius: '6px',
-              marginLeft: '12px',
-              border: 'none',
-              cursor: 'pointer',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '4px',
-            }}
-          >
-            <span>
-              {streamFormat === 'original'
-                ? 'DIRECT'
-                : streamFormat === 'opus'
-                ? `OPUS ${streamBitrate}K`
-                : streamFormat === 'mp3'
-                ? `MP3 ${streamBitrate}K`
-                : `AUTO (${currentTrack.format})`}
-            </span>
-            <span style={{ fontSize: '9px', opacity: 0.7 }}>▼</span>
-          </button>
+          {/* Format Badge (interactive quality picker for library tracks, source tag for streams) */}
+          {isStreamed ? (
+            <div
+              style={{
+                flexShrink: 0,
+                fontSize: '11px',
+                fontWeight: 700,
+                textTransform: 'uppercase',
+                backgroundColor: 'rgba(10, 132, 255, 0.14)',
+                border: '1px solid rgba(10, 132, 255, 0.28)',
+                color: '#5ac8fa',
+                padding: '4px 8px',
+                borderRadius: '6px',
+                marginLeft: '12px',
+              }}
+            >
+              {isPreview ? '30s Preview' : 'Streamed'}
+            </div>
+          ) : (
+            <button
+              onClick={() => setIsQualityPickerOpen(true)}
+              style={{
+                flexShrink: 0,
+                fontSize: '11px',
+                fontWeight: 700,
+                textTransform: 'uppercase',
+                backgroundColor: 'rgba(255, 255, 255, 0.1)',
+                color: 'var(--tg-theme-button-color, #0a84ff)',
+                padding: '4px 8px',
+                borderRadius: '6px',
+                marginLeft: '12px',
+                border: 'none',
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '4px',
+              }}
+            >
+              <span>
+                {streamFormat === 'original'
+                  ? 'DIRECT'
+                  : streamFormat === 'opus'
+                  ? `OPUS ${streamBitrate}K`
+                  : streamFormat === 'mp3'
+                  ? `MP3 ${streamBitrate}K`
+                  : `AUTO (${currentTrack.format})`}
+              </span>
+              <span style={{ fontSize: '9px', opacity: 0.7 }}>▼</span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -539,95 +608,163 @@ export const FullscreenPlayer: React.FC = () => {
           <span>Queue</span>
         </button>
 
-        <button
-          onClick={() => setIsStudioOpen(true)}
-          style={{
-            background: 'rgba(255, 255, 255, 0.08)',
-            border: 'none',
-            color: 'var(--tg-theme-text-color, #fff)',
-            borderRadius: '20px',
-            padding: '8px 18px',
-            fontSize: '13px',
-            fontWeight: 600,
-            display: 'flex',
-            alignItems: 'center',
-            gap: '6px',
-            cursor: 'pointer',
-          }}
-        >
-          <Sliders size={16} />
-          <span>Studio</span>
-        </button>
+        {!isStreamed ? (
+          <button
+            onClick={() => setIsStudioOpen(true)}
+            style={{
+              background: 'rgba(255, 255, 255, 0.08)',
+              border: 'none',
+              color: 'var(--tg-theme-text-color, #fff)',
+              borderRadius: '20px',
+              padding: '8px 18px',
+              fontSize: '13px',
+              fontWeight: 600,
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              cursor: 'pointer',
+            }}
+          >
+            <Sliders size={16} />
+            <span>Studio</span>
+          </button>
+        ) : hasArchivalProviders ? (
+          <button
+            onClick={handleRequestStreamedSong}
+            disabled={requestState === 'sending' || requestState === 'queued' || requestState === 'pending'}
+            style={{
+              background:
+                requestState === 'queued'
+                  ? 'rgba(48, 209, 88, 0.22)'
+                  : requestState === 'pending'
+                  ? 'rgba(255, 159, 10, 0.22)'
+                  : requestState === 'error'
+                  ? 'rgba(255, 69, 58, 0.22)'
+                  : 'var(--tg-theme-button-color, #0a84ff)',
+              border: 'none',
+              color:
+                requestState === 'queued'
+                  ? '#30d158'
+                  : requestState === 'pending'
+                  ? '#ff9f0a'
+                  : requestState === 'error'
+                  ? '#ff453a'
+                  : '#fff',
+              borderRadius: '20px',
+              padding: '8px 18px',
+              fontSize: '13px',
+              fontWeight: 600,
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              cursor:
+                requestState === 'sending' || requestState === 'queued' || requestState === 'pending'
+                  ? 'default'
+                  : 'pointer',
+            }}
+          >
+            <Download size={16} />
+            <span>
+              {requestState === 'sending'
+                ? 'Requesting...'
+                : requestState === 'queued'
+                ? 'Requested'
+                : requestState === 'pending'
+                ? 'Pending Approval'
+                : requestState === 'error'
+                ? 'Retry Request'
+                : 'Request'}
+            </span>
+          </button>
+        ) : null}
       </div>
 
-      {/* Telegram Actions Bar: Request Song File & Open in Bot */}
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          gap: '12px',
-          paddingTop: '8px',
-        }}
-      >
-        <button
-          onClick={handleSendToChat}
-          disabled={isSendingToChat}
-          title="Send audio file and lyrics to Telegram chat"
+      {/* Archival request status message for streamed tracks */}
+      {isStreamed && requestFeedback && (
+        <div
           style={{
-            background: 'rgba(255, 255, 255, 0.08)',
-            border: 'none',
-            color: chatStatusText?.includes('Sent')
-              ? '#30d158'
-              : 'var(--tg-theme-button-color, #0a84ff)',
-            borderRadius: '20px',
-            padding: '7px 14px',
+            textAlign: 'center',
             fontSize: '12px',
-            fontWeight: 600,
-            display: 'flex',
-            alignItems: 'center',
-            gap: '6px',
-            cursor: isSendingToChat ? 'default' : 'pointer',
-            transition: 'all 0.15s ease',
+            marginTop: '6px',
+            color: requestState === 'error' ? '#ff453a' : '#8e8e93',
           }}
         >
-          <Send size={14} />
-          <span>{chatStatusText || 'Send to Chat'}</span>
-        </button>
+          {requestFeedback}
+        </div>
+      )}
 
-        <button
-          onClick={handleOpenInBot}
-          title="Open this song's control page in Telegram bot"
+      {/* Telegram Actions Bar: Available only for tracks stored in library */}
+      {!isStreamed && (
+        <div
           style={{
-            background: 'rgba(255, 255, 255, 0.08)',
-            border: 'none',
-            color: 'var(--tg-theme-subtitle-text-color, #8e8e93)',
-            borderRadius: '20px',
-            padding: '7px 14px',
-            fontSize: '12px',
-            fontWeight: 600,
             display: 'flex',
             alignItems: 'center',
-            gap: '6px',
-            cursor: 'pointer',
-            transition: 'all 0.15s ease',
+            justifyContent: 'center',
+            gap: '12px',
+            paddingTop: '8px',
           }}
         >
-          <Bot size={14} />
-          <span>Open in Bot</span>
-        </button>
-      </div>
+          <button
+            onClick={handleSendToChat}
+            disabled={isSendingToChat}
+            title="Send audio file and lyrics to Telegram chat"
+            style={{
+              background: 'rgba(255, 255, 255, 0.08)',
+              border: 'none',
+              color: chatStatusText?.includes('Sent')
+                ? '#30d158'
+                : 'var(--tg-theme-button-color, #0a84ff)',
+              borderRadius: '20px',
+              padding: '7px 14px',
+              fontSize: '12px',
+              fontWeight: 600,
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              cursor: isSendingToChat ? 'default' : 'pointer',
+              transition: 'all 0.15s ease',
+            }}
+          >
+            <Send size={14} />
+            <span>{chatStatusText || 'Send to Chat'}</span>
+          </button>
 
-      {/* Song Studio Modal */}
-      <SongStudioModal
-        isOpen={isStudioOpen}
-        track={currentTrack}
-        onClose={() => setIsStudioOpen(false)}
-        onTrackUpdated={updateTrackData}
-      />
+          <button
+            onClick={handleOpenInBot}
+            title="Open this song's control page in Telegram bot"
+            style={{
+              background: 'rgba(255, 255, 255, 0.08)',
+              border: 'none',
+              color: 'var(--tg-theme-subtitle-text-color, #8e8e93)',
+              borderRadius: '20px',
+              padding: '7px 14px',
+              fontSize: '12px',
+              fontWeight: 600,
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              cursor: 'pointer',
+              transition: 'all 0.15s ease',
+            }}
+          >
+            <Bot size={14} />
+            <span>Open in Bot</span>
+          </button>
+        </div>
+      )}
 
-      {/* Streaming Quality Picker Sheet */}
-      {isQualityPickerOpen && (
+      {/* Song Studio Modal (Library Tracks Only) */}
+      {!isStreamed && (
+        <SongStudioModal
+          isOpen={isStudioOpen}
+          track={currentTrack}
+          onClose={() => setIsStudioOpen(false)}
+          onTrackUpdated={updateTrackData}
+        />
+      )}
+
+      {/* Streaming Quality Picker Sheet (Library Tracks Only) */}
+      {!isStreamed && isQualityPickerOpen && (
         <div
           onClick={() => setIsQualityPickerOpen(false)}
           style={{

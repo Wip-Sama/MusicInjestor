@@ -49,7 +49,17 @@ Provider servers may operate on a private Docker bridge network without authenti
 - **Content-Type:** `application/json`
 - **Accept:** `application/json`
 
-When configuring the provider in the Ingestor (`DEFAULT_MUSIC_PROVIDER_TOKEN` or via `/admin`), the configured token is automatically transmitted on all outbound requests.
+When configuring providers in the Ingestor (`providers:` in `config.yaml`, `MUSIC_PROVIDERS`, `DEFAULT_MUSIC_PROVIDER_TOKEN`, or via `/admin`), the configured token is automatically transmitted on all outbound requests.
+
+### Role Separation, Dual-Capability Discovery, Archival Quality Gate & Storage Structure
+The Ingestor cleanly adapts to each provider's declared capabilities from `GET /api/v1/capabilities` without requiring manual per-provider role wiring:
+- **Capabilities-Driven Auto-Discovery:** Providers report `features.streaming` and `features.provisioning`. When registered by URL (with `role` omitted or set to `both`/`auto`), a dual-capable provider exposing `streaming=true` AND `provisioning=true` (such as `PROVIDER_DEFAULT_ENGINE=composite`) automatically serves **both** instant streaming and archival requests. Streaming-only servers (`provisioning=false`) return `501 Not Implemented` on `POST /api/v1/provision`, and archival-only servers (`streaming=false`) return `501 Not Implemented` on `GET /api/v1/stream/{track_id}`.
+- **Priority & Quality Routing:** Streaming lookups (`purpose="stream"`) query streaming-capable providers sorted by `priority` ascending (fast streams win immediately), whereas archival song requests (`purpose="archive"`) exclude streaming-only servers and sort by highest audio quality.
+- **Archival Quality Gate (`min_archival_quality`):** Configurable globally via `MUSIC_PROVIDER_MIN_ARCHIVAL_QUALITY` (default: `"lossless"`) or per-provider. Any track below threshold at resolve time OR after post-download audio inspection is rejected before touching `storage/library`.
+- **Storage Layout:**
+  - `storage/library/` — Permanent high-quality archived tracks only
+  - `storage/cache/streams/` — Short-lived TTL & LRU-bounded ephemeral stream cache (`STREAM_CACHE_TTL_SECONDS`, `STREAM_CACHE_MAX_MB`)
+  - `storage/providers/flac/` and `storage/providers/stream/` — Per-provider container artifact directories
 
 ---
 
@@ -85,6 +95,7 @@ Executed by the Ingestor upon registration, startup, or manual cache refresh. In
   },
   "features": {
     "streaming": true,
+    "provisioning": true,
     "stream_formats": ["audio/mpeg", "audio/flac", "audio/ogg"],
     "async_provisioning": true,
     "webhooks": true,

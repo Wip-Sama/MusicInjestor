@@ -40,7 +40,11 @@ services:
       TELEGRAM_LOCAL_API_HOST_DIR: /var/lib/telegram-bot-api
       STORAGE_SCRATCH_DIR: /app/storage/scratch
       STORAGE_LIBRARY_DIR: /mnt/music/library
+      STORAGE_STREAM_CACHE_DIR: /app/storage/cache/streams
       DATABASE_PATH: /app/storage/library.db
+      MUSIC_PROVIDER_MIN_ARCHIVAL_QUALITY: ${MUSIC_PROVIDER_MIN_ARCHIVAL_QUALITY:-lossless}
+      STREAM_CACHE_TTL_SECONDS: ${STREAM_CACHE_TTL_SECONDS:-3600}
+      STREAM_CACHE_MAX_MB: ${STREAM_CACHE_MAX_MB:-256}
       UMASK: ${UMASK:-0022}
       WEB_LISTEN_HOST: ${WEB_LISTEN_HOST:-0.0.0.0}
       WEB_LISTEN_PORT: ${WEB_LISTEN_PORT:-8080}
@@ -89,12 +93,40 @@ services:
     environment:
       PROVIDER_HOST: 0.0.0.0
       PROVIDER_PORT: 8000
+      PROVIDER_NAME: ${PROVIDER_NAME:-Composite Music Provider}
       PROVIDER_API_TOKEN: ${DEFAULT_MUSIC_PROVIDER_TOKEN:-}
       PROVIDER_BOT_TOKEN: ${PROVIDER_BOT_TOKEN:-}
       PROVIDER_AUTHORIZED_USER_IDS: ${PROVIDER_AUTHORIZED_USER_IDS:-}
       PROVIDER_STORAGE_DIR: /data/artifacts
       PROVIDER_DEFAULT_ENGINE: ${PROVIDER_DEFAULT_ENGINE:-composite}
+      PROVIDER_STREAMING_ENABLED: ${PROVIDER_STREAMING_ENABLED:-auto}
+      PROVIDER_PROVISIONING_ENABLED: ${PROVIDER_PROVISIONING_ENABLED:-auto}
     volumes:
-      - ./storage/provider:/data/artifacts
+      - ./storage/providers/flac:/data/artifacts
+
+  music-provider-stream:
+    build:
+      context: ./provider
+      dockerfile: Dockerfile
+    container_name: music-provider-stream
+    profiles:
+      - split-providers
+    restart: unless-stopped
+    ports:
+      - "${PROVIDER_STREAM_PORT:-8086}:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PROVIDER_HOST: 0.0.0.0
+      PROVIDER_PORT: 8000
+      PROVIDER_NAME: YouTube Stream
+      PROVIDER_API_TOKEN: ${DEFAULT_MUSIC_PROVIDER_TOKEN:-}
+      PROVIDER_STORAGE_DIR: /data/artifacts
+      PROVIDER_DEFAULT_ENGINE: youtube
+      PROVIDER_STREAMING_ENABLED: "true"
+      PROVIDER_PROVISIONING_ENABLED: "false"
+    volumes:
+      - ./storage/providers/stream:/data/artifacts
 
 

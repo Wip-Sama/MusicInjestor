@@ -1644,6 +1644,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "spotiflac" },
     { name = "uvicorn" },
+    { name = "yt-dlp" },
 ]
 
 [package.metadata]
@@ -1654,6 +1655,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.13.5" },
     { name = "spotiflac", specifier = ">=5.0.6" },
     { name = "uvicorn", specifier = ">=0.54.0" },
+    { name = "yt-dlp", specifier = ">=2026.10.26" },
 ]
 
 [[package]]

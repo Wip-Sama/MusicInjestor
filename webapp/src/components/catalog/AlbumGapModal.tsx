@@ -1,9 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { X, Play, Pause, ExternalLink, Disc, Send, Bot, Check, Globe, Download } from 'lucide-react';
+import { X, Play, Pause, ExternalLink, Disc, Send, Bot, Check, Globe, Download, Radio } from 'lucide-react';
 import { hapticFeedback } from '@telegram-apps/sdk-react';
 import { useAudioPlayer } from '../../context/AudioPlayerContext';
 import { apiFetch } from '../../lib/auth';
-import { fetchProvidersStatus, submitSongRequest, SubmitSongRequestPayload } from '../../lib/providerApi';
+import {
+  fetchProvidersStatus,
+  resolveStreamableTrack,
+  submitSongRequest,
+  SubmitSongRequestPayload,
+} from '../../lib/providerApi';
 import { AlbumGapAnalysis, TrackItem } from '../../types/music';
 
 interface AlbumGapModalProps {
@@ -25,6 +30,7 @@ export const AlbumGapModal: React.FC<AlbumGapModalProps> = ({
     currentTrack,
     isPlaying,
     playTrack,
+    togglePlay,
     openInTelegramBot,
     sendAlbumToChat,
     sendTrackToChat,
@@ -39,7 +45,11 @@ export const AlbumGapModal: React.FC<AlbumGapModalProps> = ({
   const [copiedLinkId, setCopiedLinkId] = useState<string | null>(null);
   const [platformMenuTrackPos, setPlatformMenuTrackPos] = useState<number | null>(null);
   const [showAlbumPlatformMenu, setShowAlbumPlatformMenu] = useState<boolean>(false);
-  const [hasProviders, setHasProviders] = useState<boolean>(false);
+  const [hasStreamingProviders, setHasStreamingProviders] = useState<boolean>(false);
+  const [hasArchivalProviders, setHasArchivalProviders] = useState<boolean>(false);
+  const [streamingKeys, setStreamingKeys] = useState<Record<string, boolean>>({});
+  const [resolvedStreamTracks, setResolvedStreamTracks] = useState<Record<string, TrackItem>>({});
+  const [streamErrors, setStreamErrors] = useState<Record<string, string>>({});
   const [requestStatuses, setRequestStatuses] = useState<Record<string, string>>({});
   const [requestingKeys, setRequestingKeys] = useState<Record<string, boolean>>({});
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -144,8 +154,15 @@ export const AlbumGapModal: React.FC<AlbumGapModalProps> = ({
   useEffect(() => {
     if (!isOpen) return;
     fetchProvidersStatus()
-      .then((res) => setHasProviders(Boolean(res.has_providers && res.enabled_count > 0)))
-      .catch(() => setHasProviders(false));
+      .then((res) => {
+        const enabled = Boolean(res.has_providers && res.enabled_count > 0);
+        setHasStreamingProviders(Boolean(enabled && (res.has_streaming_providers ?? false)));
+        setHasArchivalProviders(Boolean(enabled && (res.has_archival_providers ?? true)));
+      })
+      .catch(() => {
+        setHasStreamingProviders(false);
+        setHasArchivalProviders(false);
+      });
   }, [isOpen]);
 
   useEffect(() => {
@@ -177,6 +194,46 @@ export const AlbumGapModal: React.FC<AlbumGapModalProps> = ({
   }, [isOpen, albumId, artistName, albumTitle]);
 
   if (!isOpen) return null;
+
+  const handleStreamViaProvider = async (
+    key: string,
+    trackTitle: string,
+    pos: number,
+    identifiers?: Record<string, string>
+  ) => {
+    const cached = resolvedStreamTracks[key];
+    if (cached && currentTrack?.id === cached.id) {
+      togglePlay();
+      return;
+    }
+    if (cached) {
+      playTrack(cached);
+      return;
+    }
+    if (streamingKeys[key]) return;
+    setStreamingKeys((prev) => ({ ...prev, [key]: true }));
+    setStreamErrors((prev) => ({ ...prev, [key]: '' }));
+    try {
+      const streamTrack = await resolveStreamableTrack({
+        title: trackTitle,
+        artist: gapData?.artist || artistName || 'Unknown Artist',
+        album: gapData?.title || albumTitle || 'Album',
+        trackNumber: pos,
+        coverUrl: gapData?.cover_url || '',
+        identifiers,
+      });
+      if (!streamTrack) {
+        setStreamErrors((prev) => ({ ...prev, [key]: 'Unavailable' }));
+        return;
+      }
+      setResolvedStreamTracks((prev) => ({ ...prev, [key]: streamTrack }));
+      playTrack(streamTrack);
+    } catch {
+      setStreamErrors((prev) => ({ ...prev, [key]: 'Stream failed' }));
+    } finally {
+      setStreamingKeys((prev) => ({ ...prev, [key]: false }));
+    }
+  };
 
   const handlePlayPreview = (previewUrl: string, trackTitle: string, pos: number) => {
     const previewTrack: TrackItem = {
@@ -414,7 +471,7 @@ export const AlbumGapModal: React.FC<AlbumGapModalProps> = ({
                   </button>
                 )}
 
-                {hasProviders && gapData.missing_tracks_count > 0 && (
+                {hasArchivalProviders && gapData.missing_tracks_count > 0 && (
                   <button
                     onClick={() =>
                       handleRequestViaProvider(`album_${gapData.album_id}`, {
@@ -593,7 +650,75 @@ export const AlbumGapModal: React.FC<AlbumGapModalProps> = ({
                           <span style={{ fontSize: '11px', color: '#8e8e93' }}>No preview</span>
                         )}
 
-                        {hasProviders && !trk.is_owned && (
+                        {hasStreamingProviders && !trk.is_owned && (
+                          <button
+                            onClick={() =>
+                              handleStreamViaProvider(
+                                `trk_${trk.position}_${trk.title}`,
+                                trk.title,
+                                trk.position,
+                                {
+                                  ...(trk.external_url || trk.primary_url
+                                    ? { url: (trk.external_url || trk.primary_url) as string }
+                                    : {}),
+                                  ...(trk.external_links ? trk.external_links : {}),
+                                }
+                              )
+                            }
+                            disabled={Boolean(streamingKeys[`trk_${trk.position}_${trk.title}`])}
+                            title="Stream full track via streaming provider (no library archival)"
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '4px',
+                              padding: '5px 8px',
+                              borderRadius: '6px',
+                              border: 'none',
+                              backgroundColor:
+                                resolvedStreamTracks[`trk_${trk.position}_${trk.title}`] &&
+                                currentTrack?.id ===
+                                  resolvedStreamTracks[`trk_${trk.position}_${trk.title}`].id &&
+                                isPlaying
+                                  ? '#0a84ff'
+                                  : 'rgba(10, 132, 255, 0.16)',
+                              color:
+                                resolvedStreamTracks[`trk_${trk.position}_${trk.title}`] &&
+                                currentTrack?.id ===
+                                  resolvedStreamTracks[`trk_${trk.position}_${trk.title}`].id &&
+                                isPlaying
+                                  ? '#fff'
+                                  : '#0a84ff',
+                              cursor: streamingKeys[`trk_${trk.position}_${trk.title}`]
+                                ? 'default'
+                                : 'pointer',
+                              fontSize: '11px',
+                              fontWeight: 600,
+                            }}
+                          >
+                            {resolvedStreamTracks[`trk_${trk.position}_${trk.title}`] &&
+                            currentTrack?.id ===
+                              resolvedStreamTracks[`trk_${trk.position}_${trk.title}`].id &&
+                            isPlaying ? (
+                              <Pause size={12} />
+                            ) : (
+                              <Radio size={12} />
+                            )}
+                            <span>
+                              {streamingKeys[`trk_${trk.position}_${trk.title}`]
+                                ? 'Loading...'
+                                : streamErrors[`trk_${trk.position}_${trk.title}`]
+                                  ? streamErrors[`trk_${trk.position}_${trk.title}`]
+                                  : resolvedStreamTracks[`trk_${trk.position}_${trk.title}`] &&
+                                      currentTrack?.id ===
+                                        resolvedStreamTracks[`trk_${trk.position}_${trk.title}`].id &&
+                                      isPlaying
+                                    ? 'Streaming'
+                                    : 'Stream Full'}
+                            </span>
+                          </button>
+                        )}
+
+                        {hasArchivalProviders && !trk.is_owned && (
                           <button
                             onClick={() =>
                               handleRequestViaProvider(`trk_${trk.position}_${trk.title}`, {

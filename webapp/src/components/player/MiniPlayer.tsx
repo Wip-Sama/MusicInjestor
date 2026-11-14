@@ -1,8 +1,9 @@
-import React from 'react';
-import { Play, Pause, SkipForward } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { Disc, Play, Pause, SkipForward } from 'lucide-react';
 import { useAudioPlayer } from '../../context/AudioPlayerContext';
 
 export const MiniPlayer: React.FC = () => {
+  const [coverFailed, setCoverFailed] = useState<boolean>(false);
   const {
     currentTrack,
     isPlaying,
@@ -13,6 +14,10 @@ export const MiniPlayer: React.FC = () => {
     setIsPlayerOpen,
     openArtistPage,
   } = useAudioPlayer();
+
+  useEffect(() => {
+    setCoverFailed(false);
+  }, [currentTrack?.id, currentTrack?.cover_url]);
 
   if (!currentTrack) return null;
 
@@ -72,23 +77,38 @@ export const MiniPlayer: React.FC = () => {
             overflow: 'hidden',
           }}
         >
-          <img
-            src={currentTrack.cover_url}
-            alt={currentTrack.album}
-            style={{
-              width: '46px',
-              height: '46px',
-              borderRadius: '8px',
-              objectFit: 'cover',
-              backgroundColor: '#1c1c1e',
-              flexShrink: 0,
-              boxShadow: '0 2px 6px rgba(0,0,0,0.3)',
-            }}
-            onError={(e) => {
-              (e.currentTarget as HTMLImageElement).src =
-                'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="46" height="46" fill="%233a3a3c"><rect width="46" height="46"/></svg>';
-            }}
-          />
+          {currentTrack.cover_url && !coverFailed ? (
+            <img
+              src={currentTrack.cover_url}
+              alt={currentTrack.album || currentTrack.title}
+              style={{
+                width: '46px',
+                height: '46px',
+                borderRadius: '8px',
+                objectFit: 'cover',
+                backgroundColor: '#1c1c1e',
+                flexShrink: 0,
+                boxShadow: '0 2px 6px rgba(0,0,0,0.3)',
+              }}
+              onError={() => setCoverFailed(true)}
+            />
+          ) : (
+            <div
+              style={{
+                width: '46px',
+                height: '46px',
+                borderRadius: '8px',
+                backgroundColor: '#2c2c2e',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                flexShrink: 0,
+                boxShadow: '0 2px 6px rgba(0,0,0,0.3)',
+              }}
+            >
+              <Disc size={22} color="#636366" />
+            </div>
+          )}
           <div style={{ overflow: 'hidden', flex: 1, paddingRight: '8px' }}>
             <div
               style={{

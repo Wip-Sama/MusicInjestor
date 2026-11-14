@@ -12,6 +12,41 @@
 
 ## Completed Milestones
 
+### M52: Streamed Track Tagging, Dynamic Cover/Lyrics Enrichment & Player UI Parity
+- **Provider & Resolve Metadata Enrichment (`provider/src/provider/models.py`, `provider/src/provider/engines/base.py`, `src/core/models.py`, `src/core/provider.py`):**
+  - Added `cover_url` to `TrackMetadataModel`, `ResolvedTrack.to_metadata_model()`, `TrackResolutionResult`, and `HttpMusicProviderClient.resolve_track` so resolved artwork and canonical album/duration/ISRC tags travel alongside stream URLs.
+- **Stream Enrichment Backend (`src/core/deezer.py`, `src/bot/webapp_server.py`):**
+  - Added `DeezerReleaseProvider.search_track_enrichment` to resolve official album titles, `cover_xl` artwork, track positions, and Deezer IDs.
+  - Added `GET /api/v1/app/streams/enrichment` concurrently querying Deezer enrichment and `LrclibLyricsClient` (with canonical tag retry and bounded 256-entry caching) and enriched `POST /api/v1/app/providers/resolve` responses with `cover_url` and `metadata`.
+- **Mini App Player UX, Lyrics & Archival Request Controls (`webapp/`):**
+  - Added `isStreamedTrack` / `isPreviewTrack` helpers (`webapp/src/types/music.ts`) and tagged streamed tracks in `resolveStreamableTrack` (`webapp/src/lib/providerApi.ts`).
+  - Updated `AudioPlayerContext` to automatically enrich active streamed/preview tracks (artwork, album tag, synced/plain lyrics cache, and OS lock-screen `MediaMetadata`), preserve provider stream URLs cleanly in `buildAudioUrl` / `nextTrack` / `prevTrack`, and expose `hasArchivalProviders`.
+  - Updated `SyncedLyrics` to load cached or dynamically enriched lyrics for streamed tracks instead of querying library DB endpoints.
+  - Updated `FullscreenPlayer` and `MiniPlayer` to render clean `<Disc />` artwork fallbacks when cover URLs are missing, replace the interactive library transcode quality selector (`OPUS 128K ▼`) with read-only `STREAMED` / `30S PREVIEW` tags, hide library-only `Studio`, `Send to Chat`, and `Open in Bot` buttons on streamed tracks, and show an inline `Request` button submitting archival requests via `submitSongRequest`.
+
+### M51: Dual-Capability Composite Provider (`Streaming` + `Archival`) & Capability-Driven Auto-Discovery
+- **Dual-Capable Provider Composite Engine (`provider/`):**
+  - Updated `Settings` in `provider/src/provider/config.py` so `PROVIDER_DEFAULT_ENGINE=composite` (`auto`) enables **both** `streaming_enabled=True` and `provisioning_enabled=True`, while explicit single-role modes (`spotiflac`/`archival` and `youtube`/`stream`) continue gating unused endpoints with HTTP `501`.
+  - Extended `CompositeEngine` (`provider/src/provider/engines/composite.py`, `base.py`, `youtube_engine.py`, `routes.py`) to stream resolved archival track IDs (`spoti_...`) seamlessly through `YouTubeEngine` via cached metadata hints or stateless `?title=&artist=&album=` query params, fall back to `YouTubeEngine` during `/resolve` when SpotiFLAC yields no match, report both `spotiflac` and `youtube` readiness in `health()`/`verify_readiness()`, and advertise full combined codecs/sources/formats from `GET /api/v1/capabilities`.
+- **Capability-Driven Discovery, UI Transparency & Compose Defaults (`src/core/provider.py`, `src/bot/`, `webapp/`, `docker-compose.yml`, `config.example.yaml`, `.env.example`):**
+  - Clarified `Auto / Dual (From Capabilities)` provider registration and surfaced live `/api/v1/capabilities` detection in Telegram `/admin` (`Providers`), WebApp `GovernanceView`, `POST /api/v1/app/admin/providers` responses, and `HttpMusicProviderClient.get_stream_url` query-hint forwarding while preserving `min_archival_quality="lossless"` protection against lossy fallback tracks entering `storage/library`.
+  - Updated `docker-compose.yml` (`music-provider` with `PROVIDER_STREAMING_ENABLED=auto` and optional `profiles: ["split-providers"]` on `music-provider-stream`), `config.example.yaml`, `.env.example`, `docs/MUSIC_PROVIDER_API.md`, `provider/README.md`, and `provider/ENGINES.md`.
+
+### M50: Streaming vs. Archival Provider Separation, Multi-Provider Config & Archival Quality Gate
+- **Provider Microservice Capability Roles & YouTube Streaming (`provider/`):**
+  - Added configurable `PROVIDER_NAME`, `PROVIDER_STREAMING_ENABLED`, and `PROVIDER_PROVISIONING_ENABLED` (`auto` | `true` | `false`), updating `GET /api/v1/capabilities` to expose `features.streaming` and `features.provisioning` accurately and returning HTTP `501 Not Implemented` when a disabled `/provision` or `/stream/{track_id}` endpoint is invoked.
+  - Implemented `YouTubeEngine` (`yt-dlp`, `PROVIDER_DEFAULT_ENGINE=youtube` or `stream`) with in-memory 3-hour stream URL TTL caching and upstream HTTP `Range` proxying inside `CompositeEngine`.
+- **Purpose-Aware Routing, Archival Quality Gate & Ephemeral Stream Cache (`src/core/`, `src/db/`):**
+  - Extended `ProviderFeatures`, `ProviderServerRecord`, and SQLite `provider_servers` schema/migrations with `provisioning`, `allow_streaming`, `allow_archiving`, and `min_archival_quality`.
+  - Updated `MultiProviderService.resolve_track_cascading(..., purpose=...)` so `"stream"` queries streaming-capable providers ordered by priority ascending while `"archive"` filters out streaming-only providers and tiers below `min_archival_quality` (default `"lossless"`), plus post-download audio verification via `inspect_audio_quality` + `audio_quality_meets_level` before ingesting into `storage/library`.
+  - Added `EphemeralStreamCache` (`src/core/stream_cache.py`) storing temporary streamed audio in `storage/cache/streams` with automatic TTL expiration and LRU size eviction.
+- **Multi-Provider Configuration, Storage Layout & Dual-Container Compose (`src/config/settings.py`, `main.py`, `config.example.yaml`, `.env.example`, `docker-compose.yml`):**
+  - Added typed `ConfiguredProviderSettings` parsing top-level `providers:` YAML lists, `MUSIC_PROVIDERS` JSON env overrides, role aliases (`streaming`, `archival`, `both`), `MUSIC_PROVIDER_MIN_ARCHIVAL_QUALITY`, and `STORAGE_STREAM_CACHE_DIR` while preserving `DEFAULT_MUSIC_PROVIDER_*` backward compatibility.
+  - Split Compose storage into `./storage/providers/flac` (`music-provider`) and `./storage/providers/stream` (`music-provider-stream`), with transient bot stream cache isolated in `./storage/cache/streams`.
+- **Bot & Mini App UI (`src/bot/`, `webapp/`):**
+  - Updated WebApp `/api/v1/app/providers/status`, `/api/v1/app/providers/resolve`, `/api/v1/app/admin/providers`, and `/api/v1/app/stream/provider/{id}/{track_id}` (integrating `EphemeralStreamCache`, `Range` responses, and HTTP `501` gating).
+  - Updated Telegram `/admin` (`Name | URL | Token | Role` registration and role/quality badges), WebApp `GovernanceView` (role & minimum archival quality selectors + capability pills), and `AlbumGapModal` / `RadarView` (`Stream Full` instant streaming separated from archival `Request`).
+
 ### M49: Provider Turnstile `/auth/challenge` Popup Bridge & Debug Log Filtering
 - **Hosted Turnstile Bridge & Auto-Close Fix (`provider/`):** Identified that `api.zarz.moe/v2/challenge` strips `http(s)://` `cb` parameters and runs `window.close()` after 250ms when `window.opener` is absent. Added `GET /auth/challenge` (and `/api/v1/auth/challenge`) as a popup opener + `postMessage` (`zarz_grant`) bridge forwarding grants to `GET /session-grant?format=json`, paired with non-closing `spotiflac://session-grant` fallback links and full `/auth/challenge` & `/session-grant` request logging.
 - **Clean `DEBUG` Logging (`main.py`, `provider/src/provider/main.py`):** Suppressed verbose `aiosqlite`, `httpcore`, and `hpack` library chatter (`WARNING` threshold) when `LOG_LEVEL=DEBUG`, and escalated `cloudflared` tunnel errors in `provider/src/provider/tunnel.py` to `WARNING`.

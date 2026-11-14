@@ -42,6 +42,7 @@ from src.core.queue import IngestionQueueWorker
 from src.core.radar import ReleaseRadarService
 from src.core.rbac import GovernanceService, has_permission
 from src.core.search import AlbumSearchService
+from src.core.stream_cache import EphemeralStreamCache
 from src.db.database import SqliteDatabaseManager
 from src.db.repository import SqliteCatalogRepository
 
@@ -423,33 +424,59 @@ async def run_app(settings: AppSettings | None = None) -> None:
         with contextlib.suppress(Exception):
             await bot.send_message(chat_id=telegram_id, text=message_text, parse_mode="HTML")
 
+    stream_cache = EphemeralStreamCache(
+        cache_dir=resolved_settings.storage_stream_cache_dir,
+        ttl_seconds=resolved_settings.stream_cache_ttl_seconds,
+        max_bytes=resolved_settings.stream_cache_max_mb * 1024 * 1024,
+    )
+    await stream_cache.evict_expired()
+
     multi_provider_service = MultiProviderService(
         repository=repository,
         notifier=notifier,
         staging_dir=resolved_settings.storage_scratch_dir / "provider_staging",
         auto_provision_uploader_requests=resolved_settings.auto_provision_uploader_requests,
         download_timeout_seconds=resolved_settings.provision_download_timeout_seconds,
+        min_archival_quality=resolved_settings.min_archival_quality,
         on_artifact_ready=_on_provider_artifact_ready,
         notify_requester=_notify_provider_requester,
     )
-    if resolved_settings.default_music_provider_url.strip():
-        default_server = ProviderServerRecord(
-            id="default-provider",
-            name=resolved_settings.default_music_provider_name,
-            base_url=resolved_settings.default_music_provider_url,
-            api_token_encrypted=resolved_settings.default_music_provider_token or None,
-            priority=resolved_settings.default_music_provider_priority,
-            is_enabled=True,
+    for cfg_prov in resolved_settings.effective_music_providers:
+        existing_srv = await repository.get_provider_server(cfg_prov.id)
+        prov_record = ProviderServerRecord(
+            id=cfg_prov.id,
+            name=cfg_prov.name,
+            base_url=cfg_prov.base_url,
+            api_token_encrypted=cfg_prov.api_token or None,
+            priority=cfg_prov.priority,
+            is_enabled=cfg_prov.is_enabled,
+            capabilities=existing_srv.capabilities if existing_srv else None,
+            last_health_status=existing_srv.last_health_status if existing_srv else "unknown",
+            last_health_checked_at=existing_srv.last_health_checked_at if existing_srv else None,
+            allow_streaming=cfg_prov.allow_streaming,
+            allow_archiving=cfg_prov.allow_archiving,
+            min_archival_quality=cfg_prov.min_archival_quality,
         )
+        if existing_srv is not None:
+            prov_record.created_at = existing_srv.created_at
         try:
-            await multi_provider_service.handshake_and_update(default_server)
+            updated_srv = await multi_provider_service.handshake_and_update(prov_record)
             logger.info(
-                "Configured default music provider: %s (%s)",
-                default_server.name,
-                default_server.base_url,
+                "Configured music provider: %s (%s) [stream=%s, archive=%s, min_archival=%s, status=%s]",
+                updated_srv.name,
+                updated_srv.base_url,
+                updated_srv.allow_streaming,
+                updated_srv.allow_archiving,
+                updated_srv.min_archival_quality or resolved_settings.min_archival_quality,
+                updated_srv.last_health_status,
             )
         except Exception as exc:
-            logger.warning("Default music provider handshake failed: %s", exc)
+            logger.warning(
+                "Music provider handshake failed for %s (%s): %s",
+                cfg_prov.name,
+                cfg_prov.base_url,
+                exc,
+            )
 
     dispatcher["multi_provider_service"] = multi_provider_service
     dispatcher["provider_service"] = multi_provider_service
@@ -524,6 +551,7 @@ async def run_app(settings: AppSettings | None = None) -> None:
             bot=bot,
             bot_username=bot_username,
             provider_service=multi_provider_service,
+            stream_cache=stream_cache,
         )
         await web_server.start()
 

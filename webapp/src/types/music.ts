@@ -1,3 +1,5 @@
+export type TrackSourceType = 'library' | 'provider_stream' | 'preview';
+
 export interface TrackItem {
   id: string;
   title: string;
@@ -12,6 +14,39 @@ export interface TrackItem {
   cover_url: string;
   file_size?: number;
   bitrate_kbps?: number;
+  source_type?: TrackSourceType;
+  identifiers?: Record<string, string>;
+  provider_name?: string;
+}
+
+export function isStreamedTrack(track: TrackItem | null | undefined): boolean {
+  if (!track) return false;
+  if (track.source_type === 'provider_stream' || track.source_type === 'preview') {
+    return true;
+  }
+  if (
+    track.id.startsWith('provider:') ||
+    track.id.startsWith('deezer:') ||
+    track.id.startsWith('gap_preview:')
+  ) {
+    return true;
+  }
+  return (
+    track.audio_url.startsWith('/api/v1/app/stream/provider/') ||
+    /^https?:\/\//i.test(track.audio_url)
+  );
+}
+
+export function isPreviewTrack(track: TrackItem | null | undefined): boolean {
+  if (!track) return false;
+  if (track.source_type === 'preview') return true;
+  if (track.source_type === 'provider_stream') return false;
+  return (
+    track.format.toLowerCase().includes('preview') ||
+    track.id.startsWith('deezer:') ||
+    track.id.startsWith('gap_preview:') ||
+    /^https?:\/\//i.test(track.audio_url)
+  );
 }
 
 export interface TracksResponse {
