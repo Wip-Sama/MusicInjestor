@@ -6,7 +6,9 @@
 ---
 
 ## [Unreleased]
-- None
+- **Combined Bot + Provider Docker Image (`Dockerfile.combined`, `scripts/run_combined.py`, `tests/unit/test_run_combined.py`):**
+  - Added `Dockerfile.combined` (excluded from GitHub Actions) bundling the WebApp build, main ingestion bot, and `provider` microservice in a single container without `tests/` or `.github/`, using `uv sync --frozen --no-dev --all-packages --no-install-project`.
+  - Added `scripts/run_combined.py` process supervisor starting `provider.main`, polling `/api/v1/health`, launching `main.py`, and forwarding `SIGINT`/`SIGTERM` cleanly to both processes, with unit tests in `tests/unit/test_run_combined.py`.
 
 ---
 
