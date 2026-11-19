@@ -8,7 +8,7 @@ import pytest
 from src.core.provider import HttpMusicProviderClient
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_check_health_verify_timeout_falls_back_to_degraded() -> None:
     """If /health?verify=true times out but basic /health responds, status is degraded not unreachable."""
     fallback_resp = MagicMock()
@@ -32,7 +32,7 @@ async def test_check_health_verify_timeout_falls_back_to_degraded() -> None:
     assert mock_http.get.await_count == 2
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_check_health_unreachable_populates_non_empty_error_detail() -> None:
     """When both verify and fallback fail with an empty-message timeout, error uses exception class name."""
     mock_http = MagicMock(spec=httpx.AsyncClient)
