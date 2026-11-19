@@ -6,6 +6,9 @@
 ---
 
 ## [Unreleased]
+- **Provider Degraded Badge & Metadata Probe Error Clarity (`src/bot/routers/admin.py`, `provider/src/provider/engines/spotiflac_engine.py`):**
+  - Updated `_render_providers_screen` in `src/bot/routers/admin.py` to display `🟡 degraded` instead of `🔴 degraded` when a provider is reachable with partial engine readiness (e.g. YouTube ready, SpotiFLAC pending auth).
+  - Restored 10s timeout on `SpotiFlacEngine._probe_metadata` and surfaced explicit timeout/exception class names instead of blank `TimeoutError` strings.
 - **Dedicated `provider/.env` Configuration & Template (`provider/.env.example`, `provider/src/provider/config.py`, `docker-compose.yml`, `docker-compose.example.yaml`, `.env.example`, `provider/README.md`):**
   - Added `provider/.env.example` documenting all provider, `cloudflared`, and SpotiFLAC registry/token settings.
   - Updated `docker-compose.yml` and `docker-compose.example.yaml` `music-provider` services to load `./provider/.env` via `env_file` without clobbering `provider/.env` values with empty `${VAR:-}` `environment:` entries.

@@ -738,6 +738,8 @@ async def _render_providers_screen(
                 badge = "⬜ Disabled"
             elif srv.last_health_status in ("ok", "healthy", "ready"):
                 badge = f"🟢 {srv.last_health_status}"
+            elif srv.last_health_status == "degraded":
+                badge = "🟡 degraded"
             else:
                 badge = f"🔴 {srv.last_health_status or 'untested'}"
             sources = (
