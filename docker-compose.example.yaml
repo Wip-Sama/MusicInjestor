@@ -89,21 +89,12 @@ services:
     env_file:
       - path: .env
         required: false
+      - path: ./provider/.env
+        required: false
     environment:
       PROVIDER_HOST: 0.0.0.0
       PROVIDER_PORT: 8000
-      PROVIDER_API_TOKEN: ${DEFAULT_MUSIC_PROVIDER_TOKEN:-}
-      PROVIDER_BOT_TOKEN: ${PROVIDER_BOT_TOKEN:-}
-      PROVIDER_AUTHORIZED_USER_IDS: ${PROVIDER_AUTHORIZED_USER_IDS:-}
       PROVIDER_STORAGE_DIR: /data/artifacts
-      PROVIDER_DEFAULT_ENGINE: ${PROVIDER_DEFAULT_ENGINE:-composite}
-      PROVIDER_PUBLIC_URL: ${PROVIDER_PUBLIC_URL:-}
-      PROVIDER_CLOUDFLARED_TUNNEL_URL: ${PROVIDER_CLOUDFLARED_TUNNEL_URL:-}
-      PROVIDER_USE_CLOUDFLARED_TUNNEL: ${PROVIDER_USE_CLOUDFLARED_TUNNEL:-auto}
-      PROVIDER_CLOUDFLARED_TUNNEL_TOKEN: ${PROVIDER_CLOUDFLARED_TUNNEL_TOKEN:-}
-      SPOTIFLAC_REGISTRIES: ${SPOTIFLAC_REGISTRIES:-}
-      SPOTIFLAC_QOBUZ_TOKEN: ${SPOTIFLAC_QOBUZ_TOKEN:-}
-      SPOTIFLAC_TIDAL_API: ${SPOTIFLAC_TIDAL_API:-}
     volumes:
       - ./storage/provider:/data/artifacts
       - ./storage/providers/spotiflac-state:/root/.spotiflac

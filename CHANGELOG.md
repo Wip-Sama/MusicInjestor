@@ -6,6 +6,10 @@
 ---
 
 ## [Unreleased]
+- **Dedicated `provider/.env` Configuration & Template (`provider/.env.example`, `provider/src/provider/config.py`, `docker-compose.yml`, `docker-compose.example.yaml`, `.env.example`, `provider/README.md`):**
+  - Added `provider/.env.example` documenting all provider, `cloudflared`, and SpotiFLAC registry/token settings.
+  - Updated `docker-compose.yml` and `docker-compose.example.yaml` `music-provider` services to load `./provider/.env` via `env_file` without clobbering `provider/.env` values with empty `${VAR:-}` `environment:` entries.
+  - Updated `provider/src/provider/config.py` to prioritize `provider/.env` over root `.env` and fall back to `DEFAULT_MUSIC_PROVIDER_TOKEN` when `PROVIDER_API_TOKEN` is unset.
 - **Provider Health Timeout Resilience & SpotiFLAC 5.x Registry Wiring (`src/core/provider.py`, `provider/`, `docker-compose.yml`, `docker-compose.example.yaml`, `.env.example`):**
   - Updated `HttpMusicProviderClient.check_health(verify=True)` to use a 30s timeout and fall back to a fast basic `/health` probe returning `degraded` instead of falsely marking reachable providers `unreachable`.
   - Parallelized `CompositeEngine.verify_readiness` and tightened `SpotiFlacEngine.verify_readiness` probe timeouts so `/api/v1/health?verify=true` completes well under client timeouts.
