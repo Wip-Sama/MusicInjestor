@@ -6,6 +6,12 @@
 ---
 
 ## [Unreleased]
+- **Independent Provider Cloudflared Support & Mini App Network Error Clarity (`provider/`, `docker-compose.yml`, `docker-compose.example.yaml`, `Dockerfile.combined`, `.env.example`, `webapp/src/App.tsx`):**
+  - Installed multi-arch `cloudflared` binary in `provider/Dockerfile` and `Dockerfile.combined` so `PROVIDER_USE_CLOUDFLARED_TUNNEL` works inside Docker even when the main bot disables `USE_CLOUDFLARED_TUNNEL`.
+  - Added `PROVIDER_CLOUDFLARED_TUNNEL_URL` (alias for `PROVIDER_PUBLIC_URL`) and `PROVIDER_CLOUDFLARED_TUNNEL_TOKEN` (Cloudflare Zero Trust named tunnel support via `cloudflared tunnel run --token`) in `provider/src/provider/config.py`, `provider/src/provider/tunnel.py`, and `provider/src/provider/main.py`, exposed in `docker-compose.yml`, `docker-compose.example.yaml`, `.env.example`, and `provider/README.md`.
+  - Updated `webapp/src/App.tsx` to display `Backend Unreachable` instead of `Authentication Required` when the Service Worker reports `Offline / Network unavailable`.
+- **Provider Dockerfile Build Fix (`provider/Dockerfile`):**
+  - Fixed `uv pip install --system -e .` failing with `Expected a Python module at: src/provider/__init__.py` by installing third-party dependencies via `uv pip install --system -r pyproject.toml` first (preserving layer caching) and installing the local editable package with `--no-deps` after copying `src/` and `README.md`.
 - **Combined Bot + Provider Docker Image (`Dockerfile.combined`, `scripts/run_combined.py`, `tests/unit/test_run_combined.py`):**
   - Added `Dockerfile.combined` (excluded from GitHub Actions) bundling the WebApp build, main ingestion bot, and `provider` microservice in a single container without `tests/` or `.github/`, using `uv sync --frozen --no-dev --all-packages --no-install-project`.
   - Added `scripts/run_combined.py` process supervisor starting `provider.main`, polling `/api/v1/health`, launching `main.py`, and forwarding `SIGINT`/`SIGTERM` cleanly to both processes, with unit tests in `tests/unit/test_run_combined.py`.

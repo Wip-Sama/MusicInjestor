@@ -473,7 +473,11 @@ const GuestCatalogLockedCard: React.FC<{ profile: UserProfile }> = ({ profile: _
             <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
               <AlertCircle size={24} color="var(--tg-theme-destructive-text-color, #ff453a)" />
               <div>
-                <Headline weight="2">Authentication Required</Headline>
+                <Headline weight="2">
+                  {error.toLowerCase().includes('offline') || error.toLowerCase().includes('network')
+                    ? 'Backend Unreachable'
+                    : 'Authentication Required'}
+                </Headline>
                 <Caption style={{ color: 'var(--tg-theme-subtitle-text-color, #8e8e93)' }}>
                   {error}
                 </Caption>
@@ -481,7 +485,9 @@ const GuestCatalogLockedCard: React.FC<{ profile: UserProfile }> = ({ profile: _
             </div>
             <div style={{ marginTop: '12px' }}>
               <Caption>
-                Please launch this Mini App directly from the Telegram Bot menu or an inline button to authenticate securely.
+                {error.toLowerCase().includes('offline') || error.toLowerCase().includes('network')
+                  ? 'The cached Mini App loaded, but the bot web server could not be reached. Verify the container is running and your WEB_APP_URL / reverse proxy points to the active WEB_LISTEN_PORT.'
+                  : 'Please launch this Mini App directly from the Telegram Bot menu or an inline button to authenticate securely.'}
               </Caption>
             </div>
           </Card>
