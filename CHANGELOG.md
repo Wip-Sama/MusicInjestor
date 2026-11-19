@@ -6,6 +6,11 @@
 ---
 
 ## [Unreleased]
+- **Provider Health Timeout Resilience & SpotiFLAC 5.x Registry Wiring (`src/core/provider.py`, `provider/`, `docker-compose.yml`, `docker-compose.example.yaml`, `.env.example`):**
+  - Updated `HttpMusicProviderClient.check_health(verify=True)` to use a 30s timeout and fall back to a fast basic `/health` probe returning `degraded` instead of falsely marking reachable providers `unreachable`.
+  - Parallelized `CompositeEngine.verify_readiness` and tightened `SpotiFlacEngine.verify_readiness` probe timeouts so `/api/v1/health?verify=true` completes well under client timeouts.
+  - Updated `pick_default_zarz_extension()` to auto-sync extensions via `ExtensionManager` when `SPOTIFLAC_REGISTRIES` is set and surface clear instructions when no registry URL is configured.
+  - Wired `DEFAULT_MUSIC_PROVIDER_URL`, `SPOTIFLAC_REGISTRIES`, `SPOTIFLAC_QOBUZ_TOKEN`, `SPOTIFLAC_TIDAL_API`, and persistent `/root/.spotiflac` volume into `docker-compose.yml` and `docker-compose.example.yaml`.
 - **Independent Provider Cloudflared Support & Mini App Network Error Clarity (`provider/`, `docker-compose.yml`, `docker-compose.example.yaml`, `Dockerfile.combined`, `.env.example`, `webapp/src/App.tsx`):**
   - Installed multi-arch `cloudflared` binary in `provider/Dockerfile` and `Dockerfile.combined` so `PROVIDER_USE_CLOUDFLARED_TUNNEL` works inside Docker even when the main bot disables `USE_CLOUDFLARED_TUNNEL`.
   - Added `PROVIDER_CLOUDFLARED_TUNNEL_URL` (alias for `PROVIDER_PUBLIC_URL`) and `PROVIDER_CLOUDFLARED_TUNNEL_TOKEN` (Cloudflare Zero Trust named tunnel support via `cloudflared tunnel run --token`) in `provider/src/provider/config.py`, `provider/src/provider/tunnel.py`, and `provider/src/provider/main.py`, exposed in `docker-compose.yml`, `docker-compose.example.yaml`, `.env.example`, and `provider/README.md`.

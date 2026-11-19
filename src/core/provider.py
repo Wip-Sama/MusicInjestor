@@ -227,13 +227,48 @@ class HttpMusicProviderClient(MusicProviderPort):
         client = await self._get_client()
         url = f"{self._base_url}/api/v1/health"
         params = {"verify": "true"} if verify else None
+        request_timeout = max(self._timeout_seconds, 30.0) if verify else self._timeout_seconds
         try:
-            resp = await client.get(url, params=params, headers=self._build_headers())
+            resp = await client.get(
+                url,
+                params=params,
+                headers=self._build_headers(),
+                timeout=request_timeout,
+            )
             resp.raise_for_status()
             data = resp.json()
+        except httpx.TimeoutException as exc:
+            if verify:
+                logger.warning(
+                    "Live verification health check timed out for %s after %.1fs; probing basic /health",
+                    url,
+                    request_timeout,
+                )
+                try:
+                    fallback_resp = await client.get(
+                        url,
+                        headers=self._build_headers(),
+                        timeout=min(self._timeout_seconds, 5.0),
+                    )
+                    fallback_resp.raise_for_status()
+                    fb_data = fallback_resp.json()
+                    deps = dict(fb_data.get("upstream_dependencies") or {})
+                    deps["note"] = "Live upstream verification timed out"
+                    return ProviderHealth(
+                        status="degraded",
+                        version=str(fb_data.get("version") or ""),
+                        upstream_dependencies=deps,
+                        active_jobs_count=int(fb_data.get("active_jobs_count") or 0),
+                    )
+                except Exception:
+                    pass
+            detail = str(exc) or type(exc).__name__
+            logger.warning("Health check failed for provider %s: %s", url, detail)
+            return ProviderHealth(status="unreachable", upstream_dependencies={"error": detail})
         except Exception as exc:
-            logger.warning("Health check failed for provider %s: %s", url, exc)
-            return ProviderHealth(status="unreachable", upstream_dependencies={"error": str(exc)})
+            detail = str(exc) or type(exc).__name__
+            logger.warning("Health check failed for provider %s: %s", url, detail)
+            return ProviderHealth(status="unreachable", upstream_dependencies={"error": detail})
 
         return ProviderHealth(
             status=str(data.get("status") or "ok"),
